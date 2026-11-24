@@ -46,7 +46,9 @@
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
-//!   title's view description says. Typed-format loads from heap
+//!   title's view description says ([`HostShader::heap_buffers`] lists
+//!   the kind per used-resource entry; `victory-gpu` makes raw ones raw).
+//!   Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
 //!
@@ -156,6 +158,32 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Buffer views the shader reads from the heap through tables, with the
+    /// kind it declares them: the host's view in that slot must be of that
+    /// kind (see "Buffer views in the heap").
+    pub heap_buffers: Vec<HeapBuffer>,
+}
+
+/// A heap buffer view a shader reads, by the used-resource entry naming
+/// it: root parameter and table offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapBuffer {
+    pub slot: u8,
+    pub table_offset_dwords: u32,
+    pub kind: BufferKind,
+    /// Unordered access (a UAV), else a shader resource view.
+    pub unordered: bool,
+}
+
+/// How a shader declares a buffer view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferKind {
+    /// Four 32-bit channels in the view's format.
+    Typed,
+    /// `ByteAddressBuffer`: the host view must be raw (`R32_TYPELESS`).
+    Raw,
+    /// Structured with the used-resource entry's stride.
+    Structured,
 }
 
 impl HostShader {
@@ -308,6 +336,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        heap_buffers: l.heap_buffers,
     })
 }
 
@@ -565,6 +594,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            heap_buffers: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +605,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                heap_buffers: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

@@ -37,6 +37,7 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    pub heap_buffers: Vec<super::HeapBuffer>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -222,6 +223,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Heap buffer views read, with their declared kind.
+    heap_buffers: Vec<super::HeapBuffer>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -515,6 +518,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            heap_buffers: Vec::new(),
         }
     }
 
@@ -913,6 +917,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            heap_buffers: self.heap_buffers,
         })
     }
 
@@ -3306,6 +3311,28 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        // DXIL resource kinds 10 to 12: typed, raw and structured buffers
+        // (bit 12: unordered access).
+        let kind = match props.0 & 0xFF {
+            10 => Some(super::BufferKind::Typed),
+            11 => Some(super::BufferKind::Raw),
+            12 => Some(super::BufferKind::Structured),
+            _ => None,
+        };
+        if let (Some(kind), false, Source::Loaded { .. } | Source::Phi { .. }) =
+            (kind, sampler, src)
+            && let Some(u) = self.used_kind(src)
+        {
+            let b = super::HeapBuffer {
+                slot: u.slot,
+                table_offset_dwords: u.table_offset_dwords,
+                kind,
+                unordered: props.0 & 0x1000 != 0,
+            };
+            if !self.heap_buffers.contains(&b) {
+                self.heap_buffers.push(b);
+            }
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);
