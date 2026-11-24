@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::{BufferKind, HeapBuffer};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -459,7 +460,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.heap_buffers, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -618,7 +619,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, raw: bool, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -629,7 +630,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some(view) = host.mirror(index, handle, true, raw) {
             readable(list, u, &view);
         }
     }
@@ -645,8 +646,23 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    ///
+    /// Buffer views the shader reads as `ByteAddressBuffer` are made raw,
+    /// whatever kind the title made them (`heap`, see
+    /// [`victory_shader::emit::HostShader::heap_buffers`]).
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        heap: &[HeapBuffer],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let raw = |slot: u8, dword: u32| {
+            heap.iter().any(|h| {
+                h.slot == slot && h.table_offset_dwords == dword && h.kind == BufferKind::Raw
+            })
+        };
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
@@ -678,7 +694,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, raw(u.slot, u.table_offset_dwords), compute);
             }
         }
         let mut made = Vec::new();
@@ -711,6 +727,9 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
+                for u in &entries {
+                    raw(slot, u.table_offset_dwords).hash(&mut h);
+                }
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
@@ -740,6 +759,7 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let raw = used.is_some_and(|u| raw(slot, u.table_offset_dwords));
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -750,7 +770,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_at(index, &view, raw);
                         if let Some(u) = used {
                             readable(list, u, &view);
                         }
