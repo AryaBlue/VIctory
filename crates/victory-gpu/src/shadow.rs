@@ -3705,10 +3705,10 @@ pub(crate) fn superseded_count() -> u64 {
     SUPERSEDED.load(Ordering::Relaxed)
 }
 
-// promotions so far: in place, refused by the host, waited for (not idle)
-static PROMOTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+// promotions so far: in place, refused by the host, waited for (not idle), taken back after a trial
+static PROMOTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-pub(crate) fn promoted_stats() -> [u64; 3] {
+pub(crate) fn promoted_stats() -> [u64; 4] {
     std::array::from_fn(|i| PROMOTED[i].load(Ordering::Relaxed))
 }
 
@@ -3732,20 +3732,50 @@ pub(crate) struct Heat {
     pub(crate) size: u64,
     // write-watched: cpu counts mean something (an unwatched copy is copied whole every time)
     pub(crate) watched: bool,
+    // reached through descriptor slots: shaders' reads of it are not seen
+    pub(crate) bindless: bool,
 }
 
-// in place pays where shaders read about as much as gets written, and something writes it most frames
-// (fast-6: 761 MB in place read by many small reads took the title lists from 139 to 352 ms):
-// the cpu rewriting it (upload rings, per-frame constants), or the card writing what the title reads back
-pub(crate) fn worth_in_place(h: Heat, reads: u64, cpu_rule: bool, gpu_rule: bool) -> bool {
-    if h.frames < 8 || h.asked == 0 {
-        return false;
+impl Heat {
+    // copy work per frame in place would save, in bytes: what the cpu changed, or the whole copy if the card writes it
+    pub(crate) fn pot(&self) -> u64 {
+        let gpu = if self.gpu * 2 >= self.frames.max(1) { self.size } else { 0 };
+        self.cpu_bytes / self.frames.max(1) + gpu
     }
-    let cpu = cpu_rule && h.watched && h.cpu * 2 >= h.frames && h.asked <= reads.saturating_mul(h.cpu_bytes);
-    let gpu = gpu_rule && h.gpu * 2 >= h.frames && h.asked <= reads.saturating_mul(h.size).saturating_mul(h.frames);
-    cpu || gpu
 }
 
+// why a copy is not worth putting in place (None: it is); fast-6 put 761 MB in place that shaders read many
+// times and the title lists went from 139 to 352 ms, so only what something rewrites most frames goes, and
+// what shaders are seen to read many times stays. Reads through descriptor slots are not seen: those go on
+// trial (promote measures the frame before and after and takes them back if it got slower)
+pub(crate) fn not_worth(h: Heat, reads: u64, cpu_rule: bool, gpu_rule: bool, bindless: bool) -> Option<&'static str> {
+    if h.frames < 8 {
+        return Some("under 8 frames looked at");
+    }
+    if h.bindless && !bindless {
+        return Some("reached through descriptor slots (VICTORY_INPLACE_PICK_BINDLESS=0)");
+    }
+    let cpu = cpu_rule && h.watched && h.cpu * 2 >= h.frames;
+    let gpu = gpu_rule && h.gpu * 2 >= h.frames;
+    if !cpu && !gpu {
+        return Some(match (h.watched, h.cpu * 2 >= h.frames, h.gpu * 2 >= h.frames) {
+            (false, _, false) => "not write-watched, and the card writes it in under half the frames",
+            (true, false, false) => "rewritten in under half the frames",
+            _ => "its rule is off",
+        });
+    }
+    if !h.bindless {
+        if h.asked == 0 {
+            return Some("shaders never given it");
+        }
+        let read_ok = (cpu && h.asked <= reads.saturating_mul(h.cpu_bytes))
+            || (gpu && h.asked <= reads.saturating_mul(h.size).saturating_mul(h.frames));
+        if !read_ok {
+            return Some("shaders read it many times over");
+        }
+    }
+    None
+}
 // the copy in the tables for `old` (a title buffer or a window) is swapped for `placed`; false if it is not there any more
 pub(crate) fn swap_in_place(old: &Arc<Shadow>, placed: crate::inplace::Placed) -> bool {
     let (start, len) = (old.start, old.len);
@@ -3779,13 +3809,95 @@ pub(crate) fn swap_in_place(old: &Arc<Shadow>, placed: crate::inplace::Placed) -
     }
 }
 
-// once a second with VICTORY_INPLACE_PICK or VICTORY_INPLACE_WRITTEN: copies worth it are swapped for title memory in place
+// the placed copy `placed` in the tables goes; the next ask makes an ordinary copy again
+fn demote(placed: &Arc<Shadow>) -> bool {
+    let (start, len) = (placed.start, placed.len);
+    let gone = if placed.window {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&(start, len)) {
+            Some(s) if Arc::ptr_eq(s, placed) => map.remove(&(start, len)),
+            _ => None,
+        }
+    } else {
+        let mut map = buffers();
+        let entry = map
+            .range_mut(..=(start, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, placed)))
+            .map(|(_, e)| e);
+        entry.and_then(|e| e.shadow.take())
+    };
+    match gone {
+        Some(was) => {
+            was.supersede();
+            crate::host::retire(was);
+            true
+        }
+        None => false,
+    }
+}
+
+// a step of picking on trial: what went in place, and the frame time before it
+struct Trial {
+    placed: Vec<std::sync::Weak<Shadow>>,
+    ids: Vec<u64>,
+    before_ms: f64,
+    at: (u64, u64),
+}
+
+#[derive(Default)]
+struct Picking {
+    seen: std::collections::HashMap<u64, (u64, [u64; 4])>,
+    // never again: refused by the host or taken back after a trial
+    refused: std::collections::HashSet<u64>,
+    trial: Option<Trial>,
+    // where the frame-time baseline starts (frame, ms)
+    base: Option<(u64, u64)>,
+    said: u64,
+}
+
+// average frame time since `at`, if 16 frames have gone by
+fn frame_ms_since(at: (u64, u64), now: (u64, u64)) -> Option<f64> {
+    let frames = now.0.saturating_sub(at.0);
+    (frames >= 16).then(|| now.1.saturating_sub(at.1) as f64 / frames as f64)
+}
+
+// whether a trial made frames slower than `tolerance` percent allows
+pub(crate) fn trial_failed(before_ms: f64, after_ms: f64, tolerance: f64) -> bool {
+    after_ms > before_ms * (1.0 + tolerance / 100.0)
+}
+
+// once a second with VICTORY_INPLACE_PICK or VICTORY_INPLACE_WRITTEN: copies worth it are swapped for title memory
+// in place a step at a time (VICTORY_INPLACE_PICK_STEP_MB), each step kept only if frames did not get slower
 pub(crate) fn promote() {
     let (pick, written) = (crate::inplace::pick(), crate::inplace::written_on());
-    let (cap, reads, windows) = (crate::inplace::written_most(), crate::inplace::pick_reads(), crate::inplace::pick_windows());
-    let frame = crate::frame::current();
-    static SEEN: Mutex<Option<std::collections::HashMap<u64, (u64, [u64; 4])>>> = Mutex::new(None);
-    static REFUSED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    let (cap, reads, windows, bindless) =
+        (crate::inplace::written_most(), crate::inplace::pick_reads(), crate::inplace::pick_windows(), crate::inplace::pick_bindless());
+    let now = (crate::frame::current(), crate::host::now_ms());
+    static STATE: Mutex<Option<Picking>> = Mutex::new(None);
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = state.get_or_insert_with(Default::default);
+    // a trial running: judged once 16 frames went by
+    if let Some(trial) = &state.trial {
+        let Some(after) = frame_ms_since(trial.at, now) else { return };
+        let trial = state.trial.take().expect("a trial");
+        if trial_failed(trial.before_ms, after, crate::inplace::pick_tolerance()) {
+            let mut back = 0;
+            for placed in trial.placed.iter().filter_map(std::sync::Weak::upgrade) {
+                back += u64::from(demote(&placed));
+            }
+            PROMOTED[3].fetch_add(back, Ordering::Relaxed);
+            state.refused.extend(trial.ids);
+            tracing::info!(before_ms = trial.before_ms, after_ms = after, back, "in-place picks taken back: frames got slower");
+        } else {
+            tracing::info!(before_ms = trial.before_ms, after_ms = after, kept = trial.ids.len(), "in-place picks kept");
+        }
+        state.base = Some(now);
+        return;
+    }
+    let base = *state.base.get_or_insert(now);
+    let Some(before_ms) = frame_ms_since(base, now) else { return };
     let mut copies: Vec<Arc<Shadow>> = if pick {
         buffers().values().filter_map(|e| e.shadow.clone()).collect()
     } else {
@@ -3796,50 +3908,99 @@ pub(crate) fn promote() {
     if pick && windows {
         copies.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     }
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = seen.get_or_insert_with(Default::default);
-    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    let refused = refused.get_or_insert_with(Default::default);
     let live: std::collections::HashSet<u64> = copies.iter().map(|s| s.id).collect();
-    seen.retain(|id, _| live.contains(id));
+    state.seen.retain(|id, _| live.contains(id));
+    let mut rows: Vec<(Arc<Shadow>, Heat, Option<&'static str>)> = Vec::new();
     for shadow in copies {
-        let out = shadow.place.is_some() || shadow.superseded() || shadow.bindless.load(Ordering::Relaxed);
-        if out || (shadow.window && !windows) || shadow.len > cap || refused.contains(&shadow.id) {
+        if shadow.place.is_some() || shadow.superseded() {
             continue;
         }
-        let now = shadow.heat_now();
-        let (at, was) = *seen.entry(shadow.id).or_insert((frame, now));
+        let heat_now = shadow.heat_now();
+        let (at, was) = *state.seen.entry(shadow.id).or_insert((now.0, heat_now));
         let heat = Heat {
-            frames: frame.saturating_sub(at),
-            gpu: now[0] - was[0],
-            cpu: now[1] - was[1],
-            cpu_bytes: now[2] - was[2],
-            asked: now[3] - was[3],
+            frames: now.0.saturating_sub(at),
+            gpu: heat_now[0] - was[0],
+            cpu: heat_now[1] - was[1],
+            cpu_bytes: heat_now[2] - was[2],
+            asked: heat_now[3] - was[3],
             size: shadow.len,
             watched: shadow.watched.load(Ordering::Relaxed) == 1,
+            bindless: shadow.bindless.load(Ordering::Relaxed),
         };
-        if !worth_in_place(heat, reads, pick, pick || written) {
-            if heat.frames >= 64 {
-                seen.insert(shadow.id, (frame, now));
-            }
+        let why = if state.refused.contains(&shadow.id) {
+            Some("refused before, or taken back after a trial")
+        } else if shadow.window && !windows {
+            Some("a window (VICTORY_INPLACE_PICK_WINDOWS=0)")
+        } else if shadow.len > cap {
+            Some("over VICTORY_INPLACE_WRITTEN_MAX_MB")
+        } else {
+            not_worth(heat, reads, pick, pick || written, bindless)
+        };
+        if heat.frames >= 64 && why.is_some() {
+            state.seen.insert(shadow.id, (now.0, heat_now));
+        }
+        rows.push((shadow, heat, why));
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.pot()));
+    if now.1 >= state.said + 10_000 {
+        state.said = now.1;
+        for (shadow, heat, why) in rows.iter().take(10) {
+            tracing::info!(
+                start = format_args!("{:#x}", shadow.start),
+                len = shadow.len,
+                window = shadow.window,
+                carded = shadow.card.is_some(),
+                pot_kb_per_frame = heat.pot() >> 10,
+                ?heat,
+                why = why.unwrap_or("worth it"),
+                "in-place candidate"
+            );
+        }
+    }
+    let step = crate::inplace::pick_step();
+    let (mut placed, mut ids, mut bytes) = (Vec::new(), Vec::new(), 0u64);
+    for (shadow, _, why) in rows {
+        if why.is_some() || bytes >= step {
             continue;
         }
         if !shadow.idle() {
             PROMOTED[2].fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let Some(placed) = crate::inplace::place_any(shadow.start, shadow.len, shadow.window) else {
-            refused.insert(shadow.id);
+        let Some(made) = crate::inplace::place_any(shadow.start, shadow.len, shadow.window) else {
+            state.refused.insert(shadow.id);
             PROMOTED[1].fetch_add(1, Ordering::Relaxed);
             continue;
         };
         // a placed copy that found no entry drops here and uncounts itself
-        if swap_in_place(&shadow, placed) {
+        if swap_in_place(&shadow, made) {
             PROMOTED[0].fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(start = format_args!("{:#x}", shadow.start), len = shadow.len, ?heat, "a copy is in place now");
+            bytes += shadow.len;
+            ids.push(shadow.id);
+            if let Some(new) = find_placed(&shadow) {
+                placed.push(Arc::downgrade(&new));
+            }
         }
-        seen.remove(&shadow.id);
+        state.seen.remove(&shadow.id);
     }
+    if !ids.is_empty() {
+        tracing::info!(copies = ids.len(), mb = bytes >> 20, before_ms, "in-place picks on trial");
+        state.trial = Some(Trial { placed, ids, before_ms, at: now });
+    }
+}
+
+// the placed copy now in the tables where `old` was
+fn find_placed(old: &Shadow) -> Option<Arc<Shadow>> {
+    if old.window {
+        return LOOSE.lock().unwrap_or_else(|e| e.into_inner()).get(&(old.start, old.len)).filter(|s| s.place.is_some()).cloned();
+    }
+    buffers()
+        .range(..=(old.start, usize::MAX))
+        .rev()
+        .take(64)
+        .filter_map(|(k, e)| (k.0 == old.start).then_some(e.shadow.as_ref()?))
+        .find(|s| s.place.is_some() && s.len == old.len)
+        .cloned()
 }
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
@@ -4376,19 +4537,65 @@ mod promote_tests {
     // in place only what something rewrites most frames and shaders read about once
     #[test]
     fn only_rewritten_and_lightly_read_copies_are_worth_it() {
+        let worth = |h: Heat, cpu: bool, gpu: bool| not_worth(h, 2, cpu, gpu, true).is_none();
         let ring = Heat { frames: 16, cpu: 16, cpu_bytes: 16 << 20, asked: 16 << 20, size: 4 << 20, watched: true, ..Default::default() };
-        assert!(worth_in_place(ring, 2, true, false), "an upload ring read once");
-        assert!(!worth_in_place(ring, 2, false, true), "the cpu rule is off");
-        assert!(!worth_in_place(Heat { frames: 4, ..ring }, 2, true, true), "too few frames looked at");
-        assert!(!worth_in_place(Heat { cpu: 7, ..ring }, 2, true, true), "rewritten in under half the frames");
-        assert!(!worth_in_place(Heat { asked: 40 << 20, ..ring }, 2, true, true), "read many times what is written");
-        assert!(!worth_in_place(Heat { watched: false, ..ring }, 2, true, false), "unwatched: copied whole, cpu counts say nothing");
+        assert!(worth(ring, true, false), "an upload ring read once");
+        assert!(!worth(ring, false, true), "the cpu rule is off");
+        assert!(!worth(Heat { frames: 4, ..ring }, true, true), "too few frames looked at");
+        assert!(!worth(Heat { cpu: 7, ..ring }, true, true), "rewritten in under half the frames");
+        assert!(!worth(Heat { asked: 40 << 20, ..ring }, true, true), "read many times what is written");
+        assert!(!worth(Heat { watched: false, ..ring }, true, false), "unwatched: copied whole, cpu counts say nothing");
         let output = Heat { frames: 16, gpu: 12, asked: 64 << 20, size: 4 << 20, ..Default::default() };
-        assert!(worth_in_place(output, 2, false, true), "card output read once a frame");
-        assert!(!worth_in_place(Heat { asked: 200 << 20, ..output }, 2, false, true), "card output read by many draws");
+        assert!(worth(output, false, true), "card output read once a frame");
+        assert!(!worth(Heat { asked: 200 << 20, ..output }, false, true), "card output read by many draws");
         let vertices = Heat { frames: 16, asked: 900 << 20, size: 8 << 20, watched: true, ..Default::default() };
-        assert!(!worth_in_place(vertices, 2, true, true), "static vertices read every draw stay on the card");
-        assert!(!worth_in_place(Heat { asked: 0, ..ring }, 2, true, true), "never read: nothing to gain");
+        assert!(!worth(vertices, true, true), "static vertices read every draw stay on the card");
+        assert!(!worth(Heat { asked: 0, ..ring }, true, true), "never read: nothing to gain");
+    }
+
+    // reads through descriptor slots are unseen: such a copy goes on trial if its writes qualify, or stays out by switch
+    #[test]
+    fn bindless_copies_go_on_trial_by_their_writes() {
+        let slots = Heat { frames: 16, gpu: 16, size: 2 << 20, bindless: true, ..Default::default() };
+        assert_eq!(not_worth(slots, 2, true, true, true), None, "no asks seen, but written every frame: on trial");
+        assert!(not_worth(slots, 2, true, true, false).is_some_and(|w| w.contains("descriptor slots")));
+        assert!(not_worth(Heat { gpu: 3, ..slots }, 2, true, true, true).is_some(), "written too rarely");
+        assert_eq!(Heat { frames: 16, gpu: 16, size: 2 << 20, ..Default::default() }.pot(), 2 << 20, "card-written: the whole copy each frame");
+        assert_eq!(Heat { frames: 16, cpu_bytes: 32 << 20, ..Default::default() }.pot(), 2 << 20, "cpu bytes per frame");
+    }
+
+    // a trial is judged by the frame time: slower than the tolerance takes the step back
+    #[test]
+    fn trials_take_back_what_made_frames_slower() {
+        assert!(!trial_failed(200.0, 205.0, 3.0));
+        assert!(trial_failed(200.0, 207.0, 3.0));
+        assert!(!trial_failed(200.0, 150.0, 3.0));
+        assert_eq!(frame_ms_since((10, 1000), (20, 3000)), None, "under 16 frames");
+        assert_eq!(frame_ms_since((10, 1000), (30, 5000)), Some(200.0));
+    }
+
+    // a copy demoted from place leaves the tables so the next ask makes an ordinary copy
+    #[test]
+    fn a_demoted_copy_leaves_the_tables() {
+        let Some(device) = warp() else { return };
+        // SAFETY: the test's own allocation, released at the end
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 2 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            let (start, len) = (base as u64, 1 << 16);
+            let resource = base as usize ^ 0xa5a5;
+            register(resource, start, len);
+            let placed = crate::inplace::place_part(&device, start, len).expect("placed");
+            let shadow = Arc::new(Shadow::placed(placed, start, len, false));
+            buffers().get_mut(&(start, resource)).unwrap().shadow = Some(shadow.clone());
+            assert!(find_placed(&shadow).is_some_and(|s| Arc::ptr_eq(&s, &shadow)));
+            assert!(demote(&shadow));
+            assert!(shadow.superseded());
+            assert!(buffers().get(&(start, resource)).is_some_and(|e| e.shadow.is_none()));
+            assert!(!demote(&shadow), "gone already");
+            unregister(resource, start);
+            drop(shadow);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 
     // declared writes count once per frame

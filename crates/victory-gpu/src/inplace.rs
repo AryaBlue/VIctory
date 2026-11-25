@@ -322,6 +322,25 @@ pub(crate) fn pick_windows() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_WINDOWS").is_ok_and(|v| v == "1"))
 }
 
+// copies reached through descriptor slots may be picked, on trial, VICTORY_INPLACE_PICK_BINDLESS (1; 0 keeps them out)
+// (fast-8: nearly every copy is reached that way, so leaving them out picked nothing)
+pub(crate) fn pick_bindless() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_PICK_BINDLESS").is_none_or(|v| v != "0"))
+}
+
+// bytes put in place per trial step, VICTORY_INPLACE_PICK_STEP_MB (64)
+pub(crate) fn pick_step() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_STEP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20)
+}
+
+// percent the frame may get slower before a step is taken back, VICTORY_INPLACE_PICK_TOLERANCE (3)
+pub(crate) fn pick_tolerance() -> f64 {
+    static N: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_TOLERANCE").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(3.0))
+}
+
 // a big buffer goes in place instead of to the card
 pub(crate) fn upload_in_place(start: u64, len: u64) -> bool {
     let want = upload_level();
@@ -377,10 +396,11 @@ fn say() {
     if written_on() || pick() {
         let p = crate::shadow::promoted_stats();
         tracing::info!(
-            "copies swapped in place (VICTORY_INPLACE_PICK/WRITTEN): {}, refused {}, put off while busy {}; copies taken out of the tables {}",
+            "copies swapped in place (VICTORY_INPLACE_PICK/WRITTEN): {}, refused {}, put off while busy {}, taken back after a trial {}; copies taken out of the tables {}",
             p[0],
             p[1],
             p[2],
+            p[3],
             crate::shadow::superseded_count()
         );
     }
@@ -1248,6 +1268,50 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     }
 }
 
+// why view memory under a buffer is not one run, by pairs of pages next to each other in address
+#[derive(Default, Debug, PartialEq)]
+struct Scatter {
+    pages: u64,
+    next: u64,
+    same: u64,
+    other: u64,
+    aliased: u64,
+    in_big: u64,
+}
+
+impl Scatter {
+    fn add(&mut self, v: &Views, at: usize, len: usize) {
+        let mut last: Option<(usize, u64)> = None;
+        let mut page = at - at % K64;
+        while page < at + len {
+            let shown = v.views.range(..=page).next_back().filter(|(base, view)| *base + view.0 > page);
+            let Some((&base, &(_, section, offset))) = shown else {
+                last = None;
+                page += K64;
+                continue;
+            };
+            let slot = (section, offset + (page - base) as u64);
+            self.pages += 1;
+            if let Some(was) = last {
+                match (was.0 == slot.0, was.1 + K64 as u64 == slot.1) {
+                    (true, true) => self.next += 1,
+                    (true, false) => self.same += 1,
+                    _ => self.other += 1,
+                }
+            }
+            if let Some(all) = v.pages.get(&slot).filter(|all| all.len() > 1) {
+                self.aliased += 1;
+                let big = all.iter().filter(|&&a| a != page).any(|&a| {
+                    v.views.range(..=a).next_back().is_some_and(|(b, view)| *b + view.0 > a && view.0 > 1 << 20)
+                });
+                self.in_big += u64::from(big);
+            }
+            last = Some(slot);
+            page += K64;
+        }
+    }
+}
+
 /// The census lines for `spans` (start, bytes, whether a window outside
 /// buffers).
 fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
@@ -1296,6 +1360,18 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
+    let mut why = Scatter::default();
+    for &(start, len, window) in spans {
+        if !window && cover_in(&v.views, start as usize, len as usize) == Cover::Scattered {
+            why.add(&v, start as usize, len as usize);
+        }
+    }
+    if why.pages > 0 {
+        lines.push(format!(
+            "census, why scattered buffers are scattered: {} pages; next page in address is the next of the section {}, elsewhere in the same section {}, in another section {};              pages shown at more than one address {} (slotted by another view first: VICTORY_POOL_LAZY cannot order them),              of those also inside a view of over 1 MB {}",
+            why.pages, why.next, why.same, why.other, why.aliased, why.in_big
+        ));
+    }
     for &(_, bytes, committed) in &v.sections {
         lines.push(format!(
             "census, a section of {} MB, {}",
@@ -1443,6 +1519,27 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    // a buffer over single pages that a whole view slotted first: lazy slots cannot order them
+    #[test]
+    fn scatter_says_why() {
+        let mut v = Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() };
+        let mut view = |v: &mut Views, at: usize, len: usize, section: usize, offset: u64| {
+            v.views.insert(at, (len, section, offset));
+            for k in 0..len / K64 {
+                v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
+            }
+        };
+        view(&mut v, 0x1_0000_0000, 32 * K64, 5, 0);
+        let at = 0x2_0000_0000;
+        view(&mut v, at, K64, 5, 7 * K64 as u64);
+        view(&mut v, at + K64, K64, 5, 8 * K64 as u64);
+        view(&mut v, at + 2 * K64, K64, 5, 3 * K64 as u64);
+        view(&mut v, at + 3 * K64, K64, 6, 0);
+        let mut s = Scatter::default();
+        s.add(&v, at, 4 * K64);
+        assert_eq!(s, Scatter { pages: 4, next: 1, same: 1, other: 1, aliased: 3, in_big: 3 });
     }
 
     /// What the runtime forgets when memory is mapped anew.
