@@ -6221,7 +6221,7 @@ impl HostList {
         self.pass_end();
         // The scratch buffers its prelude fills and leaves readable as
         // arguments: common again behind the list, as every scratch buffer.
-        for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.records() > 0) {
+        for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.readable()) {
             // SAFETY: an open list and a live buffer.
             unsafe {
                 self.list.ResourceBarrier(&[transition(
@@ -6691,21 +6691,48 @@ impl HostList {
     /// From here on the list gathers no records (`crate::indirect::gather`):
     /// what is about to be recorded may write arguments.
     pub(crate) fn gather_close(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        gather.closed = true;
+        for set in &mut gather.sets {
+            set.close();
+        }
+    }
+
+    /// The pass of a segment opened in `set` ([`crate::indirect::gather_segments`]),
+    /// recorded in the list here. False with nothing recorded if it cannot be.
+    fn segment_pass(&self, set: &mut crate::indirect::GatherSet, seg: crate::indirect::Segment) -> bool {
+        let (Some(c), Some(budget)) = (crate::indirect::clamp(), self.budget()) else {
+            return false;
+        };
+        let before = if set.readable() { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+        let done = crate::indirect::record_gather_as(
+            c,
+            &self.list,
+            (&set.scratch, before),
+            budget,
+            &set.src,
+            set.table_gpu + u64::from(seg.count) * 4,
+            (set.kind, set.stride, seg.most),
+            (u64::from(seg.base) * u64::from(set.stride), true),
+        );
+        set.in_list |= done;
+        done
     }
 
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
-    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
         let none = |why: usize| {
             crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
             None
         };
+        let segments = crate::indirect::gather_segments();
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        if gather.closed {
+        if gather.closed && !segments {
             return none(1);
         }
+        let closed = gather.closed;
         let found = gather
             .sets
             .iter()
@@ -6740,7 +6767,7 @@ impl HostList {
                         scratch
                     }
                 };
-                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
+                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_TABLE_WORDS) * 4) else {
                     gather.spare.push(scratch);
                     return none(4);
                 };
@@ -6749,10 +6776,29 @@ impl HostList {
             }
         };
         let set = &mut gather.sets[at];
+        let mut opened = false;
+        if closed && set.open.is_none_or(|s| s.n >= s.most) {
+            let Some(seg) = set.open_segment() else {
+                return none(3);
+            };
+            if !self.segment_pass(set, seg) {
+                set.close();
+                return none(4);
+            }
+            opened = true;
+            crate::indirect::GATHER_SEGS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        let had = set.open.map_or(0, |s| s.n);
         let Some(slot) = set.slot(offset) else {
             return none(3);
         };
-        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride)))
+        if closed {
+            crate::indirect::GATHER_SEGS[2].fetch_add(1, Ordering::Relaxed);
+            if set.open.map_or(0, |s| s.n) > had {
+                crate::indirect::GATHER_SEGS[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride), opened))
     }
 
     /// Notes what the command about to be recorded does, as a marker
