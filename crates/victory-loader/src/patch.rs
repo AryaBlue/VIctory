@@ -98,15 +98,21 @@ fn planned<'a>(patches: &'a [Patch], module: &str, size: usize) -> Vec<&'a Patch
         .collect()
 }
 
-// the replaced bytes, or what was found when it isn't what the patch expects
-fn write(image: &mut [u8], patch: &Patch) -> Result<Vec<u8>, Vec<u8>> {
-    let range = patch.rva..patch.rva + patch.bytes.len();
-    let old = image[range.clone()].to_vec();
+// `target` is the patch's own range of the image (what `apply` maps); the
+// replaced bytes, or what was found when it isn't what the patch expects
+fn write(target: &mut [u8], patch: &Patch) -> Result<Vec<u8>, Vec<u8>> {
+    let old = target.to_vec();
     if patch.expect.as_ref().is_some_and(|e| *e != old) {
         return Err(old);
     }
-    image[range].copy_from_slice(&patch.bytes);
+    target.copy_from_slice(&patch.bytes);
     Ok(old)
+}
+
+// a whole image in memory, as the tests have it
+#[cfg(test)]
+fn write_image(image: &mut [u8], patch: &Patch) -> Result<Vec<u8>, Vec<u8>> {
+    write(&mut image[patch.rva..patch.rva + patch.bytes.len()], patch)
 }
 
 #[cfg(windows)]
@@ -239,7 +245,7 @@ mod tests {
         let patches = parse("game.exe:4:010203");
         let planned = planned(&patches, "game.exe", 16);
         let mut image = [0xccu8; 16];
-        assert_eq!(write(&mut image, planned[0]), Ok(vec![0xcc; 3]));
+        assert_eq!(write_image(&mut image, planned[0]), Ok(vec![0xcc; 3]));
         assert_eq!(&image[4..7], &[1, 2, 3]);
         assert_eq!(image[7], 0xcc);
     }
@@ -255,7 +261,7 @@ mod tests {
             image.len(),
         );
         assert_eq!(picked.len(), 1);
-        assert_eq!(write(&mut image, picked[0]), Ok(WATCHDOG_OLD.to_vec()));
+        assert_eq!(write_image(&mut image, picked[0]), Ok(WATCHDOG_OLD.to_vec()));
         let at = WATCHDOG_RVA + 8;
         // jne rel32 (0f 85, ends at +6) -> nop; jmp rel32 (e9, ends at +6)
         assert_eq!(&image[at..at + 2], &[0x90, 0xe9]);
@@ -264,10 +270,18 @@ mod tests {
     }
 
     #[test]
+    fn write_works_on_the_patch_range_alone_as_apply_maps_it() {
+        // up to aeb98b54 this indexed the 14-byte range by the rva and panicked (run s4-skip-1)
+        let mut range = WATCHDOG_OLD;
+        assert_eq!(write(&mut range, &watchdog()), Ok(WATCHDOG_OLD.to_vec()));
+        assert_eq!(range, WATCHDOG_NEW);
+    }
+
+    #[test]
     fn watchdog_patch_leaves_other_bytes_alone() {
         let mut image = vec![0x90u8; WATCHDOG_RVA + 0x40];
         let before = image.clone();
-        assert!(write(&mut image, &watchdog()).is_err());
+        assert!(write_image(&mut image, &watchdog()).is_err());
         assert_eq!(image, before);
         assert!(planned(&[watchdog()], "small.dll", 0x1000).is_empty());
     }
