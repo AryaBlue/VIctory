@@ -929,7 +929,9 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-    // blocks the handler opened without the lock: opened here first (VICTORY_ONWRITE_LOCKFREE)
+    // blocks the handler opened without the lock: opened here first (VICTORY_ONWRITE_LOCKFREE),
+    // once every block taken is pushed
+    crate::guard_free::wait_flights();
     crate::guard_free::drain(|block, frame| opened_free(&mut g, block, frame));
     g
 }
@@ -1678,12 +1680,18 @@ fn install() {
         }
         let at = r.ExceptionInformation[1];
         // marked ours and read-only: opened without the lock, noted at the next drain
+        // in flight from before the take until the push: a pass waits for it (guards())
+        let flight = crate::guard_free::Flight::enter();
         if crate::guard_free::take(at / BLOCK) {
-            open_taken(at / BLOCK);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
+            if open_taken(at / BLOCK, flight) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        } else {
+            // out of flight before the locked way below waits for flights
+            drop(flight);
         }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
@@ -1715,15 +1723,30 @@ fn install() {
 /// In the handler, for a block [`crate::guard_free::take`] gave it: read-write
 /// now, and queued for the guards' next holder; under the lock if the queue
 /// is full.
-fn open_taken(block: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+/// False if the block was not read-only after all (remapped since it was
+/// marked): its protection is put back and the caller goes the locked way.
+fn open_taken(block: usize, flight: Option<crate::guard_free::Flight>) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
     // SAFETY: a block we made read-only.
-    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    if old != PAGE_READONLY {
+        let mut was = 0;
+        // SAFETY: as it was a moment ago.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut was) };
+        return false;
+    }
+    #[cfg(test)]
+    crate::guard_free::park_here();
     let frame = crate::frame::current();
     if !crate::guard_free::push(block, frame) {
+        // out of flight first: guards() waits for every flight
+        drop(flight);
         opened_free(&mut guards(), block, frame);
     }
+    true
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -2569,6 +2592,38 @@ mod tests {
         assert!(copy == memory, "a write was missed (locked: {locked})");
         drop_views(section, &[one, two], SIZE);
         writes.load(Ordering::Relaxed)
+    }
+
+    // a handler stopped between its take and its push while a pass runs: the pass waits for it,
+    // and a write landed meanwhile by another thread (no fault: the block is open) is reported
+    #[test]
+    fn a_pass_waits_for_a_block_taken_and_not_yet_queued() {
+        use std::sync::atomic::Ordering;
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        assert!(guard(one, one + SIZE).is_some());
+        assert!(guard(one, one + SIZE).is_some(), "taken: clean from here");
+        crate::guard_free::GO.store(false, Ordering::SeqCst);
+        crate::guard_free::PARKED.store(false, Ordering::SeqCst);
+        let parked = std::thread::spawn(move || {
+            crate::guard_free::PARK.with(|p| p.set(true));
+            // SAFETY: inside the first view; faults and parks after the take
+            unsafe { ((one + BLOCK + 8) as *mut u8).write_volatile(1) };
+        });
+        while !crate::guard_free::PARKED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // open now: no fault, nothing queued
+        // SAFETY: inside the first view.
+        unsafe { ((one + BLOCK + 100) as *mut u8).write_volatile(2) };
+        let pass = std::thread::spawn(move || guard(one, one + SIZE));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!pass.is_finished(), "the pass waits for the flight");
+        crate::guard_free::GO.store(true, Ordering::SeqCst);
+        parked.join().unwrap();
+        let written = pass.join().unwrap().expect("a view");
+        assert!(written.contains(&((one + BLOCK) / PAGE)), "the block taken and its later write are reported");
+        drop_views(section, &[one, two], SIZE);
     }
 
     #[test]

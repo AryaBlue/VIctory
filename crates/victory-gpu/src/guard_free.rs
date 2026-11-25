@@ -108,6 +108,62 @@ pub(crate) fn unmark(block: usize) {
     }
 }
 
+// handler calls between before their take and after their push
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// A handler call in flight ([`IN_FLIGHT`]) while held; none when off.
+pub(crate) struct Flight(());
+
+impl Flight {
+    pub(crate) fn enter() -> Option<Flight> {
+        on().then(|| {
+            IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+            Flight(())
+        })
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Under the guards' lock, before the drain: a block taken (read-write
+/// now) but not pushed yet would be read as clean by the pass.
+pub(crate) fn wait_flights() {
+    let mut spins = 0u32;
+    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        spins += 1;
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) static PARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// a test's writer stops between its take and its push until GO
+#[cfg(test)]
+pub(crate) fn park_here() {
+    if PARK.with(|p| p.get()) {
+        PARKED.store(true, Ordering::SeqCst);
+        while !GO.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     // a test's writer threads that fault the locked way
