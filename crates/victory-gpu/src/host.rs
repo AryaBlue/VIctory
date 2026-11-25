@@ -5489,7 +5489,10 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // burst refresh: not again for a submission enqueued before the last sync began
+        if crate::burst::heap_due() {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5522,6 +5525,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        batch.burst = crate::burst::begin(&mut batch.current);
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -5534,6 +5538,7 @@ impl Host {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
+                        && !batch.covered(shadow, *address, *len)
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -5569,6 +5574,9 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        if let Some(pass) = batch.burst.take() {
+            pass.end(&batch.current);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -7049,18 +7057,26 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    // burst refresh: `current` came from the submissions before and goes on to the next
+    burst: Option<crate::burst::Pass>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if let Some(pass) = &mut self.burst {
+            pass.written(&mut self.current);
+        }
         // Brought up to date in this submission already ([`refresh_once`];
         // nothing is in `current` without the switch).
         if let Some(&(_, from, to)) = self.current.get(&key)
             && from <= address
             && end <= to
         {
+            if let Some(pass) = &self.burst {
+                pass.skipped(shadow, address, len);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(crate::copystat::C::Skipped, 1);
@@ -7078,6 +7094,16 @@ impl Batch {
                 self.refreshes.push((shadow.clone(), address, end));
             }
         }
+    }
+
+    // burst refresh: the range needs no asking ahead; with the check everything is asked as before
+    fn covered(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) -> bool {
+        self.burst.is_some()
+            && !crate::burst::check()
+            && self
+                .current
+                .get(&(std::sync::Arc::as_ptr(shadow) as usize))
+                .is_some_and(|&(_, from, to)| from <= address && address + len <= to)
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
@@ -7104,7 +7130,7 @@ impl Batch {
         from: usize,
         to: usize,
     ) {
-        if !refresh_once() || from >= to {
+        if !(refresh_once() || crate::burst::on()) || from >= to {
             return;
         }
         let entry = current
