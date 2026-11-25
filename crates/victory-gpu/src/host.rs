@@ -365,6 +365,23 @@ fn flush_part(i: usize, since: std::time::Instant) {
     FLUSH_PARTS[i].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+// submit stages in us: settle before, sync_heaps, sweep, make_waiting, ask once, deferred loop,
+// last flush, ask once end, snapshots, card_before, settled inside, prep total, submissions
+static PREP_PARTS: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+// deferred steps: us then counts, kinds copy fill refresh run host gpuwrite texture
+static STEP_PARTS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    PREP_PARTS[i].fetch_add((now - since).as_micros() as u64, Ordering::Relaxed);
+    now
+}
+
+fn step_part(kind: usize, since: std::time::Instant) {
+    STEP_PARTS[kind].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    STEP_PARTS[7 + kind].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Adds to [`PREPARING`]'s copies (time, bytes) and to the frame log's totals.
 fn preparing(i: usize, n: u64) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
@@ -5454,6 +5471,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        let stage = std::time::Instant::now();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -5470,7 +5488,9 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
+        let stage = prep_part(0, stage);
         crate::descriptor::sync_heaps();
+        let stage = prep_part(1, stage);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5490,7 +5510,9 @@ impl Host {
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
+        let stage = prep_part(2, stage);
         crate::descriptor::make_waiting();
+        prep_part(3, stage);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5507,6 +5529,7 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        let stage = std::time::Instant::now();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -5540,6 +5563,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        let stage = prep_part(4, stage);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -5548,8 +5572,11 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        let stage = prep_part(5, stage);
         batch.flush();
+        let stage = prep_part(6, stage);
         crate::watch::ask_once_end();
+        let stage = prep_part(7, stage);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5563,6 +5590,7 @@ impl Host {
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
+        let stage = prep_part(8, stage);
         let flown = late && relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
@@ -5573,7 +5601,11 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        prep_part(9, stage);
         let prepared = std::time::Instant::now();
+        PREP_PARTS[10].fetch_add(settled.as_micros() as u64, Ordering::Relaxed);
+        PREP_PARTS[11].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+        PREP_PARTS[12].fetch_add(1, Ordering::Relaxed);
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -6936,6 +6968,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    step_part(0, started);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -6946,6 +6979,7 @@ impl HostList {
                         fill_check::runs(src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    step_part(1, started);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -6955,6 +6989,7 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
+                    step_part(2, started);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -6972,6 +7007,7 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    step_part(if matches!(step, Step::Run(_)) { 3 } else { 4 }, started);
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
@@ -6989,12 +7025,14 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
+                    step_part(5, started);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
+                    step_part(6, started);
                     continue;
                 }
             };
@@ -7755,6 +7793,20 @@ impl Meter {
                 "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames
+            );
+        }
+        {
+            let p: Vec<f64> = PREP_PARTS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let st: Vec<f64> = STEP_PARTS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let ms = |v: f64| v / 1e3;
+            let inside: f64 = p[4..10].iter().sum();
+            tracing::info!(
+                "submit stages per frame, {:.1} submissions: before prep: settling {:.1} ms, descriptor heaps synced {:.1}, sweep {:.1}, waiting slots made {:.1}; prep {:.1} ms: asking once {:.1}, deferred steps {:.1}, last flush {:.1}, asks once ended {:.1}, snapshots {:.1}, card checks built {:.1} (these parts include any settling inside), unaccounted {:.1} (settled inside, not in prep: {:.1})",
+                p[12], ms(p[0]), ms(p[1]), ms(p[2]), ms(p[3]), ms(p[11]), ms(p[4]), ms(p[5]), ms(p[6]), ms(p[7]), ms(p[8]), ms(p[9]), ms(p[11] + p[10] - inside), ms(p[10])
+            );
+            tracing::info!(
+                "deferred steps per frame, ms (count), each with the flushes it set off: copies {:.1} ({:.0}), fills {:.1} ({:.0}), refreshes queued {:.1} ({:.0}), runs {:.1} ({:.0}), host work {:.1} ({:.0}), gpu writes {:.1} ({:.0}), textures {:.1} ({:.0})",
+                ms(st[0]), st[7], ms(st[1]), st[8], ms(st[2]), st[9], ms(st[3]), st[10], ms(st[4]), st[11], ms(st[5]), st[12], ms(st[6]), st[13]
             );
         }
         {
