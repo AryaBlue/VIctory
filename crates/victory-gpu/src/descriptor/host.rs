@@ -1793,6 +1793,12 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            // the same resource again: kept as it is, nothing to retire
+            if let (Some(old), Some(new)) = (slot.as_ref(), resource.as_ref())
+                && windows::core::Interface::as_raw(old) == windows::core::Interface::as_raw(new)
+            {
+                return;
+            }
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
