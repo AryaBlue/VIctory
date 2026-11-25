@@ -1913,6 +1913,7 @@ impl HostHeap {
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
+        fine: bool,
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
@@ -1954,7 +1955,8 @@ impl HostHeap {
                 due.push((index as u32, handle));
             }
         }
-        self.mirror_due(&due, sync_batch());
+        // fine: the made lock record by record (the heap helper keeps its holds short)
+        self.mirror_due(&due, sync_batch() && !fine);
         (looked, due.len() as u64)
     }
 
