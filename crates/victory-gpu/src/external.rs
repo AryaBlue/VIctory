@@ -26,6 +26,11 @@ pub fn host_texture(
 ) -> Option<(ID3D12Resource, u32)> {
     let host = crate::list::host_list(list)?;
     let texture = crate::resource::host_resource(resource)?.clone();
+    // a state the library writes in (render target, unordered access, depth write, copy dest): the card's now, not title memory's
+    if state & (0x4 | 0x8 | 0x10 | 0x400) != 0 {
+        crate::texture::card_writes(host, resource, &texture, None);
+        crate::texture::host_written(resource);
+    }
     crate::list::ensure_state(host, resource, state);
     let state = crate::host::legal_state(&texture, state);
     Some((texture, state))
