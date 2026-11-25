@@ -24,7 +24,7 @@ CPU, 48 GB RAM.
 | Gameplay (the prologue) | you can walk and look around as Lucia; world, characters and textures render |
 | Series S profile (`--console series-s`) | reaches gameplay; the game's own upscaler path runs |
 | Upscaling | the game's FSR calls are served on the PC: NVIDIA DLSS (Super Resolution) or AMD FSR 3.1, 1280x720 to 1920x1080 |
-| Frame rate in the world | **7.4-7.6 fps** settled with Series S + DLSS (131-135 ms a frame, median of four five-minute runs; the fastest stretches reach 8). It was 5.2-5.6 fps earlier the same day and about 6.2 before per-draw table reuse. The Series X profile has not been re-measured (4.5-4.6 fps at 1080p before) |
+| Frame rate in the world | **7.4-7.6 fps** settled with Series S + DLSS and shadow cascades capped at three (131-135 ms a frame, median of four five-minute runs; the fastest stretches reach 8); **6.7-6.9 fps** with full shadow cascades. Measured in the opening cutscene, which unattended runs do not yet leave. It was 5.2-5.6 fps earlier the same day and about 6.2 before per-draw table reuse. The Series X profile has not been re-measured (4.5-4.6 fps at 1080p before) |
 | Stability | full five-minute runs with no device loss |
 | Pause menu, HUD layer | the game presents its interface as a second 4K layer; drawing it is fixed on a branch (the pause menu shows in full there) and not merged here yet |
 | Light in shadow | still dark: the game's ray-traced lighting does not run yet |
@@ -72,10 +72,12 @@ VICTORY_LATE_WAIT_LISTS=512
 victory run <path to game_scarlett_master.exe> --execute --console series-s
 ```
 
-That is the set the 7.4-7.6 fps runs used. They also set
-`VICTORY_SHADOW_CASCADES=3`, which trims shadow detail for about 1.5 ms of
-GPU time; it is left out above because it lowers picture quality. All
-in-place (`VICTORY_INPLACE*`) switches were off.
+That is the set the 7.4-7.6 fps runs used, together with
+`VICTORY_SHADOW_CASCADES=3`, which caps the shadow cascades. The cap is left
+out above because it lowers picture quality, and it matters: the same set
+without it measured 6.7-6.9 fps (142-150 ms a frame) in two runs, so the cap
+is worth about 10 ms a frame here. All in-place (`VICTORY_INPLACE*`) switches
+were off.
 
 Build with the `dlss` cargo feature and `VICTORY_DLSS_SDK` pointing at
 NVIDIA's [DLSS SDK](https://github.com/NVIDIA/DLSS); the DLSS runtime is not
