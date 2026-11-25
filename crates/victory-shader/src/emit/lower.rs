@@ -236,6 +236,8 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// With `split_lds`: the IR block, and whether it wrote or touched LDS since the waves last met.
+    lds_since: (usize, bool, bool),
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -1048,6 +1050,28 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's `VICTORY_LDS_MEET_TRIM`, for its thread only.
+    pub(super) static TEST_LDS_TRIM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The meetings before LDS accesses this thread's lowerings made.
+    pub(super) static LDS_MEETINGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `VICTORY_LDS_MEET_TRIM=1`: the two host waves of a console wave meet before an LDS access only
+/// when it may clash with what the block did since they last met (a write since, or a write now
+/// after any access); reads after reads go without. Off by default.
+pub(super) fn lds_meet_trim() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_TRIM.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_MEET_TRIM").is_some_and(|v| v == "1"))
+}
+
+/// Whether the waves must meet before an LDS access, given whether the block wrote or touched LDS
+/// since they last met and whether the access only reads.
+pub(super) fn lds_meet_needed(wrote: bool, touched: bool, reads_only: bool) -> bool {
+    wrote || (!reads_only && touched)
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1540,6 +1564,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_since: (usize::MAX, true, true),
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -4790,9 +4815,22 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            let reads_only = name.starts_with("ds_read") || name.starts_with("ds_load");
+            if self.lds_since.0 != b {
+                self.lds_since = (b, true, true);
+            }
+            if !lds_meet_trim() || lds_meet_needed(self.lds_since.1, self.lds_since.2, reads_only) {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.lds_since = (b, false, false);
+                #[cfg(test)]
+                LDS_MEETINGS.set(LDS_MEETINGS.get() + 1);
+            }
+            self.lds_since.2 = true;
+            if !reads_only {
+                self.lds_since.1 = true;
+            }
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -4811,6 +4849,9 @@ impl<'a> Lower<'a> {
                 };
                 if !waits {
                     mode &= !1;
+                } else {
+                    // the waves meet here too
+                    self.lds_since = (b, false, false);
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
