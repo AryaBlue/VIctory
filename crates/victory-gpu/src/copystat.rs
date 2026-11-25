@@ -157,6 +157,12 @@ pub(crate) enum C {
     ClampCounted,
     ClampStores,
     ClampMiss,
+    /// Root arguments set around draws (constants and views), those the
+    /// list held already with the same value, and pipelines set again
+    /// that our clamp's compute pipeline had replaced.
+    RootArgSets,
+    RootArgSame,
+    PsoAfterClamp,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1343,6 +1349,13 @@ pub(crate) fn log(frames: f64) {
         c[C::ClampCounted as usize],
         c[C::ClampStores as usize],
         c[C::ClampMiss as usize],
+    );
+    tracing::info!(
+        "  root arguments per frame: {:.0} set, {:.0} of them as the list held already (VICTORY_ROOT_CACHE=1 \
+         leaves those out); {:.0} pipelines set again after our clamp replaced them",
+        c[C::RootArgSets as usize],
+        c[C::RootArgSame as usize],
+        c[C::PsoAfterClamp as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
