@@ -565,6 +565,7 @@ mod tests {
                 sent: Mutex::default(),
                 masked: Mutex::default(),
                 size: 0,
+                listed: Default::default(),
             });
         } else if matches!(kind, Kind::Snapshot) {
             *shadow.before.lock().unwrap() = Some(held.to_vec());

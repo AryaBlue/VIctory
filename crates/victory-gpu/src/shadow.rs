@@ -112,6 +112,49 @@ struct Card {
     masked: Mutex<crate::card_mask::Notes>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    // card_listed: whether it is on the list, and the copy itself
+    listed: Listed,
+}
+
+#[derive(Default)]
+struct Listed {
+    on: std::sync::atomic::AtomicBool,
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
+}
+
+// VICTORY_CARD_DIRTY_LIST=1: card_dirty visits the copies with something to send, not every copy
+pub(crate) fn card_listed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(test) || std::env::var_os("VICTORY_CARD_DIRTY_LIST").is_some_and(|v| v == "1");
+        if on && !cfg!(test) {
+            tracing::info!("card copies with bytes to send are kept on a list (VICTORY_CARD_DIRTY_LIST=1)");
+        }
+        on
+    })
+}
+
+// copies with dirty ranges, masked dwords or the relay's notes
+static CARD_TO_SEND: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+impl Card {
+    // call after the range or dwords are in, outside their locks
+    fn list(&self) {
+        if card_listed()
+            && let Some(me) = self.listed.me.get()
+            && !self.listed.on.swap(true, Ordering::AcqRel)
+        {
+            CARD_TO_SEND.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+    }
+}
+
+fn carded_new(shadow: &Arc<Shadow>) {
+    let weak = Arc::downgrade(shadow);
+    if let Some(card) = &shadow.card {
+        let _ = card.listed.me.set(weak.clone());
+    }
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -379,44 +422,79 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>, Vec<(u32, u32)>)> {
+    card_dirty_as(sent_as, card_listed())
+}
+
+fn card_dirty_as(sent_as: u64, listed: bool) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>, Vec<(u32, u32)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    if listed {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        if CALLS.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.strong_count() > 0);
+        }
+        let list = std::mem::take(&mut *CARD_TO_SEND.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut again = Vec::new();
+        for weak in list {
+            let Some(shadow) = weak.upgrade() else {
+                continue;
+            };
+            let Some(card) = &shadow.card else {
+                continue;
+            };
+            // off before the take: a write after it lists the copy again
+            card.listed.on.store(false, Ordering::Release);
+            let (ranges, masked, noted) = card_take(card, sent_as, fetched);
+            // notes to drop on a later send keep it listed
+            if noted && !card.listed.on.swap(true, Ordering::AcqRel) {
+                again.push(weak);
+            }
+            if !ranges.is_empty() || !masked.is_empty() {
+                out.push((shadow.clone(), joined(ranges), masked));
+            }
+        }
+        if !again.is_empty() {
+            CARD_TO_SEND.lock().unwrap_or_else(|e| e.into_inner()).extend(again);
+        }
+        return out;
+    }
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let (ranges, masked) = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                let mut notes = c.masked.lock().unwrap_or_else(|e| e.into_inner());
-                // with VICTORY_MERGE_MASKED_INDEX the masked runs are kept per send
-                let masked = if relay() && crate::card_mask::indexed() {
-                    notes.send(sent_as, fetched)
-                } else {
-                    std::mem::take(&mut notes.pending)
-                };
-                drop(notes);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                    if !crate::card_mask::indexed() {
-                        sent.extend(crate::card_mask::byte_runs(&masked).into_iter().map(|(a, b)| (a, b, sent_as)));
-                    }
-                }
-                (ranges, masked)
-            })
-            .unwrap_or_default();
+        let (ranges, masked, _) = shadow.card.as_ref().map(|c| card_take(c, sent_as, fetched)).unwrap_or_default();
         if !ranges.is_empty() || !masked.is_empty() {
             out.push((shadow, joined(ranges), masked));
         }
         true
     });
     out
+}
+
+// what a copy has to send, taken; whether the relay's notes of it are still kept
+fn card_take(c: &Card, sent_as: u64, fetched: u64) -> (Vec<(usize, usize)>, Vec<(u32, u32)>, bool) {
+    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+    let ranges = std::mem::take(&mut *dirty);
+    let mut notes = c.masked.lock().unwrap_or_else(|e| e.into_inner());
+    // with VICTORY_MERGE_MASKED_INDEX the masked runs are kept per send
+    let masked = if relay() && crate::card_mask::indexed() {
+        notes.send(sent_as, fetched)
+    } else {
+        std::mem::take(&mut notes.pending)
+    };
+    let mut noted = !notes.sent.is_empty();
+    drop(notes);
+    if relay() {
+        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+        sent.retain(|s| s.2 > fetched);
+        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+        if !crate::card_mask::indexed() {
+            sent.extend(crate::card_mask::byte_runs(&masked).into_iter().map(|(a, b)| (a, b, sent_as)));
+        }
+        noted |= !sent.is_empty();
+    }
+    (ranges, masked, noted)
 }
 
 // runs of set bits of a page's piece mask as [first, end) pieces, gaps of up to two pieces copied with them
@@ -3133,6 +3211,8 @@ impl Shadow {
             MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
         }
         masked.extend(entries);
+        drop(notes);
+        card.list();
         true
     }
 
@@ -3457,6 +3537,8 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        drop(dirty);
+        card.list();
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -4214,6 +4296,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     masked: Mutex::default(),
                     size,
+                    listed: Default::default(),
                 };
                 (on_card, Some(card))
             }
@@ -4238,7 +4321,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            carded_new(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -4431,6 +4514,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 masked: Mutex::default(),
                 size: len,
+                listed: Default::default(),
             };
             (on_card, Some(card))
         }
@@ -4448,7 +4532,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        carded_new(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
@@ -4759,6 +4843,58 @@ mod promote_tests {
         }
     }
 
+    // the list gives what the walk over every copy gives, and an idle copy leaves it
+    #[test]
+    fn listed_copies_send_what_the_walk_sends() {
+        let mut side = vec![0u8; 1 << 16];
+        let Some(device) = warp() else { return };
+        let placed = {
+            // SAFETY: the test's own allocation
+            let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) };
+            crate::inplace::place_part(&device, base as u64, 4096).ok()
+        };
+        let Some(placed) = placed else { return };
+        let mut shadow = Shadow::new(placed.buffer.clone(), side.as_mut_ptr(), 0, 0x77_0000, 1 << 16);
+        shadow.card = Some(Card {
+            staging: placed.buffer.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            masked: Mutex::default(),
+            size: 0,
+            listed: Default::default(),
+        });
+        let shadow = Arc::new(shadow);
+        carded_new(&shadow);
+        let mine = |out: Vec<(Arc<Shadow>, Vec<(usize, usize)>, Vec<(u32, u32)>)>| {
+            out.into_iter().filter(|o| Arc::ptr_eq(&o.0, &shadow)).map(|o| (o.1, o.2)).collect::<Vec<_>>()
+        };
+        let write = || {
+            shadow.card_changed(256, 512);
+            shadow.card_changed(4096, 4100);
+            shadow.card_changed(512, 600);
+            let card = shadow.card.as_ref().unwrap();
+            card.masked.lock().unwrap().pending.extend([(8u32, 0xffu32), (12, 0xff00)]);
+            card.list();
+        };
+        write();
+        let walked = mine(card_dirty_as(1, false));
+        assert_eq!(walked, vec![(vec![(256, 600), (4096, 4100)], vec![(8, 0xff), (12, 0xff00)])]);
+        // the walk left it listed with nothing to send
+        assert!(mine(card_dirty_as(2, true)).is_empty());
+        write();
+        assert_eq!(mine(card_dirty_as(3, true)), walked);
+        assert!(mine(card_dirty_as(4, true)).is_empty());
+        assert!(!shadow.card.as_ref().unwrap().listed.on.load(Ordering::Acquire));
+        assert!(!CARD_TO_SEND.lock().unwrap().iter().any(|w| w.as_ptr() == Arc::as_ptr(&shadow)));
+        // listed once however many writes
+        write();
+        write();
+        assert_eq!(CARD_TO_SEND.lock().unwrap().iter().filter(|w| w.as_ptr() == Arc::as_ptr(&shadow)).count(), 1);
+        assert_eq!(mine(card_dirty_as(5, true)).len(), 1);
+        CARDED.lock().unwrap().retain(|w| w.as_ptr() != Arc::as_ptr(&shadow));
+    }
+
     // declared writes count once per frame
     #[test]
     fn heat_counts_frames_not_declarations() {
@@ -4779,6 +4915,7 @@ mod promote_tests {
             sent: Mutex::default(),
             masked: Mutex::default(),
             size: 0,
+            listed: Default::default(),
         });
         shadow.writing(0x10_0000, 64);
         shadow.writing(0x10_0040, 64);
@@ -4889,6 +5026,7 @@ pub(crate) mod card_merge_tests {
             sent: Mutex::new(sent),
             masked: Mutex::default(),
             size: 0,
+            listed: Default::default(),
         });
         *shadow.before.lock().unwrap() = snapshot;
         Some(std::sync::Arc::new(shadow))
@@ -4928,6 +5066,7 @@ pub(crate) mod card_merge_tests {
                 masked: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                listed: Default::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
