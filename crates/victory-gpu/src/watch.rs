@@ -653,9 +653,65 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
-    let g = guards();
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first) || ((seen_views() || view_known()) && g.views.contains(&first))
+    if view_memo() && VIEW_MEMO.with(|m| m.borrow_mut().holds(first)) {
+        return true;
+    }
+    let g = guards();
+    let view = g.protected.contains(&first) || ((seen_views() || view_known()) && g.views.contains(&first));
+    if view && view_memo() {
+        VIEW_MEMO.with(|m| m.borrow_mut().keep(first));
+    }
+    view || g.absent.contains(&first)
+}
+
+/// Whether [`known_view`] remembers, on each thread, the blocks it found to
+/// be view memory until the runtime maps or unmaps title memory
+/// (`VICTORY_VIEW_MEMO=1`; off by default).
+///
+/// Why: in the s2-prep-1 profile the submitting thread waited 6.4 ms a
+/// frame for the guards' lock in [`known_view`] alone, asking about the
+/// same blocks at every submission. A block stays view memory until
+/// [`title_memory_remapped`]; blocks noted absent are not remembered (an
+/// ordinary commit fills them with no word to us).
+fn view_memo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MEMO").is_some_and(|v| v == "1"))
+}
+
+/// Mappings and unmappings of title memory so far: [`ViewMemo`] forgets
+/// what it held when this moves.
+static REMAPPINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A thread's view blocks, as of a count of [`REMAPPINGS`].
+#[derive(Default)]
+struct ViewMemo {
+    remappings: u64,
+    blocks: std::collections::HashSet<usize>,
+}
+
+impl ViewMemo {
+    fn current(&mut self) {
+        let now = REMAPPINGS.load(std::sync::atomic::Ordering::Acquire);
+        if now != self.remappings {
+            self.remappings = now;
+            self.blocks.clear();
+        }
+    }
+
+    fn holds(&mut self, block: usize) -> bool {
+        self.current();
+        self.blocks.contains(&block)
+    }
+
+    fn keep(&mut self, block: usize) {
+        self.current();
+        self.blocks.insert(block);
+    }
+}
+
+thread_local! {
+    static VIEW_MEMO: std::cell::RefCell<ViewMemo> = std::cell::RefCell::new(ViewMemo::default());
 }
 
 struct Guards {
@@ -1203,6 +1259,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in views {
         g.views.remove(&block);
     }
+    // under the guards' lock: a block remembered before this was found before it
+    REMAPPINGS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1262,6 +1320,20 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VICTORY_VIEW_MEMO: a remembered view block is forgotten once title
+    /// memory is mapped or unmapped.
+    #[test]
+    fn a_remembered_view_is_forgotten_at_a_remapping() {
+        let mut memo = ViewMemo::default();
+        memo.keep(7);
+        assert!(memo.holds(7));
+        assert!(!memo.holds(8));
+        REMAPPINGS.fetch_add(1, std::sync::atomic::Ordering::Release);
+        assert!(!memo.holds(7));
+        memo.keep(9);
+        assert!(memo.holds(9));
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };

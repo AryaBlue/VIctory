@@ -86,6 +86,8 @@ mod texture_worker;
 pub mod upscale;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod wide_copy;
 
 #[cfg(windows)]
 pub use host::on_failure;

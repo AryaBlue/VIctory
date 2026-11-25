@@ -7174,6 +7174,20 @@ impl Batch {
             let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
+        } else if crate::wide_copy::on() {
+            // decided here in order, the bytes moved wide (VICTORY_WIDE_COPIES)
+            let refreshes = std::mem::take(&mut self.refreshes);
+            let noted = crate::wide_copy::noted_in(|| {
+                for (shadow, from, to) in &refreshes {
+                    Self::update(shadow, *from, *to);
+                    Self::brought(&mut self.current, shadow, *from, *to);
+                }
+            });
+            let started = std::time::Instant::now();
+            crate::wide_copy::make(noted, crate::wide_copy::title_move);
+            preparing(0, started.elapsed().as_micros() as u64);
+            // the copies stay alive until their bytes are in
+            drop(refreshes);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
