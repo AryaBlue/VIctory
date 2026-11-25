@@ -268,6 +268,47 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
+// pending ranges where they are walked: declarations, their sum of lengths, the longest; refreshes and their sum;
+// merges under flights, their sum, the ranges they asked about; frames; then microseconds (VICTORY_PENDING_STATS=1):
+// declaring, a merge's askings, its merges
+static PEND: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+fn pend_times() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_STATS").is_some_and(|v| v == "1"))
+}
+
+fn pend_add(i: usize, n: u64) {
+    PEND[i].fetch_add(n, Ordering::Relaxed);
+}
+
+// at a declaration: counts the frames and says the line every 256
+fn pend_tick() {
+    const EVERY: u64 = 256;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::frame::current();
+    if LAST.swap(now, Ordering::Relaxed) == now || PEND[8].fetch_add(1, Ordering::Relaxed) + 1 < EVERY {
+        return;
+    }
+    let s: [u64; 12] = std::array::from_fn(|i| PEND[i].swap(0, Ordering::Relaxed));
+    let (frames, each) = (s[8].max(1) as f64, |sum: u64, n: u64| sum as f64 / n.max(1) as f64);
+    tracing::info!(
+        "pending ranges per frame: {:.0} declarations walking {:.0} each (the longest list {}); {:.0} refreshes of copies with some walking {:.0} each; {:.0} merges under flights walking {:.0} each and asking about {:.0} ranges; ms (VICTORY_PENDING_STATS=1: {}): declaring {:.1}, the merges' askings {:.1}, their merging {:.1}",
+        s[0] as f64 / frames,
+        each(s[1], s[0]),
+        s[2],
+        s[3] as f64 / frames,
+        each(s[4], s[3]),
+        s[5] as f64 / frames,
+        each(s[6], s[5]),
+        s[7] as f64 / frames,
+        pend_times(),
+        s[9] as f64 / 1000.0 / frames,
+        s[10] as f64 / 1000.0 / frames,
+        s[11] as f64 / 1000.0 / frames,
+    );
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -839,6 +880,15 @@ impl Flights {
             }
         }
         free
+    }
+}
+
+// its microseconds into PEND at its end
+struct Timed(std::time::Instant, usize);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        pend_add(self.1, self.0.elapsed().as_micros() as u64);
     }
 }
 
@@ -2533,7 +2583,13 @@ impl Shadow {
         }
         let range = (address, address + len);
         self.note_frame(H_GPU_AT);
+        pend_tick();
+        let started = pend_times().then(std::time::Instant::now);
+        let _timed = started.map(|s| Timed(s, 9));
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pend_add(0, 1);
+        pend_add(1, pending.len() as u64);
+        PEND[2].fetch_max(pending.len() as u64, Ordering::Relaxed);
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
@@ -3063,17 +3119,16 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pend_add(5, 1);
+            pend_add(6, pending.len() as u64);
+            pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect()
+        };
         if busy.is_empty() {
             return false;
         }
+        pend_add(7, busy.len() as u64);
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
@@ -3089,6 +3144,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
+            let asking = pend_times().then(|| Timed(std::time::Instant::now(), 10));
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
                 return true;
             };
@@ -3096,6 +3152,8 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            drop(asking);
+            let _merging = pend_times().then(|| Timed(std::time::Instant::now(), 11));
             let settle = if merge::wide() {
                 self.merge_stale_wide(a, e, &stale, now, runs_left, masked)
             } else {
@@ -3327,14 +3385,14 @@ impl Shadow {
 
     // the refresh of `[from, to)` (inside the buffer) as it always was; and whether no shader writes in it
     fn update_old(&self, from: usize, to: usize) -> (usize, bool) {
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.is_empty() {
+                pend_add(3, 1);
+                pend_add(4, pending.len() as u64);
+            }
+            pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
