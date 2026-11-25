@@ -551,19 +551,19 @@ thread_local! {
 }
 
 #[cfg(windows)]
-struct Own;
+struct Own<'a>(std::marker::PhantomData<&'a Vec<Held>>);
 
 #[cfg(windows)]
-impl Drop for Own {
+impl Drop for Own<'_> {
     fn drop(&mut self) {
         OWN_LINE.set(std::ptr::null());
     }
 }
 
 #[cfg(windows)]
-fn own_line(held: &Vec<Held>) -> Own {
+fn own_line(held: &Vec<Held>) -> Own<'_> {
     OWN_LINE.set(held);
-    Own
+    Own(std::marker::PhantomData)
 }
 
 /// Whether any queue's line holds something.

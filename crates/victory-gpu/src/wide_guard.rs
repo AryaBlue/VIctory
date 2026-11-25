@@ -90,7 +90,18 @@ pub(crate) fn during(ranges: &[(usize, usize)], f: impl FnOnce()) {
             FLUSH.with(|f| *f.borrow_mut() = None);
         }
     }
-    let ends = ask_ahead(ranges);
+    let early = crate::ask_early::on();
+    // with commit notices the guard pass reads the answers on retry frames only
+    let read = !crate::guard_log::commit_notice() || crate::guard_log::retry_frame(crate::frame::current());
+    let ends = if !read {
+        BTreeMap::new()
+    } else if early {
+        let (mut ends, left) = crate::ask_early::take(crate::watch::absent_in(ranges));
+        ends.append(&mut ask(left));
+        ends
+    } else {
+        ask_ahead(ranges)
+    };
     FLUSH.with(|f| {
         *f.borrow_mut() = Some(Flush {
             runs: Vec::new(),
@@ -112,6 +123,9 @@ pub(crate) fn during(ranges: &[(usize, usize)], f: impl FnOnce()) {
                 .collect()
         });
     }
+    if early {
+        crate::ask_early::next();
+    }
 }
 
 /// `runs` sorted, those that meet or overlap made one.
@@ -130,7 +144,11 @@ pub(crate) fn merged(mut runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// The absent blocks of `ranges` asked about on the wide threads: start
 /// block to end block of each uncommitted stretch found.
 fn ask_ahead(ranges: &[(usize, usize)]) -> BTreeMap<usize, usize> {
-    let absent = crate::watch::absent_in(ranges);
+    ask(crate::watch::absent_in(ranges))
+}
+
+// `absent` (lists of blocks) asked about, on the wide threads if more than one list
+fn ask(absent: Vec<Vec<usize>>) -> BTreeMap<usize, usize> {
     let found = Arc::new(Mutex::new(BTreeMap::new()));
     let walk = |blocks: &[usize], found: &Mutex<BTreeMap<usize, usize>>| {
         let mut until = 0;
