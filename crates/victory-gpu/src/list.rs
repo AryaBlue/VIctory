@@ -853,7 +853,7 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     worked(this);
-    stored(this);
+    stored(this, buffer_range(dst, dst_offset, len).map_or(0, |p| p as u64), len);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -887,7 +887,7 @@ pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     worked(this);
-    stored(this);
+    stored_buffer(this, dst);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -954,7 +954,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     worked(this);
-    stored(this);
     copy_resource(this, dst, src);
 }
 
@@ -981,7 +980,6 @@ extern "system" fn copy_texture_region(
     source_box: *const [u32; 6],
 ) {
     worked(this);
-    stored(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1214,7 +1212,6 @@ extern "system" fn copy_texture_region_x(
     _flags: u32,
 ) {
     worked(this);
-    stored(this);
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1395,7 +1392,7 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     worked(this);
-    stored(this);
+    stored(this, dst, len);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1453,7 +1450,7 @@ extern "system" fn resolve_queries(
     offset: u64,
 ) {
     worked(this);
-    stored(this);
+    stored_buffer(this, buffer);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -2040,17 +2037,28 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// write (the title's buffer barriers order compute passes).
 /// Work recorded after the title's own wait: a clamp waits for itself again
 /// (`crate::indirect::wait_share`).
-/// Something about to be recorded writes buffers: a list's gathered records
-/// are read before it ([`crate::indirect::gather_segments`]).
-fn stored(this: This) {
+/// Title memory `len` bytes from `at` is about to be written by the list: a
+/// record gathered there is read before it, so its set gathers no more
+/// (`crate::indirect::gather`).
+fn stored(this: This, at: u64, len: u64) {
     #[cfg(windows)]
-    if crate::indirect::gather_segments()
+    if at != 0
         && let Some(list) = host_list(this)
     {
-        list.gather_close();
+        list.gather_wrote((at, at.saturating_add(len)));
     }
     #[cfg(not(windows))]
-    let _ = this;
+    let _ = (this, at, len);
+}
+
+/// [`stored`] for the whole of a buffer.
+fn stored_buffer(this: This, buffer: This) {
+    #[cfg(windows)]
+    if let Some((at, len)) = crate::resource::buffer_bytes(buffer) {
+        stored(this, at as u64, len);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer);
 }
 
 fn worked(this: This) {
@@ -2209,13 +2217,13 @@ unsafe fn group_wait(count: u32, groups: *const u8) -> Wait {
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     worked(this);
-    stored(this);
+    stored(this, address, 4);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
     worked(this);
-    stored(this);
+    stored(this, address, 8);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {

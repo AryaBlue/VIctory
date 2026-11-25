@@ -3728,7 +3728,7 @@ impl State {
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
-            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride)).map(|(scratch, at, opened)| {
+            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), (offset, arguments), (kind, stride)).map(|(scratch, at, opened)| {
                 // a segment's pass went in front: our pipeline replaced the title's
                 if opened {
                     self.host_pipeline = 0;

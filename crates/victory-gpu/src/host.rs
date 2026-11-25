@@ -6690,6 +6690,16 @@ impl HostList {
 
     /// From here on the list gathers no records (`crate::indirect::gather`):
     /// what is about to be recorded may write arguments.
+    /// Title memory `[lo, hi)` is about to be written (a copy or an
+    /// immediate write the list records): the sets whose records may lie
+    /// there gather no more of them ([`crate::indirect::gather`]).
+    pub(crate) fn gather_wrote(&self, range: (u64, u64)) {
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        for set in &mut gather.sets {
+            set.wrote(range);
+        }
+    }
+
     pub(crate) fn gather_close(&self) {
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         gather.closed = true;
@@ -6722,7 +6732,7 @@ impl HostList {
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
-    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
+    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, (offset, title): (u32, u64), (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
         let none = |why: usize| {
             crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
             None
@@ -6775,6 +6785,10 @@ impl HostList {
                 gather.sets.len() - 1
             }
         };
+        let closed = closed || gather.sets[at].shut;
+        if closed && !segments {
+            return none(1);
+        }
         let set = &mut gather.sets[at];
         let mut opened = false;
         if closed && set.open.is_none_or(|s| s.n >= s.most) {
@@ -6792,6 +6806,7 @@ impl HostList {
         let Some(slot) = set.slot(offset) else {
             return none(3);
         };
+        set.note(title, stride);
         if closed {
             crate::indirect::GATHER_SEGS[2].fetch_add(1, Ordering::Relaxed);
             if set.open.map_or(0, |s| s.n) > had {

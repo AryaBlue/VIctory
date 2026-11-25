@@ -791,6 +791,10 @@ pub(crate) struct GatherSet {
     pub(crate) open: Option<Segment>,
     /// A segment's pass left the scratch readable as arguments.
     pub(crate) in_list: bool,
+    /// The title memory the open segment's records (the prelude's while
+    /// the list gathers) lie in, and whether a write ended them.
+    span: (u64, u64),
+    pub(crate) shut: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the table is the list's own
@@ -813,6 +817,8 @@ impl GatherSet {
             prelude: 0,
             open: None,
             in_list: false,
+            span: (u64::MAX, 0),
+            shut: false,
         }
     }
 
@@ -834,6 +840,9 @@ impl GatherSet {
     /// The slot of the record at `offset`: the one it has, or the next
     /// free one. None when the set (or its open segment) is full.
     pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
+        if self.shut && self.open.is_none() {
+            return None;
+        }
         if let Some(&slot) = self.slots.get(&offset) {
             return Some(slot);
         }
@@ -861,11 +870,29 @@ impl GatherSet {
     pub(crate) fn close(&mut self) {
         self.slots.clear();
         self.open = None;
+        self.span = (u64::MAX, 0);
+        self.shut = true;
+    }
+
+    /// Notes that the record a slot was given for lies at `title` in title memory.
+    pub(crate) fn note(&mut self, title: u64, stride: u32) {
+        self.span = (self.span.0.min(title), self.span.1.max(title.saturating_add(u64::from(stride))));
+    }
+
+    /// Title memory `[lo, hi)` is about to be written: true, with the set
+    /// closed, if a record it gave a slot to may lie there.
+    pub(crate) fn wrote(&mut self, (lo, hi): (u64, u64)) -> bool {
+        let hit = lo < self.span.1 && self.span.0 < hi;
+        if hit {
+            self.close();
+        }
+        hit
     }
 
     /// Opens a segment in the list: None if the set has no room.
     pub(crate) fn open_segment(&mut self) -> Option<Segment> {
         self.close();
+        self.shut = false;
         let room = GATHER_MOST.saturating_sub(self.next).min(GATHER_TABLE_WORDS.saturating_sub(self.word + 1));
         if room == 0 {
             return None;
@@ -911,14 +938,14 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
 /// about 1,450 draws a frame each had a compute pass of ours in front of
 /// them: the card left drawing for compute and came back, about nine
 /// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), (offset, title): (u64, u64), spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
     let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
         GATHER_NONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     };
-    list.gather_slot(src, src_id, offset, spec)
+    list.gather_slot(src, src_id, (offset, title), spec)
 }
 
 /// Since the last line: records that got no slot because they do not fit
@@ -2080,6 +2107,30 @@ void main() {
         assert_eq!((set.records(), set.readable()), (2, true));
         let seg = set.open_segment().unwrap();
         assert_eq!((seg.base, seg.count), (4, 5));
+    }
+
+    #[test]
+    fn warp_a_write_over_a_gathered_record_ends_its_set_and_only_its_set() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        let mut table = vec![0u32; GATHER_TABLE_WORDS as usize];
+        let mut set = GatherSet::new(warp.default_uav(256), 1, (10, 12), warp.default_uav(256), (0, table.as_mut_ptr().cast()));
+        assert_eq!(set.slot(0x40), Some(0));
+        set.note(0x1_0040, 12);
+        assert_eq!(set.slot(0x80), Some(1));
+        set.note(0x1_0080, 12);
+        // writes beside the records leave the set gathering
+        assert!(!set.wrote((0x1_0000, 0x1_0040)));
+        assert!(!set.wrote((0x1_008c, 0x1_0100)));
+        assert_eq!(set.slot(0x40), Some(0));
+        // a write over one record: no slot from here on, the prelude keeps what it had
+        assert!(set.wrote((0x1_0088, 0x1_008c)));
+        assert_eq!((set.slot(0x40), set.slot(0xc0)), (None, None));
+        assert_eq!(set.records(), 2);
+        // with segments, the next one serves again
+        assert!(set.open_segment().is_some());
+        assert_eq!(set.slot(0x40), Some(2));
     }
 
     #[test]
