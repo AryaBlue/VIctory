@@ -601,7 +601,10 @@ fn present_ready() -> Option<crate::present_later::Due> {
         unsafe { &(*(q as *const Queue)).held }
     };
     let ready = queues.iter().all(|&q| {
-        crate::present_later::line_ready(lock(line(q)).first().map(|h| matches!(h, Held::Present)))
+        let held = lock(line(q));
+        // a line with no mark only holds what was given after the present
+        !held.iter().any(|h| matches!(h, Held::Present))
+            || crate::present_later::line_ready(held.first().map(|h| matches!(h, Held::Present)))
     });
     if !ready {
         return None;
@@ -1398,6 +1401,42 @@ mod tests {
         assert_eq!(crate::fence::completed(told), 2);
         assert!(lock(&queue(q).held).is_empty());
         assert!(!lock(&WAITING).contains(&(q as usize)));
+    }
+
+    /// VICTORY_PRESENT_LATER: a line that holds only what was given after
+    /// the present (no mark: a queue that held nothing when the present
+    /// was given) does not hold the present back. fast-1 hung on this: the
+    /// title stood in its present while such a line waited for a value the
+    /// title writes after it.
+    #[cfg(windows)]
+    #[test]
+    fn a_line_without_a_mark_does_not_hold_a_later_present() {
+        let _one = crate::present_later::TEST_ONE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut a, mut b) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut a), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut b), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut never = null;
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut never), S_OK);
+        lock(&WAITING).push(a as usize);
+        present_later(crate::present_later::Due { resource: 0, frame: 1 });
+        // b starts holding after the present: no mark
+        lock(&queue(b).held).push(Held::Wait(never as usize, 5));
+        lock(&WAITING).push(b as usize);
+        release_held_now(false);
+        assert_eq!(crate::present_later::due(), None, "the present was held by a line without a mark");
+        assert_eq!(lock(&queue(b).held).len(), 1, "what came after the present ran with it");
+        release_held_now(true);
+        assert!(lock(&queue(b).held).is_empty());
     }
 
     #[test]
