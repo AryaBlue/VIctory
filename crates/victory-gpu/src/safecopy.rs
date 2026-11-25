@@ -109,14 +109,9 @@ pub(crate) fn on() -> bool {
 
 /// copies of 256 bytes and more store past the cache (VICTORY_COPY_STREAM=1; off by default)
 pub(crate) fn stream() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_COPY_STREAM").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("title reads store past the cache (VICTORY_COPY_STREAM=1)");
-        }
-        on
-    })
+    // live: no state
+    static S: crate::switch::Switch = crate::switch::Switch::noted("COPY_STREAM", "title reads store past the cache (VICTORY_COPY_STREAM=1)");
+    S.on()
 }
 
 /// false if a page faulted; dst may hold the bytes before it, as with rpm

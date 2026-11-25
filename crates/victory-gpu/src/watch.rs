@@ -194,14 +194,10 @@ pub(crate) fn pieces(start: usize, end: usize) -> Vec<(usize, Pieces)> {
 /// (`VICTORY_PIECES_FLAT=1`; off by default; with `VICTORY_FINE_PAGES=1`):
 /// each refresh's [`pieces`] is a slice copy, not a tree walk collected.
 fn pieces_flat() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_PIECES_FLAT").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("the write journal's piece notes are kept flat (VICTORY_PIECES_FLAT=1)");
-        }
-        on
-    })
+    // live: the notes change form under the journal's lock at the next use
+    static S: crate::switch::Switch =
+        crate::switch::Switch::noted("PIECES_FLAT", "the write journal's piece notes are kept flat (VICTORY_PIECES_FLAT=1)");
+    S.on()
 }
 
 // the pieces of a page a copy stamped `since` lacks, given the page's last write and its noted pieces
@@ -609,14 +605,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Pages new to the journal wait in a small tree and are merged in at the
 /// next range read.
 fn journal_flat() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_JOURNAL_FLAT").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("the write journal's pages are kept flat (VICTORY_JOURNAL_FLAT=1)");
-        }
-        on
-    })
+    // live: the pages change form under the journal's lock at the next use
+    static S: crate::switch::Switch =
+        crate::switch::Switch::noted("JOURNAL_FLAT", "the write journal's pages are kept flat (VICTORY_JOURNAL_FLAT=1)");
+    S.on()
 }
 
 /// New pages that wait before the flat journal is merged whole.
@@ -628,8 +620,10 @@ struct Pages<V: Copy = u64> {
     tree: BTreeMap<usize, V>,
     flat: Vec<(usize, V)>,
     fresh: BTreeMap<usize, V>,
-    // decided at the first use (tests set it)
+    // 0 follows the switch, 1 tree, 2 flat (tests set it)
     mode: u8,
+    // the form the pages are in now
+    flat_now: bool,
     // the switch that keeps this one flat
     switch: fn() -> bool,
 }
@@ -641,15 +635,31 @@ impl<V: Copy> Pages<V> {
             flat: Vec::new(),
             fresh: BTreeMap::new(),
             mode: 0,
+            flat_now: false,
             switch,
         }
     }
 
     fn is_flat(&mut self) -> bool {
-        if self.mode == 0 {
-            self.mode = if (self.switch)() { 2 } else { 1 };
+        let want = match self.mode {
+            0 => (self.switch)(),
+            m => m == 2,
+        };
+        if want != self.flat_now {
+            self.reform(want);
         }
-        self.mode == 2
+        want
+    }
+
+    // the switch flipped: every page moves to the other form
+    fn reform(&mut self, flat: bool) {
+        if flat {
+            self.flat = std::mem::take(&mut self.tree).into_iter().collect();
+        } else {
+            self.merge();
+            self.tree = std::mem::take(&mut self.flat).into_iter().collect();
+        }
+        self.flat_now = flat;
     }
 
     fn insert(&mut self, page: usize, now: V) -> Option<V> {
@@ -953,6 +963,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards();
+    if !crate::guard_log::fault_log() && !g.covered.is_empty() {
+        // switched off (VICTORY_ALT): forget the stretches, faults are not kept for them now
+        g.covered = crate::guard_log::Covered::new();
+        g.unclean.clear();
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -1809,6 +1824,43 @@ mod tests {
         }
         assert_eq!(tree.range(0, usize::MAX), flat.range(0, usize::MAX));
         assert!(flat.range(5, 5).is_empty() && flat.range(9, 3).is_empty());
+    }
+
+    /// VICTORY_ALT: pages that follow their switch change form whenever it
+    /// flips, between any two uses, and answer as the tree does throughout.
+    #[test]
+    fn a_journal_whose_switch_flips_answers_as_the_tree_does() {
+        static FLAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn flat_now() -> bool {
+            FLAT.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let (mut tree, mut live) = (Pages::<u64>::new(journal_flat), Pages::<u64>::new(flat_now));
+        tree.mode = 1;
+        let mut seed = 0x2545_f491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        for now in 1..6000u64 {
+            if now % 97 == 0 {
+                FLAT.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let page = next() % 3000;
+            if now % 3 == 0 {
+                *tree.entry(page, 0) += now;
+                *live.entry(page, 0) += now;
+            } else {
+                assert_eq!(tree.insert(page, now), live.insert(page, now), "insert of page {page}");
+            }
+            if now % 5 == 0 {
+                let a = next() % 3100;
+                let b = a + next() % 400;
+                assert_eq!(tree.range(a, b), live.range(a, b), "range {a}..{b}");
+            }
+        }
+        assert_eq!(tree.range(0, usize::MAX), live.range(0, usize::MAX));
     }
 
     /// VICTORY_PIECES_FLAT: piece notes kept flat take the same updates

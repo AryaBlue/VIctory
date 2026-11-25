@@ -314,6 +314,8 @@ struct State {
     since: std::time::Instant,
     /// The lengths of the last frames (microseconds), for the usual one.
     recent: std::collections::VecDeque<f64>,
+    /// [`crate::switch::flips`] when this reading began.
+    flips: u64,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -491,7 +493,21 @@ pub fn frame() {
         frames: Vec::new(),
         since: now,
         recent: std::collections::VecDeque::new(),
+        flips: crate::switch::flips(),
     });
+    let flips = crate::switch::flips();
+    if flips != state.flips {
+        // VICTORY_ALT changed phase after the last frame: its reading ends there
+        let frames = std::mem::take(&mut state.frames);
+        if !frames.is_empty() {
+            let usual = median(state.recent.iter().copied());
+            for line in lines(&frames, usual, state.since.elapsed().as_secs_f64()) {
+                tracing::info!("{line}{}", crate::switch::tag_before());
+            }
+        }
+        (state.since, state.flips) = (now, flips);
+        state.recent.clear();
+    }
     state.number += 1;
     if let Some((then, t0, s0, thread0)) = state.last.replace((now, totals, sampled, thread)) {
         let mut f = Frame {
@@ -525,7 +541,7 @@ pub fn frame() {
     }
     let usual = median(state.recent.iter().copied());
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
-        tracing::info!("{line}");
+        tracing::info!("{line}{}", crate::switch::tag());
     }
 }
 

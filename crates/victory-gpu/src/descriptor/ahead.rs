@@ -7,8 +7,9 @@ use std::sync::{Condvar, Mutex};
 
 // whether a helper thread mirrors changed heap pages ahead of submissions
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_AHEAD").is_some_and(|v| v == "1"))
+    // live: off, the helper gets no kicks and waits; what it took is drained by the next pass
+    static S: crate::switch::Switch = crate::switch::Switch::new("HEAP_SYNC_AHEAD");
+    S.on()
 }
 
 // how far into the gap between submit passes the helper takes its pages, in percent (VICTORY_HEAP_SYNC_AHEAD_DELAY, default 50)
@@ -57,7 +58,13 @@ pub(super) fn submit_begin() -> Option<std::time::Instant> {
         let _ = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(helper);
     });
     WANTED.fetch_add(1, Relaxed);
+    BEGUN.set(true);
     Some(std::time::Instant::now())
+}
+
+thread_local! {
+    // this thread's pass counted itself in WANTED: its end takes it out, whatever the switch says by then
+    static BEGUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // the submit pass holds SYNCING now
@@ -70,7 +77,7 @@ pub(super) fn submit_waited(asking: Option<std::time::Instant>) {
 
 // the submit pass is done: the helper is kicked for the next gap
 pub(super) fn submit_end() {
-    if !on() {
+    if !BEGUN.replace(false) {
         return;
     }
     WANTED.fetch_sub(1, Relaxed);

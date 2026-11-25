@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use super::{BUFFERS, Shadow, innermost, lookup_locked, loose};
 
@@ -17,14 +17,12 @@ pub(super) fn changed() {
 
 /// `VICTORY_LOOKUP_FAST=1`.
 pub(super) fn fast() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_LOOKUP_FAST").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("title buffers' copies are found under a shared lock with a memo per thread (VICTORY_LOOKUP_FAST=1)");
-        }
-        on
-    })
+    // live: GEN moves at every table change with the switch off too, so old memos go stale
+    static S: crate::switch::Switch = crate::switch::Switch::noted(
+        "LOOKUP_FAST",
+        "title buffers' copies are found under a shared lock with a memo per thread (VICTORY_LOOKUP_FAST=1)",
+    );
+    S.on()
 }
 
 const SLOTS: usize = 256;

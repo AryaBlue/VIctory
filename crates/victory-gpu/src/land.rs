@@ -6,8 +6,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 // whether landings go wide
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_LAND").is_some_and(|v| v == "1"))
+    // live: read once per landing, which waits for its pieces; the pool idles when off
+    static S: crate::switch::Switch = crate::switch::Switch::new("WIDE_LAND");
+    S.on()
 }
 
 // below this many bytes a landing stays on its own thread

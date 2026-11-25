@@ -29,8 +29,9 @@ fn switch(name: &str) -> bool {
 
 /// On in the tests: every guard test runs its later checks from the log.
 pub(crate) fn fault_log() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(test) || *ON.get_or_init(|| switch("VICTORY_FAULT_LOG"))
+    // live: switched off, the next pass forgets the covered stretches (`watch::guard`)
+    static S: crate::switch::Switch = crate::switch::Switch::new("FAULT_LOG");
+    cfg!(test) || S.on()
 }
 
 pub(crate) fn hot_open() -> bool {
@@ -44,8 +45,9 @@ pub(crate) fn hot_count() -> bool {
 }
 
 pub(crate) fn commit_notice() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| switch("VICTORY_COMMIT_NOTICE"))
+    // live: commits clear absent blocks with the switch off too
+    static S: crate::switch::Switch = crate::switch::Switch::new("COMMIT_NOTICE");
+    S.on()
 }
 
 /// Frames between a hot block's closings, and between askings about absent

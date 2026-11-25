@@ -3,20 +3,18 @@
 //! wide threads; what it puts where, and when it says settle, are the same.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use super::{MERGED, PAGE, Shadow, changed_runs, joined_over, merge_gap};
 
 /// `VICTORY_MERGE_WIDE=1`.
 pub(super) fn wide() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_MERGE_WIDE").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("title bytes under flights' shader writes are compared a word at a time on the wide threads (VICTORY_MERGE_WIDE=1)");
-        }
-        on
-    })
+    // live: read once per merge, whose result is the same either way
+    static S: crate::switch::Switch = crate::switch::Switch::noted(
+        "MERGE_WIDE",
+        "title bytes under flights' shader writes are compared a word at a time on the wide threads (VICTORY_MERGE_WIDE=1)",
+    );
+    S.on()
 }
 
 // pages held under one lock of the reference
