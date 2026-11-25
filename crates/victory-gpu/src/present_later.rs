@@ -25,6 +25,27 @@ pub(crate) fn on() -> bool {
     })
 }
 
+/// `VICTORY_PRESENT_EARLY=1`: presents go behind the lines at every late
+/// stage, not only at 3 (it turns `VICTORY_PRESENT_FLIGHT` on). The
+/// title's present no longer waits on the releasers' lock while our
+/// thread prepares the frame.
+pub(crate) fn early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRESENT_EARLY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("presents go behind the lines at every late stage (VICTORY_PRESENT_EARLY=1)");
+        }
+        on
+    })
+}
+
+/// Whether the title's present only gives the present to our thread:
+/// switched on, presents settle nothing, and our thread runs the lines.
+pub(crate) fn later_for(later: bool, early: bool, behind: bool, free: bool) -> bool {
+    (later || early) && behind && free
+}
+
 /// A present waiting for the lines: the title's resource and the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Due {
@@ -103,6 +124,27 @@ mod tests {
         assert_eq!(due(), Some(second));
         assert_eq!(take(|| {}), Some(second));
         assert_eq!(take(|| {}), None);
+    }
+
+    /// VICTORY_PRESENT_EARLY: the title's present goes behind the lines at
+    /// late stages 1 and 2 too (fast-8 and ffx-seriess-1 ran at 1-2, where
+    /// the title stood ~190 ms a frame in its present on the releasers' lock).
+    #[cfg(windows)]
+    #[test]
+    fn an_early_present_goes_behind_the_lines_at_every_late_stage() {
+        use crate::host::free_present_at;
+        for stage in 1..=3 {
+            assert!(later_for(false, true, true, free_present_at(stage, true)), "stage {stage}");
+        }
+        // stage 0 sends no flights: the present cannot be one
+        assert!(!later_for(false, true, true, free_present_at(0, true)));
+        // only our thread may run the lines
+        assert!(!later_for(false, true, false, free_present_at(1, true)));
+        // as before: PRESENT_LATER alone needs stage 3
+        assert!(!later_for(true, false, true, free_present_at(1, false)));
+        assert!(!later_for(true, false, true, free_present_at(2, false)));
+        assert!(later_for(true, false, true, free_present_at(3, false)));
+        assert!(!later_for(false, false, true, free_present_at(3, false)));
     }
 
     #[test]
