@@ -29,13 +29,20 @@ pub(crate) fn on() -> bool {
 pub(crate) fn dword_masks(at: usize, runs: &[(usize, usize)]) -> Vec<(u32, u32)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
     for &(r, n) in runs {
-        for byte in at + r..at + r + n {
-            let word = (byte & !3) as u32;
-            let bit = 0xffu32 << ((byte & 3) * 8);
-            match out.last_mut() {
-                Some(last) if last.0 == word => last.1 |= bit,
-                _ => out.push((word, bit)),
+        // a dword at a time, not a byte at a time
+        let (mut byte, end) = (at + r, at + r + n);
+        while byte < end {
+            let word = byte & !3;
+            let upto = (word + 4).min(end);
+            let mut bits = 0u32;
+            for b in byte..upto {
+                bits |= 0xffu32 << ((b & 3) * 8);
             }
+            match out.last_mut() {
+                Some(last) if last.0 == word as u32 => last.1 |= bits,
+                _ => out.push((word as u32, bits)),
+            }
+            byte = upto;
         }
     }
     out
@@ -96,24 +103,39 @@ pub(crate) fn indexed() -> bool {
 #[derive(Default)]
 pub(crate) struct Notes {
     pub(crate) pending: Vec<(u32, u32)>,
-    pub(crate) sent: Vec<(u64, Vec<(usize, usize)>)>,
+    pub(crate) sent: Vec<(u64, Group)>,
+}
+
+/// A send's masked dwords as it took them, made into sorted byte runs by
+/// the relay the first time it looks (not on the submitting thread: 9.8 ms
+/// a frame there in s2-prep-1).
+pub(crate) enum Group {
+    Taken(Vec<(u32, u32)>),
+    Runs(Vec<(usize, usize)>),
 }
 
 impl Notes {
-    /// Send `sent_as` takes what is pending; with [`indexed`] its byte runs
-    /// are kept, and the groups every fetch still to merge came after go.
+    /// Send `sent_as` takes what is pending; with [`indexed`] its dwords are
+    /// kept as a group, and the groups every fetch still to merge came after
+    /// go.
     pub(crate) fn send(&mut self, sent_as: u64, fetched: u64) -> Vec<(u32, u32)> {
         let pending = std::mem::take(&mut self.pending);
         self.sent.retain(|g| g.0 > fetched);
         if !pending.is_empty() {
-            self.sent.push((sent_as, byte_runs(&pending)));
+            self.sent.push((sent_as, Group::Taken(pending.clone())));
         }
         pending
     }
 
     /// The masked bytes in `[from, to)` that are the title's for a fetch sent
     /// after send `after`: those still to go up and those a later send took.
-    pub(crate) fn skip(&self, from: usize, to: usize, after: u64, out: &mut Vec<(usize, usize)>) {
+    pub(crate) fn skip(
+        &mut self,
+        from: usize,
+        to: usize,
+        after: u64,
+        out: &mut Vec<(usize, usize)>,
+    ) {
         let near: Vec<(u32, u32)> = self
             .pending
             .iter()
@@ -121,10 +143,16 @@ impl Notes {
             .filter(|&(w, _)| (w as usize) < to && w as usize + 4 > from)
             .collect();
         out.extend(byte_runs(&near));
-        for (s, runs) in &self.sent {
+        for (s, group) in &mut self.sent {
             if *s <= after {
                 continue;
             }
+            if let Group::Taken(taken) = group {
+                *group = Group::Runs(byte_runs(taken));
+            }
+            let Group::Runs(runs) = group else {
+                continue;
+            };
             let first = runs.partition_point(|r| r.1 <= from);
             out.extend(runs[first..].iter().take_while(|r| r.0 < to).copied());
         }
@@ -312,6 +340,48 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The entries as the byte-at-a-time loop made them.
+    fn dword_masks_one_by_one(at: usize, runs: &[(usize, usize)]) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for &(r, n) in runs {
+            for byte in at + r..at + r + n {
+                let word = (byte & !3) as u32;
+                let bit = 0xffu32 << ((byte & 3) * 8);
+                match out.last_mut() {
+                    Some(last) if last.0 == word => last.1 |= bit,
+                    _ => out.push((word, bit)),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn masks_a_dword_at_a_time_are_those_a_byte_at_a_time() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        for _ in 0..300 {
+            let at = next() % 9;
+            let mut runs = Vec::new();
+            let mut r = next() % 7;
+            for _ in 0..next() % 12 {
+                let n = 1 + next() % 13;
+                runs.push((r, n));
+                r += n + next() % 6;
+            }
+            assert_eq!(
+                dword_masks(at, &runs),
+                dword_masks_one_by_one(at, &runs),
+                "{at} {runs:?}"
+            );
+        }
     }
 
     #[test]

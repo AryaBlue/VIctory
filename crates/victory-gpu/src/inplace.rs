@@ -186,6 +186,15 @@ pub(crate) fn declares() -> bool {
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    // picking: in place only by promotion, never when the copy is made
+    if pick() {
+        return None;
+    }
+    place_any(start, len, window)
+}
+
+// title memory in place if the level allows and the memory opens, whatever picking says
+pub(crate) fn place_any(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
@@ -287,10 +296,30 @@ pub(crate) fn written_on() -> bool {
     })
 }
 
-// the biggest written buffer swapped in place, VICTORY_INPLACE_WRITTEN_MAX_MB (32): the 174 MB heap stays carded
+// the biggest copy swapped in place, VICTORY_INPLACE_WRITTEN_MAX_MB (256): size alone keeps nothing out, read heat does
 pub(crate) fn written_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_WRITTEN_MAX_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(32) << 20)
+    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_WRITTEN_MAX_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20)
+}
+
+// VICTORY_INPLACE_PICK=1: nothing goes in place when its copy is made; once a second copies the cpu or the card
+// rewrites most frames and shaders read about once are swapped in place (fast-6: blanket in place, 4.0 -> 2.0 fps)
+// (needs VICTORY_INPLACE>=2, 3 under late wait and for the pool)
+pub(crate) fn pick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK").is_ok_and(|v| v == "1") && level() >= 2 && (level() >= 3 || !crate::host::late()))
+}
+
+// bytes shaders may read per byte written before a copy stays on the card, VICTORY_INPLACE_PICK_READS (2)
+pub(crate) fn pick_reads() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_READS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2))
+}
+
+// windows outside buffers may be picked too, VICTORY_INPLACE_PICK_WINDOWS=1 (off: fast-6's 388 MB of windows were read hard)
+pub(crate) fn pick_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_WINDOWS").is_ok_and(|v| v == "1"))
 }
 
 // a big buffer goes in place instead of to the card
@@ -345,10 +374,10 @@ fn say() {
         s[6],
         s[7]
     );
-    if written_on() {
+    if written_on() || pick() {
         let p = crate::shadow::promoted_stats();
         tracing::info!(
-            "written title buffers swapped in place: {}, refused {}, put off while busy {}; copies taken out of the tables {}",
+            "copies swapped in place (VICTORY_INPLACE_PICK/WRITTEN): {}, refused {}, put off while busy {}; copies taken out of the tables {}",
             p[0],
             p[1],
             p[2],
@@ -1344,8 +1373,8 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
-    if written_on() {
-        crate::shadow::promote_written();
+    if written_on() || pick() {
+        crate::shadow::promote();
     }
     if probe_level() == 0 {
         return;
@@ -1515,12 +1544,16 @@ mod tests {
             assert!(same(start as *const u8, &got), "the GPU reads the title buffer's bytes");
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
-            // the rig's list still holds the buffer, and so the heap
             drop(rig);
             drop(placed);
-            // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // Half of it decommitted: turned down, the host not asked. On
+            // memory no heap ever stood on (WARP lets a heap go when it
+            // likes, and pages under one cannot be decommitted).
+            let other = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            assert_ne!(mem::VirtualFree(other.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            let start = other as u64 + K64 as u64 + 0x1230;
             assert!(matches!(place_part(&device, start, len), Err(None)));
+            mem::VirtualFree(other.cast(), 0, mem::MEM_RELEASE);
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
     }

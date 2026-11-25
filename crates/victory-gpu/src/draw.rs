@@ -1742,6 +1742,7 @@ impl State {
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.iter() {
+            shadow.mark_bindless();
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
