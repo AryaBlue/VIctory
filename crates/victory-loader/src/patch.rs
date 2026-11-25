@@ -37,6 +37,39 @@ fn watchdog() -> Patch {
     }
 }
 
+// VICTORY_FFX_FORCE: the upscaler-type getter (+0x7e93f0) answers 7 (the fsr
+// wrapper) without the series s and settings-bit tests
+const FFX_TYPE_RVA: usize = 0x7e93f0;
+const FFX_TYPE_OLD: [u8; 6] = [0x48, 0x83, 0xec, 0x28, 0x80, 0x3d];
+const FFX_TYPE_NEW: [u8; 6] = [0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3];
+// the wrapper's render scale (+0x28ef6a4): both console branches become one
+// constant from VICTORY_FFX_SCALE (default 2/3)
+const FFX_SCALE_RVA: usize = 0x28ef6a4;
+const FFX_SCALE_OLD: [u8; 22] = [
+    0x84, 0xc0, 0x75, 0x0a, 0xc5, 0xfa, 0x10, 0x05, 0x28, 0x78, 0x6d, 0x03, 0xeb, 0x08, 0xc5, 0xfa,
+    0x10, 0x05, 0xa2, 0xe2, 0x86, 0x03,
+];
+
+fn ffx_scale() -> f32 {
+    env::var("VICTORY_FFX_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite())
+        .map_or(2.0 / 3.0, |s| s.clamp(0.25, 1.0))
+}
+
+fn ffx_force(scale: f32) -> [Patch; 2] {
+    // mov eax, imm32; vmovd xmm0, eax; nops
+    let mut scaled = vec![0xb8];
+    scaled.extend_from_slice(&scale.to_bits().to_le_bytes());
+    scaled.extend_from_slice(&[0xc5, 0xf9, 0x6e, 0xc0]);
+    scaled.resize(FFX_SCALE_OLD.len(), 0x90);
+    [
+        Patch { module: None, rva: FFX_TYPE_RVA, expect: Some(FFX_TYPE_OLD.to_vec()), bytes: FFX_TYPE_NEW.to_vec() },
+        Patch { module: None, rva: FFX_SCALE_RVA, expect: Some(FFX_SCALE_OLD.to_vec()), bytes: scaled },
+    ]
+}
+
 fn hex(s: &str) -> Option<usize> {
     usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
 }
@@ -60,6 +93,9 @@ pub(crate) fn from_env() -> Vec<Patch> {
     let mut patches = parse(&env::var("VICTORY_PATCH").unwrap_or_default());
     if on("VICTORY_NO_WATCHDOG") {
         patches.push(watchdog());
+    }
+    if on("VICTORY_FFX_FORCE") {
+        patches.extend(ffx_force(ffx_scale()));
     }
     patches
 }
@@ -188,6 +224,14 @@ pub(crate) fn apply(base: usize, size: usize, module: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffx_scale_patch_keeps_its_length() {
+        let [kind, scale] = ffx_force(0.5);
+        assert_eq!(kind.bytes.len(), FFX_TYPE_OLD.len());
+        assert_eq!(scale.bytes.len(), FFX_SCALE_OLD.len());
+        assert_eq!(&scale.bytes[1..5], &0.5f32.to_bits().to_le_bytes());
+    }
 
     #[test]
     fn parses_entries_like_the_other_knobs() {
