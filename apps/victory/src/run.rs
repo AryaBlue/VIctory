@@ -18,6 +18,8 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    // VICTORY_PRIORITY, VICTORY_THREAD_MAP
+    victory_hle::placement::start();
     let cfg = victory_core::Config::load()?;
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.

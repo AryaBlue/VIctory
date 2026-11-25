@@ -1055,7 +1055,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Made::new(count, made_stripes()),
-            ready: (0..if made_fast() || cfg!(test) { count } else { 0 })
+            ready: (0..if MADE_FAST.ever() || cfg!(test) { count } else { 0 })
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             copied: Mutex::new(Vec::new()),
@@ -1412,10 +1412,11 @@ impl HostHeap {
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
         // published made (VICTORY_MADE_FAST): no need of the lock to say so
-        let published = self
-            .ready
-            .get(index as usize)
-            .is_some_and(|r| r.load(std::sync::atomic::Ordering::Acquire) == key);
+        let published = made_fast()
+            && self
+                .ready
+                .get(index as usize)
+                .is_some_and(|r| r.load(std::sync::atomic::Ordering::Acquire) == key);
         let made = || {
             self.made
                 .hold(index)
@@ -2127,7 +2128,9 @@ impl HostHeap {
             }
             return None;
         }
-        if let Some(view) = self.mirror_ready(index, handle) {
+        if made_fast()
+            && let Some(view) = self.mirror_ready(index, handle)
+        {
             made_count(FAST_HIT);
             return Some(view);
         }
@@ -2182,7 +2185,7 @@ impl HostHeap {
 
     // whether slot `index` is still made from record key `key` (None: not tracked, ask `mirror`)
     pub(crate) fn still_made(&self, index: u32, key: u64) -> Option<bool> {
-        let ready = self.ready.get(index as usize)?;
+        let ready = self.ready.get(index as usize).filter(|_| made_fast())?;
         Some(ready.load(std::sync::atomic::Ordering::Acquire) == key)
     }
 
@@ -2605,10 +2608,11 @@ fn made_stripes() -> bool {
             on
         })
 }
+// live: the published keys are kept (and withdrawn) whenever it can be on, only their use follows it
+static MADE_FAST: crate::switch::Switch = crate::switch::Switch::new("MADE_FAST");
 
 fn made_fast() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MADE_FAST").is_some_and(|v| v == "1"))
+    MADE_FAST.on()
 }
 
 /// Whether the pass over records copied in as bytes also mirrors slots

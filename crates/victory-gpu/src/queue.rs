@@ -475,7 +475,10 @@ pub(crate) fn behind() -> bool {
         let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0") && crate::host::late() && cuts();
         if on {
             tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
-            let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);
+            let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(|| {
+                crate::placement::helper();
+                worker()
+            });
         }
         on
     })
@@ -1455,6 +1458,7 @@ extern "system" fn present(
         crate::framelog::frame();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
+        crate::switch::frame_end();
     }
     hr
 }

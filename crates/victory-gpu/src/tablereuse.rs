@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_REUSE").is_some_and(|v| v == "1"))
+    // live: the epoch moves with the switch off too, so notes stay true
+    static S: crate::switch::Switch = crate::switch::Switch::new("TABLE_REUSE");
+    S.on()
 }
 
 // moves whenever what a record names can change without its words changing

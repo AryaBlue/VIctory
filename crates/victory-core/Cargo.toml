@@ -16,6 +16,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing.workspace = true
 
 [features]
 # Lets `VICTORY_LOG` enable debug and trace output.

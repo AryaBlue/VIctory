@@ -3461,7 +3461,10 @@ fn late_helper() {
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
+        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(|| {
+            crate::placement::helper();
+            late_helper()
+        }) {
             tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
         }
         tracing::info!(
@@ -3471,7 +3474,10 @@ fn late_threads() {
         );
         if relay() {
             // Without it nothing would ever land.
-            if let Err(e) = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker) {
+            if let Err(e) = std::thread::Builder::new().name("victory-relay".into()).spawn(|| {
+                crate::placement::helper();
+                relay_worker()
+            }) {
                 fail(format_args!("no thread to land submissions sent ahead (VICTORY_RELAY=1): {e}"));
             }
             tracing::info!(
@@ -7621,14 +7627,12 @@ fn refresh_once() -> bool {
 
 // a title buffer copy flushes only the pending refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)
 fn copy_flush_overlap() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_COPY_FLUSH_OVERLAP").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("a title buffer copy flushes only the refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)");
-        }
-        on
-    })
+    // live: read per copy, either way leaves nothing behind
+    static S: crate::switch::Switch = crate::switch::Switch::noted(
+        "COPY_FLUSH_OVERLAP",
+        "a title buffer copy flushes only the refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)",
+    );
+    S.on()
 }
 
 // past this many pending refreshes a title copy flushes them all: the search would cost more
@@ -8302,6 +8306,8 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
+    // VICTORY_ALT phase changes when this window began
+    flips: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
@@ -8316,6 +8322,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
+            flips: crate::switch::flips(),
             logged: now,
             caption: None,
         }
@@ -8343,7 +8350,8 @@ impl Meter {
         crate::fpsbox::set(fps);
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        let alt = if self.flips == crate::switch::flips() { crate::switch::tag() } else { " [alt=mixed]" };
+        (self.since, self.frames, self.drawn, self.flips) = (std::time::Instant::now(), 0, drawn, crate::switch::flips());
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -8621,13 +8629,14 @@ impl Meter {
                 );
             }
             tracing::info!(
+                target: "victory_gpu::host::frame",
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}{alt}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
