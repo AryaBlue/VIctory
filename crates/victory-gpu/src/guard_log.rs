@@ -48,6 +48,80 @@ pub(crate) fn commit_notice() -> bool {
     *ON.get_or_init(|| switch("VICTORY_COMMIT_NOTICE"))
 }
 
+/// Since the last frame line, with any of these switches on: what the
+/// guard passes did (see [`guard_line`]).
+pub(crate) static COUNTS: [std::sync::atomic::AtomicU64; 13] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+/// blocks read from the log (a covered range's blocks not clean)
+pub(crate) const FROM_LOG: usize = 0;
+/// blocks walked the old way (ranges not covered)
+pub(crate) const WALKED: usize = 1;
+pub(crate) const RANGES_COVERED: usize = 2;
+/// not covered: no part of the range looked through yet
+pub(crate) const RANGES_NEW: usize = 3;
+/// not covered: partly looked through (new blocks at an end, or a remap cut it)
+pub(crate) const RANGES_PART: usize = 4;
+/// mapped or unmapped memory that cut covered stretches
+pub(crate) const REMAP_CUTS: usize = 5;
+pub(crate) const QUERIES: usize = 6;
+/// absent blocks not asked about (commit notices)
+pub(crate) const ASK_SKIPPED: usize = 7;
+/// absent blocks the title's commits made due again
+pub(crate) const COMMITS_NOTICED: usize = 8;
+/// absent blocks asked about on retry frames
+pub(crate) const NET_ASKED: usize = 9;
+/// of those, found committed: commits the notices missed
+pub(crate) const NET_FOUND: usize = 10;
+/// hot blocks left open at passes
+pub(crate) const HOT: usize = 11;
+pub(crate) const NET_PASSES: usize = 12;
+
+pub(crate) fn count(i: usize, n: usize) {
+    COUNTS[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the frame line says what the guard passes did.
+pub(crate) fn any_on() -> bool {
+    fault_log() || commit_notice() || hot_count()
+}
+
+/// With the frame line: [`COUNTS`] per frame over `frames`, and what the
+/// guards hold now (`state`: blocks not clean in the log, covered
+/// stretches, absent blocks).
+pub(crate) fn guard_line(frames: f64, block_bytes: usize, state: (usize, usize, usize)) {
+    let n = COUNTS
+        .each_ref()
+        .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "guard passes per frame (VICTORY_FAULT_LOG {}, VICTORY_COMMIT_NOTICE {}, VICTORY_HOT_OPEN {}): blocks read \
+         from the log {:.0}, walked the old way {:.0}; ranges covered {:.1}, not covered {:.1} (none looked through \
+         yet {:.1}, partly {:.1}), remaps that cut stretches {:.1}; VirtualQuery made {:.1}, absent blocks not asked \
+         {:.0}, commits noticed {:.1} blocks, safety-net passes {:.2} asking {:.0} blocks, {:.1} found committed; hot \
+         blocks open {:.0} ({:.1} MB); now {} blocks not clean in the log, {} covered stretches, {} absent",
+        fault_log() as u8,
+        commit_notice() as u8,
+        hot_open() as u8,
+        n[FROM_LOG],
+        n[WALKED],
+        n[RANGES_COVERED],
+        n[RANGES_NEW] + n[RANGES_PART],
+        n[RANGES_NEW],
+        n[RANGES_PART],
+        n[REMAP_CUTS],
+        n[QUERIES],
+        n[ASK_SKIPPED],
+        n[COMMITS_NOTICED],
+        n[NET_PASSES],
+        n[NET_ASKED],
+        n[NET_FOUND],
+        n[HOT],
+        n[HOT] * block_bytes as f64 / (1 << 20) as f64,
+        state.0,
+        state.1,
+        state.2
+    );
+}
+
 /// Frames between a hot block's closings, and between askings about absent
 /// blocks with commit notices.
 pub(crate) const RETRY: u64 = 64;
@@ -121,6 +195,17 @@ impl Covered {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether any stretch meets `[a, b)`.
+    pub(crate) fn touches(&self, a: usize, b: usize) -> bool {
+        a < b
+            && (self.0.range(a..b).next().is_some()
+                || self.0.range(..a).next_back().is_some_and(|(_, &e)| e > a))
+    }
 }
 
 /// Per block, the frames it was written in lately: the last such frame and
@@ -190,6 +275,7 @@ mod tests {
         assert_eq!(c.0.len(), 1);
         c.remove(15, 17);
         assert!(c.holds(10, 15) && c.holds(17, 40) && !c.holds(14, 16) && !c.holds(16, 17));
+        assert!(c.touches(0, 11) && c.touches(39, 60) && !c.touches(40, 60) && !c.touches(0, 10));
         c.remove(0, 100);
         assert!(c.is_empty());
         c.add(5, 8);

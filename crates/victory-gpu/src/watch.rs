@@ -1042,9 +1042,10 @@ impl Guards {
 
     /// Blocks `[from, to)` mapped or unmapped: no stretch holds them now.
     fn uncover(&mut self, from: usize, to: usize) {
-        if self.covered.is_empty() {
+        if !self.covered.touches(from, to) {
             return;
         }
+        crate::guard_log::count(crate::guard_log::REMAP_CUTS, 1);
         self.covered.remove(from, to);
         let gone: Vec<usize> = self.unclean.range(from..to).copied().collect();
         for block in gone {
@@ -1142,12 +1143,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let frame = crate::frame::current();
+    if crate::guard_log::commit_notice() && crate::guard_log::retry_frame(frame) {
+        crate::guard_log::count(crate::guard_log::NET_PASSES, 1);
+    }
     if crate::guard_log::hot_count() {
         g.faults.census(frame, BLOCK);
     }
-    if crate::guard_log::fault_log() && g.covered.holds(first, last) {
+    let log = crate::guard_log::fault_log();
+    if log && g.covered.holds(first, last) {
         // the blocks not clean, as the handler and the passes left them
         let unclean: Vec<usize> = g.unclean.range(first..last).copied().collect();
+        crate::guard_log::count(crate::guard_log::RANGES_COVERED, 1);
+        crate::guard_log::count(crate::guard_log::FROM_LOG, unclean.len());
         let mut uncommitted_until = first;
         let mut prev = None;
         for block in unclean {
@@ -1171,6 +1178,15 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             end_run(&mut g, from, p + 1);
         }
         return Some(written);
+    }
+    if log {
+        let why = if g.covered.touches(first, last) {
+            crate::guard_log::RANGES_PART
+        } else {
+            crate::guard_log::RANGES_NEW
+        };
+        crate::guard_log::count(why, 1);
+        crate::guard_log::count(crate::guard_log::WALKED, last - first);
     }
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
@@ -1244,8 +1260,10 @@ fn visit(
     if g.absent.contains(&block) {
         if crate::guard_log::commit_notice() && !crate::guard_log::retry_frame(frame) {
             // commits are told (title_memory_committed): still absent
+            crate::guard_log::count(crate::guard_log::ASK_SKIPPED, 1);
             open = false;
         } else {
+            let net = crate::guard_log::commit_notice();
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= *uncommitted_until {
@@ -1253,6 +1271,10 @@ fn visit(
                     .unwrap_or_else(|| uncommitted_end(block));
             }
             open = block >= *uncommitted_until;
+            if net {
+                crate::guard_log::count(crate::guard_log::NET_ASKED, 1);
+                crate::guard_log::count(crate::guard_log::NET_FOUND, open as usize);
+            }
             if open {
                 g.absent.remove(&block);
             }
@@ -1296,6 +1318,7 @@ fn stays_open(g: &mut Guards, block: usize, frame: u64, on: bool) -> bool {
     }
     // counted written this frame: it does not fault while open
     g.faults.note(block, frame);
+    crate::guard_log::count(crate::guard_log::HOT, 1);
     true
 }
 
@@ -1550,6 +1573,7 @@ fn uncommitted_end(block: usize) -> usize {
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    crate::guard_log::count(crate::guard_log::QUERIES, 1);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
@@ -1844,10 +1868,24 @@ pub fn title_memory_committed(at: usize, len: usize) {
         .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
         .copied()
         .collect();
+    crate::guard_log::count(crate::guard_log::COMMITS_NOTICED, blocks.len());
     for block in blocks {
         g.absent.remove(&block);
         g.set_unclean(block);
     }
+}
+
+/// With the frame line, when a guard-log switch is on: what the guard
+/// passes did ([`crate::guard_log::guard_line`]).
+pub(crate) fn guard_line(frames: f64) {
+    if !crate::guard_log::any_on() {
+        return;
+    }
+    let state = {
+        let g = guards();
+        (g.unclean.len(), g.covered.len(), g.absent.len())
+    };
+    crate::guard_log::guard_line(frames, BLOCK, state);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
