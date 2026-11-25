@@ -58,6 +58,9 @@ enum Held {
     /// title can add to its end meanwhile; whatever is added stays behind
     /// this (the line is not empty), signals too.
     Running,
+    /// With [`crate::present_later`]: the present due is behind what is
+    /// before this, in every line.
+    Present,
 }
 
 /// The queues that hold something (their addresses).
@@ -405,7 +408,7 @@ pub(crate) fn before_sync() {
 fn release_held_now(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    if lock(&WAITING).is_empty() {
+    if lock(&WAITING).is_empty() && crate::present_later::due().is_none() {
         return;
     }
     let _one = lock(&RELEASING);
@@ -417,6 +420,9 @@ fn release_held_now(all: bool) {
         }
     }
     let _leave = Leave(was_here);
+    // a present is due and nothing runs unforced any more: what is before
+    // its marks runs as at a present
+    let mut forcing = false;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -424,9 +430,10 @@ fn release_held_now(all: bool) {
             // SAFETY: a live queue: one released is taken off the list.
             let line = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(line);
+            let all = all || (forcing && held.iter().any(|h| matches!(h, Held::Present)));
             loop {
                 match held.first() {
-                    None | Some(Held::Running) => break,
+                    None | Some(Held::Running | Held::Present) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
@@ -436,7 +443,7 @@ fn release_held_now(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) | Held::Running => {}
+                    Held::Wait(..) | Held::Running | Held::Present => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -478,7 +485,7 @@ fn release_held_now(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            if behind() && !all {
+                            if behind() && (!all || forcing) {
                                 // The line is open while this part is
                                 // prepared and sent: only this thread takes
                                 // from its head (one releaser at a time).
@@ -534,10 +541,59 @@ fn release_held_now(all: bool) {
                 lock(&WAITING).retain(|&w| w != q);
             }
         }
+        if !moved && crate::present_later::due().is_some() {
+            if !forcing && forces() {
+                forcing = true;
+                continue;
+            }
+            if let Some(due) = present_ready() {
+                forcing = false;
+                show(due.resource as This, due.frame);
+                continue;
+            }
+        }
         if !moved {
             break;
         }
     }
+}
+
+/// With [`crate::present_later`]: the present due, taken with its marks,
+/// once every line stands at its mark.
+#[cfg(windows)]
+fn present_ready() -> Option<crate::present_later::Due> {
+    let queues = lock(&WAITING).clone();
+    let line = |q: usize| {
+        // SAFETY: a live queue: one released is taken off the list.
+        unsafe { &(*(q as *const Queue)).held }
+    };
+    let ready = queues.iter().all(|&q| {
+        crate::present_later::line_ready(lock(line(q)).first().map(|h| matches!(h, Held::Present)))
+    });
+    if !ready {
+        return None;
+    }
+    crate::present_later::take(|| {
+        for &q in &queues {
+            let mut held = lock(line(q));
+            if matches!(held.first(), Some(Held::Present)) {
+                held.remove(0);
+            }
+        }
+    })
+}
+
+/// The title's side of [`crate::present_later`]: a mark at the end of
+/// every line, and our thread is told.
+#[cfg(windows)]
+fn present_later(due: crate::present_later::Due) {
+    crate::present_later::give(due, || {
+        for q in lock(&WAITING).clone() {
+            // SAFETY: a live queue: one released is taken off the list.
+            lock(unsafe { &(*(q as *const Queue)).held }).push(Held::Present);
+        }
+    });
+    wake();
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -881,10 +937,15 @@ extern "system" fn present(
     crate::copystat::present_begins();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
+    // with VICTORY_PRESENT_LATER our thread runs the lines up to the present
+    #[cfg(windows)]
+    let later = crate::present_later::on() && behind() && crate::host::late_free_present();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
+    if later {
+        // nothing runs here: our thread runs the lines up to the marks
+    } else if crate::host::late() && !crate::host::late_free_present() {
         // (With `behind`: what the queues hold runs here first, and what
         // it sent is settled with the rest.)
         if behind() {
@@ -901,7 +962,9 @@ extern "system" fn present(
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
-    release_held(forces());
+    if !later {
+        release_held(forces());
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -946,22 +1009,39 @@ extern "system" fn present(
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        if later {
+            present_later(crate::present_later::Due {
+                resource: resource as usize,
+                frame,
+            });
+        } else {
+            show(resource, frame);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+
+/// Shows `resource`, the first plane's first resource, in our window.
+#[cfg(windows)]
+fn show(resource: This, frame: u64) {
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return;
+    };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
+    let shown = host.present(texture, state, frame);
+    crate::resource::host_transition(resource, state);
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, resource, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shown;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -1203,6 +1283,61 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    /// VICTORY_PRESENT_LATER: the title's present runs nothing; our
+    /// thread forces what is before the marks, shows the present, then
+    /// runs what came after.
+    #[cfg(windows)]
+    #[test]
+    fn a_later_present_runs_on_our_thread_after_what_is_before_it() {
+        let _one = crate::present_later::TEST_ONE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut never, mut told) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut never),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut told), S_OK);
+        lock(&queue(q).held).extend([
+            Held::Wait(never as usize, 5),
+            Held::Signal(told as usize, 1),
+        ]);
+        lock(&WAITING).push(q as usize);
+        // no present due: the wait holds
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(told), 0);
+        present_later(crate::present_later::Due {
+            resource: 0,
+            frame: 1,
+        });
+        lock(&queue(q).held).push(Held::Signal(told as usize, 2));
+        assert_eq!(
+            crate::fence::completed(told),
+            0,
+            "the title's thread ran the line"
+        );
+        assert_eq!(lock(&queue(q).held).len(), 4);
+        release_held_now(false);
+        assert_eq!(
+            crate::present_later::due(),
+            None,
+            "the present was not shown"
+        );
+        assert_eq!(crate::fence::completed(told), 2);
+        assert!(lock(&queue(q).held).is_empty());
+        assert!(!lock(&WAITING).contains(&(q as usize)));
     }
 
     #[test]

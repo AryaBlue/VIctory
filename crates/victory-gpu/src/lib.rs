@@ -19,6 +19,8 @@
 mod capture;
 #[cfg(windows)]
 mod card_mask;
+#[cfg(windows)]
+mod present_later;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
