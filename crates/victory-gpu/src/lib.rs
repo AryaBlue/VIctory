@@ -103,6 +103,8 @@ mod titleprobe;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod wsmemo;
+#[cfg(windows)]
 mod wide_copy;
 #[cfg(windows)]
 mod wide_guard;
