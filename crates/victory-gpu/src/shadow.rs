@@ -79,8 +79,10 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
     // replaced in the tables (promoted in place or let go on a remap): holders must find again
     superseded: std::sync::atomic::AtomicBool,
-    // last frame shaders were declared writing it, and how many frames did
-    heat: [AtomicU64; 2],
+    // what in-place picking weighs (H_*): who writes it how often, and how much shaders read
+    heat: [AtomicU64; 6],
+    // reached through the descriptor heap: how often shaders read it is unknown, so never picked
+    bindless: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2331,6 +2333,8 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        // bytes shaders were given to read: in place every one of them crosses the bus
+        self.heat[H_ASKED].fetch_add(len, Ordering::Relaxed);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -2361,7 +2365,8 @@ impl Shadow {
             window: false,
             place: None,
             superseded: std::sync::atomic::AtomicBool::new(false),
-            heat: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
+            heat: [const { AtomicU64::new(0) }; 6],
+            bindless: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2444,10 +2449,7 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
-        let frame = crate::frame::current();
-        if self.heat[0].swap(frame, Ordering::Relaxed) != frame {
-            self.heat[1].fetch_add(1, Ordering::Relaxed);
-        }
+        self.note_frame(H_GPU_AT);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3102,6 +3104,35 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let bytes = self.update_inner(address, len);
+        if bytes > 0 {
+            self.note_frame(H_CPU_AT);
+            self.heat[H_CPU_BYTES].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        bytes
+    }
+
+    // counts a frame once in heat[at + 1], the frame (plus one) kept in heat[at]
+    fn note_frame(&self, at: usize) {
+        let frame = crate::frame::current() + 1;
+        if self.heat[at].swap(frame, Ordering::Relaxed) != frame {
+            self.heat[at + 1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // the heap pass reached it through descriptor slots
+    pub(crate) fn mark_bindless(&self) {
+        if !self.bindless.load(Ordering::Relaxed) {
+            self.bindless.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // gpu-written frames, cpu-changed frames, cpu bytes, bytes given to shaders: since the start
+    fn heat_now(&self) -> [u64; 4] {
+        [H_GPU, H_CPU, H_CPU_BYTES, H_ASKED].map(|i| self.heat[i].load(Ordering::Relaxed))
+    }
+
+    fn update_inner(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -3676,16 +3707,51 @@ pub(crate) fn promoted_stats() -> [u64; 3] {
     std::array::from_fn(|i| PROMOTED[i].load(Ordering::Relaxed))
 }
 
-// shaders write it in at least half the frames since it was last looked at (8 frames at least)
-pub(crate) fn written_hot(frames: u64, written: u64) -> bool {
-    frames >= 8 && written * 2 >= frames
+// heat slots: frame (plus one) and frames the card wrote it, frame and frames the cpu changed it,
+// bytes the cpu changed, bytes shaders were given to read
+const H_GPU_AT: usize = 0;
+const H_GPU: usize = 1;
+const H_CPU_AT: usize = 2;
+const H_CPU: usize = 3;
+const H_CPU_BYTES: usize = 4;
+const H_ASKED: usize = 5;
+
+// what a copy did over some frames, for picking what goes in place
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct Heat {
+    pub(crate) frames: u64,
+    pub(crate) gpu: u64,
+    pub(crate) cpu: u64,
+    pub(crate) cpu_bytes: u64,
+    pub(crate) asked: u64,
+    pub(crate) size: u64,
+    // write-watched: cpu counts mean something (an unwatched copy is copied whole every time)
+    pub(crate) watched: bool,
 }
 
-// the copy in the tables for title buffer `old` is swapped for `placed`; false if it is not there any more
+// in place pays where shaders read about as much as gets written, and something writes it most frames
+// (fast-6: 761 MB in place read by many small reads took the title lists from 139 to 352 ms):
+// the cpu rewriting it (upload rings, per-frame constants), or the card writing what the title reads back
+pub(crate) fn worth_in_place(h: Heat, reads: u64, cpu_rule: bool, gpu_rule: bool) -> bool {
+    if h.frames < 8 || h.asked == 0 {
+        return false;
+    }
+    let cpu = cpu_rule && h.watched && h.cpu * 2 >= h.frames && h.asked <= reads.saturating_mul(h.cpu_bytes);
+    let gpu = gpu_rule && h.gpu * 2 >= h.frames && h.asked <= reads.saturating_mul(h.size).saturating_mul(h.frames);
+    cpu || gpu
+}
+
+// the copy in the tables for `old` (a title buffer or a window) is swapped for `placed`; false if it is not there any more
 pub(crate) fn swap_in_place(old: &Arc<Shadow>, placed: crate::inplace::Placed) -> bool {
     let (start, len) = (old.start, old.len);
-    let new = Arc::new(Shadow::placed(placed, start, len, false));
-    let swapped = {
+    let new = Arc::new(Shadow::placed(placed, start, len, old.window));
+    let swapped = if old.window {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(&(start, len)) {
+            Some(s) if Arc::ptr_eq(s, old) => Some(std::mem::replace(s, new)),
+            _ => None,
+        }
+    } else {
         let mut map = buffers();
         let entry = map
             .range_mut(..=(start, usize::MAX))
@@ -3708,32 +3774,48 @@ pub(crate) fn swap_in_place(old: &Arc<Shadow>, placed: crate::inplace::Placed) -
     }
 }
 
-// VICTORY_INPLACE_WRITTEN: big carded title buffers shaders write most frames are swapped for title memory in place
-pub(crate) fn promote_written() {
-    let cap = crate::inplace::written_most();
+// once a second with VICTORY_INPLACE_PICK or VICTORY_INPLACE_WRITTEN: copies worth it are swapped for title memory in place
+pub(crate) fn promote() {
+    let (pick, written) = (crate::inplace::pick(), crate::inplace::written_on());
+    let (cap, reads, windows) = (crate::inplace::written_most(), crate::inplace::pick_reads(), crate::inplace::pick_windows());
     let frame = crate::frame::current();
-    static SEEN: Mutex<Option<std::collections::HashMap<u64, (u64, u64)>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<std::collections::HashMap<u64, (u64, [u64; 4])>>> = Mutex::new(None);
     static REFUSED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
-    let carded: Vec<Arc<Shadow>> = {
+    let mut copies: Vec<Arc<Shadow>> = if pick {
+        buffers().values().filter_map(|e| e.shadow.clone()).collect()
+    } else {
         let mut list = CARDED.lock().unwrap_or_else(|e| e.into_inner());
         list.retain(|w| w.strong_count() > 0);
         list.iter().filter_map(std::sync::Weak::upgrade).collect()
     };
+    if pick && windows {
+        copies.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    }
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = seen.get_or_insert_with(Default::default);
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     let refused = refused.get_or_insert_with(Default::default);
-    let live: std::collections::HashSet<u64> = carded.iter().map(|s| s.id).collect();
+    let live: std::collections::HashSet<u64> = copies.iter().map(|s| s.id).collect();
     seen.retain(|id, _| live.contains(id));
-    for shadow in carded {
-        if shadow.window || shadow.superseded() || shadow.len > cap || refused.contains(&shadow.id) {
+    for shadow in copies {
+        let out = shadow.place.is_some() || shadow.superseded() || shadow.bindless.load(Ordering::Relaxed);
+        if out || (shadow.window && !windows) || shadow.len > cap || refused.contains(&shadow.id) {
             continue;
         }
-        let written = shadow.heat[1].load(Ordering::Relaxed);
-        let (at, was) = *seen.entry(shadow.id).or_insert((frame, written));
-        if !written_hot(frame.saturating_sub(at), written - was) {
-            if frame.saturating_sub(at) >= 64 {
-                seen.insert(shadow.id, (frame, written));
+        let now = shadow.heat_now();
+        let (at, was) = *seen.entry(shadow.id).or_insert((frame, now));
+        let heat = Heat {
+            frames: frame.saturating_sub(at),
+            gpu: now[0] - was[0],
+            cpu: now[1] - was[1],
+            cpu_bytes: now[2] - was[2],
+            asked: now[3] - was[3],
+            size: shadow.len,
+            watched: shadow.watched.load(Ordering::Relaxed) == 1,
+        };
+        if !worth_in_place(heat, reads, pick, pick || written) {
+            if heat.frames >= 64 {
+                seen.insert(shadow.id, (frame, now));
             }
             continue;
         }
@@ -3741,7 +3823,7 @@ pub(crate) fn promote_written() {
             PROMOTED[2].fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let Some(placed) = crate::inplace::place_for(shadow.start, shadow.len, false) else {
+        let Some(placed) = crate::inplace::place_any(shadow.start, shadow.len, shadow.window) else {
             refused.insert(shadow.id);
             PROMOTED[1].fetch_add(1, Ordering::Relaxed);
             continue;
@@ -3749,12 +3831,11 @@ pub(crate) fn promote_written() {
         // a placed copy that found no entry drops here and uncounts itself
         if swap_in_place(&shadow, placed) {
             PROMOTED[0].fetch_add(1, Ordering::Relaxed);
-            tracing::info!(start = format_args!("{:#x}", shadow.start), len = shadow.len, "a written title buffer is in place now (VICTORY_INPLACE_WRITTEN)");
+            tracing::debug!(start = format_args!("{:#x}", shadow.start), len = shadow.len, ?heat, "a copy is in place now");
         }
         seen.remove(&shadow.id);
     }
 }
-
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
@@ -4287,13 +4368,22 @@ mod promote_tests {
         }
     }
 
-    // hot means written in half the frames looked at, over 8 frames at least
+    // in place only what something rewrites most frames and shaders read about once
     #[test]
-    fn written_most_frames_is_hot() {
-        assert!(!written_hot(4, 4));
-        assert!(written_hot(8, 4));
-        assert!(!written_hot(16, 7));
-        assert!(written_hot(16, 16));
+    fn only_rewritten_and_lightly_read_copies_are_worth_it() {
+        let ring = Heat { frames: 16, cpu: 16, cpu_bytes: 16 << 20, asked: 16 << 20, size: 4 << 20, watched: true, ..Default::default() };
+        assert!(worth_in_place(ring, 2, true, false), "an upload ring read once");
+        assert!(!worth_in_place(ring, 2, false, true), "the cpu rule is off");
+        assert!(!worth_in_place(Heat { frames: 4, ..ring }, 2, true, true), "too few frames looked at");
+        assert!(!worth_in_place(Heat { cpu: 7, ..ring }, 2, true, true), "rewritten in under half the frames");
+        assert!(!worth_in_place(Heat { asked: 40 << 20, ..ring }, 2, true, true), "read many times what is written");
+        assert!(!worth_in_place(Heat { watched: false, ..ring }, 2, true, false), "unwatched: copied whole, cpu counts say nothing");
+        let output = Heat { frames: 16, gpu: 12, asked: 64 << 20, size: 4 << 20, ..Default::default() };
+        assert!(worth_in_place(output, 2, false, true), "card output read once a frame");
+        assert!(!worth_in_place(Heat { asked: 200 << 20, ..output }, 2, false, true), "card output read by many draws");
+        let vertices = Heat { frames: 16, asked: 900 << 20, size: 8 << 20, watched: true, ..Default::default() };
+        assert!(!worth_in_place(vertices, 2, true, true), "static vertices read every draw stay on the card");
+        assert!(!worth_in_place(Heat { asked: 0, ..ring }, 2, true, true), "never read: nothing to gain");
     }
 
     // declared writes count once per frame
@@ -4319,7 +4409,7 @@ mod promote_tests {
         });
         shadow.writing(0x10_0000, 64);
         shadow.writing(0x10_0040, 64);
-        assert_eq!(shadow.heat[1].load(Ordering::Relaxed), 1);
+        assert_eq!(shadow.heat[H_GPU].load(Ordering::Relaxed), 1);
         drop(shadow);
     }
 
