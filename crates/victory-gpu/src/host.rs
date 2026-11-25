@@ -3428,11 +3428,21 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    // wide: each piece's bytes, in the order of the pieces
+    let mut wide = if crate::land::on() {
+        let pieces: Vec<_> = work.iter().zip(&found).flat_map(|((s, _, _), f)| f.iter().map(move |&(at, n)| (s, at, n))).collect();
+        crate::land::pc(&pieces).into_iter()
+    } else {
+        Vec::new().into_iter()
+    };
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
         for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+            written += match wide.next() {
+                Some(w) => w,
+                None => shadow.relay_merge(at, n, &mut now, &mut title),
+            };
         }
         copy_back(1, written as u64);
         #[cfg(feature = "diagnostics")]
@@ -4730,13 +4740,17 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
+        if crate::land::on() {
+            written = crate::land::card(&pieces, data, after);
+        } else {
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
         }
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
