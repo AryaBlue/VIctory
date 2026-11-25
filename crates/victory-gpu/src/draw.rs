@@ -238,6 +238,24 @@ fn draw_ends_window(keep: bool, stores: Option<bool>) -> bool {
     !keep || stores.is_none_or(|s| s)
 }
 
+/// `VICTORY_ROOT_CACHE=1`: a root argument the host list holds already with
+/// the same value (same root signature since) is not set again. Off by
+/// default.
+fn root_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// Notes root argument `key` set to `value` in `held`: true if it held that
+/// value already.
+fn root_held(held: &mut std::collections::HashMap<(bool, u32), Vec<u32>>, key: (bool, u32), value: &[u32]) -> bool {
+    if held.get(&key).is_some_and(|v| v.as_slice() == value) {
+        return true;
+    }
+    held.insert(key, value.to_vec());
+    false
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -276,6 +294,11 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Root arguments the host list holds since its root signature was set,
+    /// by (compute, parameter): constants, or a view's address as two words.
+    root_args: std::collections::HashMap<(bool, u32), Vec<u32>>,
+    /// The pipeline our last clamp replaced (its compute pipeline).
+    pso_lost: usize,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -1253,6 +1276,7 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            self.root_args.retain(|k, _| k.0 != compute);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::RootSigSets, 1);
         }
@@ -1261,6 +1285,11 @@ impl State {
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            #[cfg(feature = "diagnostics")]
+            if self.pso_lost == p.pso.as_raw() as usize {
+                crate::copystat::add(crate::copystat::C::PsoAfterClamp, 1);
+            }
+            self.pso_lost = 0;
             self.host_pipeline = p.pso.as_raw() as usize;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::PsoSets, 1);
@@ -1308,12 +1337,22 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                let held = (root_cache() || cfg!(feature = "diagnostics")) && root_held(&mut self.root_args, (compute, param), &values);
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::RootArgSets, 1);
+                    if held {
+                        crate::copystat::add(crate::copystat::C::RootArgSame, 1);
+                    }
+                }
                 // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if !(held && root_cache()) {
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -1384,6 +1423,17 @@ impl State {
                             0,
                             None,
                         ));
+                    }
+                    let held = (root_cache() || cfg!(feature = "diagnostics")) && root_held(&mut self.root_args, (compute, param), &[gpu as u32, (gpu >> 32) as u32]);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        crate::copystat::add(crate::copystat::C::RootArgSets, 1);
+                        if held {
+                            crate::copystat::add(crate::copystat::C::RootArgSame, 1);
+                        }
+                    }
+                    if held && root_cache() {
+                        continue;
                     }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -3396,6 +3446,7 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                self.pso_lost = self.host_pipeline;
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
                 if !many {
@@ -3859,6 +3910,20 @@ mod window_tests {
         assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x100 + 16 * 32, 5), None);
         assert_eq!(super::window_hit(&windows, 1, 2, 12, 0x140, 5), None);
         assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x140, 6), None);
+    }
+
+    #[test]
+    fn a_root_argument_is_held_until_its_value_changes() {
+        let mut held = std::collections::HashMap::new();
+        assert!(!super::root_held(&mut held, (false, 2), &[1, 2]));
+        assert!(super::root_held(&mut held, (false, 2), &[1, 2]));
+        // the same parameter of the other kind of root signature
+        assert!(!super::root_held(&mut held, (true, 2), &[1, 2]));
+        assert!(!super::root_held(&mut held, (false, 2), &[1, 3]));
+        // a root signature set forgets its side
+        held.retain(|k, _| k.0);
+        assert!(!super::root_held(&mut held, (false, 2), &[1, 3]));
+        assert!(super::root_held(&mut held, (true, 2), &[1, 2]));
     }
 
     #[test]
