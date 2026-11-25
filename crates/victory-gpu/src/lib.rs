@@ -19,6 +19,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod burst;
+#[cfg(windows)]
 mod card_mask;
 #[cfg(windows)]
 mod present_later;

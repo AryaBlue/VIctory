@@ -50,7 +50,7 @@ enum Held {
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
-    Run(Vec<crate::list::Detached>, Vec<usize>),
+    Run(Vec<crate::list::Detached>, Vec<usize>, u64),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
     /// With [`behind`]: the submission at the head of the line is being
@@ -294,7 +294,7 @@ fn submit_cut(this: This, lists: &[This]) {
             let mut held = lock(&queue(this).held);
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                held.push(Held::Run(taken, order, crate::burst::stamp()));
             }
         }
         let mut waiting = lock(&WAITING);
@@ -375,7 +375,7 @@ fn submit_split(this: This, lists: &[This]) {
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
             let (taken, order) = crate::list::detach(&lists[from..to]);
-            pieces.push(Held::Run(taken, order));
+            pieces.push(Held::Run(taken, order, crate::burst::stamp()));
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
@@ -611,7 +611,9 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(lists, order, stamp) => {
+                        // burst refresh: which enqueue this thread prepares
+                        let _stamp = crate::burst::enter(stamp);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -909,7 +911,7 @@ fn execute_now(this: This, count: u32, lists: *const This) {
         }
         let kept = hold(this, || {
             let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
+            Held::Run(taken, order, crate::burst::stamp())
         });
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
@@ -1072,6 +1074,8 @@ pub(crate) enum Written {
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+        #[cfg(windows)]
+        crate::burst::wrote(at as usize, bytes);
         let value = match self {
             Written::Value(v) => v,
             Written::GpuTimestamp => {

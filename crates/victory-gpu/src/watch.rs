@@ -1376,6 +1376,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::burst::wrote(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -1433,6 +1434,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    crate::burst::wrote(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1555,6 +1557,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::burst::wrote(at, len);
     REMAPS[4].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -1592,7 +1595,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// (`VICTORY_COMMIT_NOTICE`, which stops asking Windows about absent
 /// blocks at every pass).
 pub fn title_memory_committed(at: usize, len: usize) {
-    // f1: crate::burst::wrote(at, len)
+    crate::burst::wrote(at, len);
     if len == 0 {
         return;
     }
