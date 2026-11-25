@@ -1165,6 +1165,17 @@ struct Hosted {
     replaced: std::sync::atomic::AtomicBool,
 }
 
+/// For the hold (`crate::texture_hold`): whether a texture's first page is mapped, asked while
+/// the runtime is not remapping (a remap unmaps whole views and maps them again, and a look then
+/// finds pages the title never gave up unmapped); mid-remap it counts as mapped, for a later sweep.
+#[cfg(windows)]
+fn mapped_still(at: *const u8) -> bool {
+    match crate::watch::title_memory_reading_now() {
+        Some(_still) => crate::texture::committed(at, 1),
+        None => true,
+    }
+}
+
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
 /// their bytes; made again after that and their bytes; and host copies made
@@ -1836,7 +1847,7 @@ pub(crate) fn let_go_idle() {
                 level,
                 placed,
                 r.host.replaced.load(Relaxed),
-                placed && crate::texture::committed(r.data().cast_const(), 1),
+                placed && mapped_still(r.data().cast_const()),
             );
             if kept {
                 crate::texture_hold::STATS[0].fetch_add(1, Relaxed);
