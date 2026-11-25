@@ -224,6 +224,53 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
+/// Whether an indirect dispatch whose arguments no shader was ever declared to write is
+/// clamped on the CPU when its list is submitted, into the list's upload memory, with no
+/// clamp of ours on the card (`VICTORY_DISPATCH_CPU_CLAMP=1`; off by default).
+pub(crate) fn cpu_dispatch_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_CPU_CLAMP").is_some_and(|v| v == "1"))
+}
+
+/// Which of a clamp's two waits for every shader write are left out
+/// (`VICTORY_CLAMP_WAIT_SHARE`; off by default): bit 0 the one before, when the title's
+/// own wait was the last work recorded; bit 1 the one after, whose work the move of the
+/// scratch buffer to indirect arguments does.
+pub(crate) fn wait_share() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CLAMP_WAIT_SHARE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0) & 3)
+}
+
+thread_local! {
+    /// Set around one clamp whose wait before the title's own wait stands in for.
+    static SHARED_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next clamp recorded on this thread leaves out its wait before (`shared`), or not.
+pub(crate) fn share_wait(shared: bool) {
+    SHARED_WAIT.with(|s| s.set(shared));
+}
+
+const CPU_GROUPS: u32 = 1 << 20;
+const CPU_BUDGET: u32 = 1 << 27;
+
+/// A dispatch record's group counts clamped as the clamp shader does, charging `budget`
+/// (threads, a group as 64): past it the record runs empty.
+pub(crate) fn clamp_dispatch_record(g: [u32; 3], budget: &std::sync::atomic::AtomicU32) -> [u32; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = g.map(|v| v.min(65535));
+    if g[2] != 0 && g[0] * g[1] > CPU_GROUPS / g[2] {
+        g = [0; 3];
+    }
+    let cost = g[0] * g[1] * g[2] * 64;
+    if cost == 0 {
+        return g;
+    }
+    let charge = |at: u32| if at >= CPU_BUDGET || CPU_BUDGET - at <= cost { CPU_BUDGET } else { at + cost };
+    let before = budget.fetch_update(Relaxed, Relaxed, |at| Some(charge(at))).unwrap_or(CPU_BUDGET);
+    if before < CPU_BUDGET && CPU_BUDGET - before >= cost { g } else { [0; 3] }
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -554,9 +601,15 @@ fn record_clamps_at(
         ),
     ];
     let skip = usize::from(!waits);
+    let shared = SHARED_WAIT.with(|s| s.replace(false));
+    #[cfg(feature = "diagnostics")]
+    if shared && waits {
+        crate::copystat::add(crate::copystat::C::ClampWaitsShared, 1);
+    }
+    let after = usize::from(!waits || wait_share() & 2 != 0);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[usize::from(!waits || shared)..]);
         let mut bound = false;
         for (job, (constants, src_gpu, count_gpu, dst_gpu)) in jobs.iter().zip(&roots) {
             let records = job.spec.2;
@@ -575,8 +628,9 @@ fn record_clamps_at(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[after..]);
     }
+    let _ = skip;
     true
 }
 
@@ -3132,5 +3186,30 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+}
+#[cfg(test)]
+mod cpu_clamp_tests {
+    use super::clamp_dispatch_record;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn a_dispatch_clamped_on_the_cpu_is_bounded_as_the_clamp_shader_bounds_it() {
+        let budget = AtomicU32::new(0);
+        assert_eq!(clamp_dispatch_record([4, 2, 1], &budget), [4, 2, 1]);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 8 * 64);
+        // a dimension past the host's limit is cut to it
+        assert_eq!(clamp_dispatch_record([70_000, 1, 1], &budget), [65_535, 1, 1]);
+        // more than 2^20 groups in all: empty, charging nothing
+        let before = budget.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(clamp_dispatch_record([u32::MAX, u32::MAX, u32::MAX], &budget), [0, 0, 0]);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), before);
+        // past the list's budget, records run empty
+        let full = AtomicU32::new((1 << 27) - 64);
+        assert_eq!(clamp_dispatch_record([2, 1, 1], &full), [0, 0, 0]);
+        assert_eq!(clamp_dispatch_record([1, 1, 1], &full), [0, 0, 0]);
+        let room = AtomicU32::new((1 << 27) - 128);
+        assert_eq!(clamp_dispatch_record([2, 1, 1], &room), [2, 1, 1]);
+        assert_eq!(clamp_dispatch_record([1, 1, 1], &room), [0, 0, 0]);
     }
 }

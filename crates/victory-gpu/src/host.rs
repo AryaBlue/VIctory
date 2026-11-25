@@ -884,6 +884,12 @@ pub(crate) struct HostList {
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
+    /// Whether the title's own wait for every earlier shader write is the last work
+    /// recorded (`crate::indirect::wait_share`).
+    title_waited: std::sync::atomic::AtomicBool,
+    /// With `crate::indirect::cpu_dispatch_clamp`: the work the dispatches clamped on the
+    /// CPU charged since the list's submission began.
+    cpu_budget: std::sync::Arc<AtomicU32>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2048,6 +2054,8 @@ struct Deferred {
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
+    /// Whether the CPU's clamp budget is zeroed for this recording.
+    cpu_budget_zeroed: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -3988,6 +3996,8 @@ impl Host {
                 pass_span: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
+                title_waited: std::sync::atomic::AtomicBool::new(false),
+                cpu_budget: std::sync::Arc::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6229,6 +6239,7 @@ impl HostList {
             fail(format_args!("a host command list did not reset ({e})"));
         }
         self.pass_span.store(u32::MAX, Ordering::Relaxed);
+        self.title_waited.store(false, Ordering::Relaxed);
         self.meter
             .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -6241,6 +6252,27 @@ impl HostList {
         self.pass_end();
         let span = crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Pass(key));
         self.pass_span.store(span.raw(), Ordering::Relaxed);
+    }
+
+    /// Whether the title's own wait is the last work recorded.
+    pub(crate) fn title_waited(&self) -> bool {
+        self.title_waited.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_title_waited(&self, waited: bool) {
+        self.title_waited.store(waited, Ordering::Relaxed);
+    }
+
+    /// The budget of the dispatches clamped on the CPU, zeroed when the list is submitted
+    /// before the first of them.
+    pub(crate) fn cpu_budget(&self) -> std::sync::Arc<AtomicU32> {
+        let mut deferred = self.deferred();
+        if !deferred.cpu_budget_zeroed {
+            deferred.cpu_budget_zeroed = true;
+            let budget = self.cpu_budget.clone();
+            deferred.copies.push(Step::Host(Box::new(move || budget.store(0, Ordering::Relaxed))));
+        }
+        self.cpu_budget.clone()
     }
 
     /// The pass being recorded ends here.
@@ -6835,16 +6867,21 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (buffer, at, data) = self.scratch_region(len)?;
+        // SAFETY: a live buffer.
+        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+    }
+
+    /// As [`HostList::scratch`]: the buffer, the offset in it and the CPU pointer.
+    pub(crate) fn scratch_region(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            self.deferred().hold_upload(buffer.clone(), len);
+            return Some((buffer, 0, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -6861,10 +6898,10 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
+        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0._buffer.clone());
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some((buffer, at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:

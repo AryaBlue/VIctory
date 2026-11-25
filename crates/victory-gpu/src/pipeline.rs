@@ -69,6 +69,19 @@ pub(crate) struct Shader {
     walks: OnceLock<bool>,
 }
 
+impl Shader {
+    /// A compute program's threads per group and whether it runs in waves of 64 (diagnostics).
+    pub(crate) fn compute_shape(&self) -> Option<([u32; 3], bool)> {
+        let c = victory_shader::Container::parse(&self.container).ok()?;
+        let part = c.part(victory_shader::FourCC::DXIL)?;
+        let programs = victory_shader::native_programs(part.data).ok()?;
+        programs.iter().find_map(|p| match &p.io {
+            victory_shader::native::StageIo::Cs(cs) => Some((cs.threads, p.wave64)),
+            _ => None,
+        })
+    }
+}
+
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)

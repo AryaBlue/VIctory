@@ -163,6 +163,14 @@ pub(crate) enum C {
     RootArgSets,
     RootArgSame,
     PsoAfterClamp,
+    /// Indirect dispatches clamped: whose arguments no shader was ever declared to write
+    /// (single records, no count buffer), the others, those clamped on the CPU
+    /// (`VICTORY_DISPATCH_CPU_CLAMP`), and clamps whose wait before the title's own wait
+    /// stood in for (`VICTORY_CLAMP_WAIT_SHARE`).
+    DispatchArgsCpu,
+    DispatchArgsShader,
+    DispatchClampedOnCpu,
+    ClampWaitsShared,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1357,6 +1365,15 @@ pub(crate) fn log(frames: f64) {
         c[C::RootArgSets as usize],
         c[C::RootArgSame as usize],
         c[C::PsoAfterClamp as usize],
+    );
+    tracing::info!(
+        "  indirect dispatches per frame: {:.0} whose arguments no shader writes, {:.0} others; {:.0} clamped on \
+         the CPU (VICTORY_DISPATCH_CPU_CLAMP=1); {:.0} clamps whose wait the title's own stood in for \
+         (VICTORY_CLAMP_WAIT_SHARE)",
+        c[C::DispatchArgsCpu as usize],
+        c[C::DispatchArgsShader as usize],
+        c[C::DispatchClampedOnCpu as usize],
+        c[C::ClampWaitsShared as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
