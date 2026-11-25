@@ -7181,10 +7181,21 @@ impl Batch {
         } else if crate::wide_copy::on() {
             // decided here in order, the bytes moved wide (VICTORY_WIDE_COPIES)
             let refreshes = std::mem::take(&mut self.refreshes);
+            let current = &mut self.current;
             let noted = crate::wide_copy::noted_in(|| {
-                for (shadow, from, to) in &refreshes {
-                    Self::update(shadow, *from, *to);
-                    Self::brought(&mut self.current, shadow, *from, *to);
+                let mut each = || {
+                    for (shadow, from, to) in &refreshes {
+                        Self::update(shadow, *from, *to);
+                        Self::brought(current, shadow, *from, *to);
+                    }
+                };
+                if crate::wide_guard::on() {
+                    // the guards' system calls wide too (VICTORY_WIDE_GUARDS)
+                    let ranges: Vec<(usize, usize)> =
+                        refreshes.iter().map(|r| (r.1, r.2)).collect();
+                    crate::wide_guard::during(&ranges, each);
+                } else {
+                    each();
                 }
             });
             let started = std::time::Instant::now();

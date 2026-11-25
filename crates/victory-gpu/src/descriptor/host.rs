@@ -1920,10 +1920,30 @@ impl HostHeap {
                 due.push((index as u32, handle));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
-        }
+        self.mirror_due(&due, sync_batch());
         (looked, due.len() as u64)
+    }
+
+    /// [`HostHeap::mirror`] of each of `due` (slot, title handle), in
+    /// order; under one taking of the made keys' lock with `batch`.
+    fn mirror_due(&self, due: &[(u32, u64)], batch: bool) {
+        if !batch {
+            for &(index, handle) in due {
+                self.mirror(index, handle, false);
+            }
+            return;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for &(index, handle) in due {
+            if index < self.count {
+                self.mirror_in(&mut made, index, handle, false);
+            } else {
+                // past the heap: said as mirror says it, without the lock
+                drop(made);
+                self.mirror(index, handle, false);
+                made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            }
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -1945,11 +1965,17 @@ impl HostHeap {
             }
             return None;
         }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        self.mirror_in(&mut made, index, handle, for_draw)
+    }
+
+    /// [`HostHeap::mirror`] with the made keys' lock already taken
+    /// (`index` inside the heap).
+    fn mirror_in(&self, made: &mut [u64], index: u32, handle: u64, for_draw: bool) -> Option<View> {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1970,7 +1996,7 @@ impl HostHeap {
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(made, stale);
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -2239,6 +2265,20 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
+
+/// Whether the pass over records copied in as bytes makes a page's
+/// changed slots under one taking of the made keys' lock, not one each
+/// (`VICTORY_HEAP_SYNC_BATCH=1`; off by default).
+///
+/// Why: in the s2-prep-1 profile 24 of the pass's 28 ms a frame were in
+/// [`HostHeap::mirror`], some 14 of them waiting for or handing over that
+/// lock, which the recording threads' draws take too (they waited 107 ms
+/// a frame on it, all threads together). Spreading the slots over more
+/// threads would only fight for it harder.
+fn sync_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BATCH").is_some_and(|v| v == "1"))
+}
 
 /// Whether the pass over records copied in as bytes also mirrors slots
 /// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
@@ -3456,6 +3496,29 @@ mod tests {
         assert!(heap.note_buffer(2, Some(&view), true).is_empty());
         assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
         assert_eq!(heap.buffer_slots(), [2]);
+    }
+
+    /// VICTORY_HEAP_SYNC_BATCH: a page's slots made under one taking of
+    /// the lock end as one by one: a record that is no view of ours makes
+    /// its made slot null, and a slot past the heap is left alone.
+    #[test]
+    fn a_page_mirrored_at_once_ends_as_slot_by_slot() {
+        for batch in [false, true] {
+            let Some(heap) = HostHeap::new(false, 8) else {
+                return; // no host GPU
+            };
+            // records that are not views of ours (tag 0)
+            let records = [[0u32; 8]; 8];
+            let handle = |i: usize| records[i].as_ptr() as u64;
+            {
+                let mut made = heap.made.lock().unwrap();
+                (made[1], made[3], made[5]) = (7 << 32 | 1, 9 << 32 | 2, 3 << 32 | 4);
+            }
+            let due: Vec<(u32, u64)> = vec![(1, handle(1)), (3, handle(3)), (9, handle(4))];
+            heap.mirror_due(&due, batch);
+            assert!(!heap.made(1) && !heap.made(3), "batch {batch}");
+            assert!(heap.made(5), "batch {batch}");
+        }
     }
 
     #[test]

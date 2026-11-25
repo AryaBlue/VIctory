@@ -807,7 +807,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+                uncommitted_until = crate::wide_guard::uncommitted_end_asked(block)
+                    .unwrap_or_else(|| uncommitted_end(block));
             }
             open = block >= uncommitted_until;
             if open {
@@ -824,7 +825,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 continue;
             }
         }
-        if let Some(from) = run.take() {
+        if let Some(from) = run.take()
+            && !crate::wide_guard::later(from, block)
+        {
             protect(&mut g, from, block);
         }
     }
@@ -889,6 +892,11 @@ fn is_view(start: usize, end: usize) -> bool {
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     protect_here(g, from, to);
+    protect_aliases(g, from, to);
+}
+
+/// [`protect`]'s other views of blocks `[from, to)`.
+fn protect_aliases(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
@@ -957,19 +965,28 @@ fn protect_alias(g: &mut Guards, block: usize) {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    let done = set_read_only(from, to);
+    protect_noted(g, from, to, done);
+}
+
+/// Makes blocks `[from, to)` read-only; false if that failed.
+pub(crate) fn set_read_only(from: usize, to: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
-    };
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    unsafe {
+        VirtualProtect(
+            (from * BLOCK) as *const _,
+            (to - from) * BLOCK,
+            PAGE_READONLY,
+            &mut old,
+        ) != 0
+    }
+}
+
+/// [`protect_here`] once [`set_read_only`] of the whole of `[from, to)`
+/// said `done`.
+fn protect_noted(g: &mut Guards, from: usize, to: usize, done: bool) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
@@ -977,17 +994,56 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.views.extend(from..to);
         }
     };
-    if set(from, to) {
+    if done {
         note(g, from, to);
         return;
     }
     for block in from..to {
-        if set(block, block + 1) {
+        if set_read_only(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
     }
+}
+
+/// With [`crate::wide_guard`]: the guards' lock held while `set` makes
+/// `runs` (blocks, in order, apart) read-only, then each noted guarded as
+/// [`protect`] notes it, in order. `set` must not run other wide work.
+pub(crate) fn protect_runs(
+    runs: &[(usize, usize)],
+    set: impl FnOnce(&[(usize, usize)]) -> Vec<bool>,
+) {
+    let mut g = guards();
+    let done = set(runs);
+    for (&(from, to), &done) in runs.iter().zip(&done) {
+        protect_noted(&mut g, from, to, done);
+        protect_aliases(&mut g, from, to);
+    }
+}
+
+/// With [`crate::wide_guard`]: the blocks noted absent in `ranges`
+/// (addresses), each range's in order.
+pub(crate) fn absent_in(ranges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let g = guards();
+    if g.absent.is_empty() {
+        return Vec::new();
+    }
+    ranges
+        .iter()
+        .map(|&(start, end)| {
+            g.absent
+                .range(start / BLOCK..end.div_ceil(BLOCK))
+                .copied()
+                .collect()
+        })
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .collect()
+}
+
+/// [`uncommitted_end`] for [`crate::wide_guard`].
+pub(crate) fn uncommitted_end_of(block: usize) -> usize {
+    uncommitted_end(block)
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.

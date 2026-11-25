@@ -90,6 +90,8 @@ pub mod upscale;
 mod watch;
 #[cfg(windows)]
 mod wide_copy;
+#[cfg(windows)]
+mod wide_guard;
 
 #[cfg(windows)]
 pub use host::on_failure;
