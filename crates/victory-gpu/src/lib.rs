@@ -83,6 +83,8 @@ mod texture;
 #[cfg(windows)]
 mod texture_worker;
 #[cfg(windows)]
+pub mod upscale;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
