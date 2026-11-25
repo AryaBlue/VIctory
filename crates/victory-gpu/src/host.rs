@@ -7034,6 +7034,26 @@ fn refresh_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
 }
 
+// a title buffer copy flushes only the pending refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)
+fn copy_flush_overlap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COPY_FLUSH_OVERLAP").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("a title buffer copy flushes only the refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)");
+        }
+        on
+    })
+}
+
+// past this many pending refreshes a title copy flushes them all: the search would cost more
+const FLUSH_OVER_MOST: usize = 256;
+
+// the copies whose pending range touches `[at, end)`
+fn pending_over<T: Clone>(refreshes: &[(T, usize, usize)], at: usize, end: usize) -> Vec<T> {
+    refreshes.iter().filter(|r| r.1 < end && at < r.2).map(|r| r.0.clone()).collect()
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -7174,7 +7194,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
-        self.flush();
+        self.flush_for(at, at + len);
         self.textures.clear();
         let end = at + len;
         self.current.retain(|_, entry| {
@@ -7190,6 +7210,16 @@ impl Batch {
             }
             entry.1 < entry.2
         });
+    }
+
+    // before a title buffer copy into `[at, end)`: only the pending refreshes over it, if asked
+    fn flush_for(&mut self, at: usize, end: usize) {
+        if !copy_flush_overlap() || self.refreshes.len() > FLUSH_OVER_MOST {
+            return self.flush();
+        }
+        for shadow in pending_over(&self.refreshes, at, end) {
+            self.flush_one(&shadow);
+        }
     }
 
     fn flush(&mut self) {
@@ -8665,7 +8695,7 @@ mod spare {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, pending_over};
     use std::sync::Arc;
 
     #[test]
@@ -8679,6 +8709,14 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    #[test]
+    fn a_title_copy_finds_only_the_refreshes_over_it() {
+        let pending = [(1u8, 0x1000, 0x2000), (2, 0x2000, 0x3000), (3, 0x8000, 0x9000), (4, 0, 0x10000)];
+        assert_eq!(pending_over(&pending, 0x1ff0, 0x2010), [1, 2, 4]);
+        assert_eq!(pending_over(&pending, 0x3000, 0x8000), [4]);
+        assert_eq!(pending_over(&pending, 0x10000, 0x10100), [0u8; 0]);
     }
 
     #[test]
