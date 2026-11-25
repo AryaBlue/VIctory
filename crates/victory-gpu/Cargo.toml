@@ -22,6 +22,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# dlss super resolution through nvidia's ngx; needs VICTORY_DLSS_SDK at build time.
+dlss = []
 
 [lints]
 workspace = true
