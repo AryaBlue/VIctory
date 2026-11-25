@@ -43,7 +43,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<Pending>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -307,6 +307,13 @@ fn pend_tick() {
         s[10] as f64 / 1000.0 / frames,
         s[11] as f64 / 1000.0 / frames,
     );
+    if pending_indexed() && pending_check() {
+        tracing::info!(
+            checked = PENDING_CHECKED[0].swap(0, Ordering::Relaxed),
+            differing = PENDING_CHECKED[1].load(Ordering::Relaxed),
+            "pending check: lookups made by the walk too, and those that differed (since the start)"
+        );
+    }
 }
 
 /// The copies in the card's memory.
@@ -844,13 +851,30 @@ pub(crate) fn relay_fetched(number: u64) {
 /// of the first flight's copy-back removed it while the second was still
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
+// .1 with pending_indexed: where each range is in the list
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(Vec<((usize, usize), u32, u64)>, std::collections::HashMap<(usize, usize), usize>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
     fn declare(&mut self, range: (usize, usize), number: u64) {
+        if pending_indexed() {
+            match self.1.get(&range) {
+                Some(&at) => {
+                    let f = &mut self.0[at];
+                    if f.2 != number {
+                        f.1 += 1;
+                        f.2 = number;
+                    }
+                }
+                None => {
+                    self.1.insert(range, self.0.len());
+                    self.0.push((range, 1, number));
+                }
+            }
+            return;
+        }
         match self.0.iter_mut().find(|f| f.0 == range) {
             Some(f) => {
                 if f.2 != number {
@@ -866,12 +890,21 @@ impl Flights {
     /// the ranges no other submission still holds.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut free = Vec::new();
+        let indexed = pending_indexed();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
+            let found = if indexed { self.1.get(range).copied() } else { self.0.iter().position(|f| f.0 == *range) };
+            match found {
                 Some(at) => {
                     self.0[at].1 = self.0[at].1.saturating_sub(1);
                     if self.0[at].1 == 0 {
                         self.0.swap_remove(at);
+                        if indexed {
+                            self.1.remove(range);
+                            // the last one took its place
+                            if let Some(moved) = self.0.get(at) {
+                                self.1.insert(moved.0, at);
+                            }
+                        }
                         free.push(*range);
                     }
                 }
@@ -880,6 +913,151 @@ impl Flights {
             }
         }
         free
+    }
+}
+
+// VICTORY_PENDING_INDEX=1 (on in the crate's tests): pending ranges are looked up, not walked
+pub(crate) fn pending_indexed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PENDING_INDEX").map_or(cfg!(test), |v| v == "1");
+        if on && !cfg!(test) {
+            tracing::info!(
+                check = pending_check(),
+                "ranges shaders may be writing are looked up by range, and a merge under flights asks once for its span (VICTORY_PENDING_INDEX=1)"
+            );
+        }
+        on
+    })
+}
+
+// VICTORY_PENDING_CHECK=1 (on in the tests): every lookup is made by the walk too, and the two compared
+fn pending_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_CHECK").map_or(cfg!(test), |v| v == "1"))
+}
+
+// lookups checked, and those the walk answered otherwise
+pub(crate) static PENDING_CHECKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn pending_differs(what: &str, len: usize) {
+    if PENDING_CHECKED[1].fetch_add(1, Ordering::Relaxed) < 16 {
+        tracing::warn!(what, len, "pending check: the index and the walk over the list disagree");
+    }
+    debug_assert!(!cfg!(test), "pending check: {what}");
+}
+
+/// The ranges shaders of submissions not yet copied back may be writing,
+/// as declared (`list`, which derefs: the old code walks it), and with
+/// [`pending_indexed`] an index of them: the set of the ranges and their
+/// union, apart and in order.
+#[derive(Default)]
+struct Pending {
+    list: Vec<(usize, usize)>,
+    set: std::collections::HashSet<(usize, usize)>,
+    union: Vec<(usize, usize)>,
+    // the list's length the index was made at; `redo`: ranges left it since
+    made: usize,
+    redo: bool,
+}
+
+impl std::ops::Deref for Pending {
+    type Target = Vec<(usize, usize)>;
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+impl std::ops::DerefMut for Pending {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.list
+    }
+}
+
+impl Pending {
+    // the index made again if the list changed behind it
+    fn sync(&mut self) {
+        if !self.redo && self.made == self.list.len() {
+            return;
+        }
+        self.set = self.list.iter().copied().collect();
+        self.union = joined(self.list.clone());
+        (self.made, self.redo) = (self.list.len(), false);
+    }
+
+    /// Whether `range` is declared, as `list.contains`.
+    fn has(&mut self, range: (usize, usize)) -> bool {
+        self.sync();
+        let has = self.set.contains(&range);
+        if pending_check() {
+            PENDING_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            if has != self.list.contains(&range) {
+                pending_differs("has", self.list.len());
+            }
+        }
+        has
+    }
+
+    /// Declares `range`, as `list.push`.
+    fn add(&mut self, range: (usize, usize)) {
+        self.sync();
+        self.list.push(range);
+        self.made = self.list.len();
+        self.set.insert(range);
+        let (mut lo, mut hi) = range;
+        if lo >= hi {
+            return;
+        }
+        // the ranges of the union it overlaps or touches become one with it
+        let first = self.union.partition_point(|r| r.1 < lo);
+        let mut last = first;
+        while last < self.union.len() && self.union[last].0 <= hi {
+            (lo, hi) = (lo.min(self.union[last].0), hi.max(self.union[last].1));
+            last += 1;
+        }
+        self.union.splice(first..last, [(lo, hi)]);
+    }
+
+    /// The ranges in `gone` leave, as `list.retain(|r| !gone.contains(r))`.
+    fn leave(&mut self, gone: &[(usize, usize)]) {
+        if gone.is_empty() || self.list.is_empty() {
+            return;
+        }
+        let gone: std::collections::HashSet<(usize, usize)> = gone.iter().copied().collect();
+        let before = self.list.len();
+        self.list.retain(|r| !gone.contains(r));
+        if self.list.len() != before {
+            self.redo = true;
+        }
+    }
+
+    /// What is declared inside `[from, to)`, cut to it: apart, in order,
+    /// touching ranges as one. The same bytes as the list's ranges that
+    /// overlap `[from, to)`, cut.
+    fn over(&mut self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.sync();
+        let first = self.union.partition_point(|r| r.1 <= from);
+        let out: Vec<(usize, usize)> = self.union[first..]
+            .iter()
+            .take_while(|r| r.0 < to)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .filter(|&(a, e)| a < e)
+            .collect();
+        if pending_check() {
+            PENDING_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            let walked = joined(
+                self.list
+                    .iter()
+                    .filter(|&&(a, e)| a < to && e > from)
+                    .map(|&(a, e)| (a.max(from), e.min(to)))
+                    .filter(|&(a, e)| a < e)
+                    .collect(),
+            );
+            if walked != out {
+                pending_differs("over", self.list.len());
+            }
+        }
+        out
     }
 }
 
@@ -2250,6 +2428,49 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
 mod stale_tests {
     use super::*;
 
+    // the index answers as the walk does through declarations and leavings (the check is on in tests and panics)
+    #[test]
+    fn the_pending_index_answers_as_the_walk() {
+        let mut pending = Pending::default();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |most: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % most as u64) as usize
+        };
+        for round in 0..4000 {
+            let a = next(4096) * 16;
+            let range = (a, a + (1 + next(64)) * 16);
+            match next(8) {
+                0..=3 => {
+                    if !pending.has(range) {
+                        pending.add(range);
+                    }
+                }
+                4 => {
+                    let gone: Vec<(usize, usize)> = pending.iter().copied().filter(|_| next(3) == 0).collect();
+                    pending.leave(&gone);
+                    assert!(gone.iter().all(|r| !pending.has(*r)));
+                }
+                5 if round % 97 == 0 => pending.clear(),
+                _ => {
+                    let over = pending.over(range.0, range.1 + next(4096));
+                    assert!(over.windows(2).all(|w| w[0].1 < w[1].0), "apart and in order");
+                }
+            }
+        }
+        assert!(PENDING_CHECKED[0].load(Ordering::Relaxed) > 1000);
+        // a range that only touches is one with its neighbour, and a cut never leaves an empty range
+        let mut pending = Pending::default();
+        pending.add((16, 32));
+        pending.add((32, 48));
+        pending.add((64, 80));
+        assert_eq!(pending.over(0, 100), [(16, 48), (64, 80)]);
+        assert!(pending.over(48, 64).is_empty());
+        assert_eq!(pending.over(40, 70), [(40, 48), (64, 70)]);
+    }
+
     #[test]
     fn pages_never_taken_are_stale_written_or_not() {
         let base = 0x100;
@@ -2596,21 +2817,28 @@ impl Shadow {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
         // Dispatches declare the same ranges thousands of times.
-        if pending.contains(&range) {
+        let indexed = pending_indexed();
+        if if indexed { pending.has(range) } else { pending.contains(&range) } {
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
-            pending.push(range);
+            if indexed {
+                pending.add(range);
+            } else {
+                pending.push(range);
+            }
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        // with the index: what is declared over the range, a few ranges, not every range of the copy
+        let over = if indexed { pending.over(address, address + len) } else { Vec::new() };
+        for &(a, e) in if indexed { over.iter() } else { pending.iter() } {
             let (a, e) = self.inside(a, e - a);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
@@ -2627,7 +2855,11 @@ impl Shadow {
             }
             parts = rest;
         }
-        pending.push(range);
+        if indexed {
+            pending.add(range);
+        } else {
+            pending.push(range);
+        }
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -2994,7 +3226,13 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| !free.contains(r));
+            if pending_indexed() {
+                pending.leave(&free);
+            } else {
+                pending.retain(|r| !free.contains(r));
+            }
+        } else if pending_indexed() {
+            pending.leave(ranges);
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
@@ -3075,14 +3313,14 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending_indexed() {
+                pending.over(from, to)
+            } else {
+                pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect()
+            }
+        };
         if busy.is_empty() {
             return false;
         }
@@ -3120,10 +3358,14 @@ impl Shadow {
             return false;
         }
         let busy: Vec<(usize, usize)> = {
-            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pend_add(5, 1);
             pend_add(6, pending.len() as u64);
-            pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect()
+            if pending_indexed() {
+                pending.over(from, to)
+            } else {
+                pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect()
+            }
         };
         if busy.is_empty() {
             return false;
@@ -3137,6 +3379,45 @@ impl Shadow {
             && self.card.is_some()
             && crate::host::host().and_then(|h| crate::card_mask::program(&h.device)).is_some();
         let mut title = vec![0u8; PAGE];
+        // with the index: one asking for the span, and only the ranges with a stale page go on
+        const SPAN_ASK: usize = 4;
+        let spanned = (pending_indexed() && busy.len() >= SPAN_ASK)
+            .then(|| {
+                let _asking = pend_times().then(|| Timed(std::time::Instant::now(), 10));
+                let (now, written) = crate::watch::writes(from, to, true)?;
+                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                Some((now, stale_pages_in(base, &copied, from, to, &written)))
+            })
+            .flatten();
+        if let Some((now, stale)) = spanned {
+            for (a, e) in busy {
+                let pages = &stale[stale.partition_point(|&p| p < a / PAGE)..stale.partition_point(|&p| p < e.div_ceil(PAGE))];
+                if pending_check() {
+                    // as the walk asks: the journal again for this range alone
+                    PENDING_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    let alone = crate::watch::asked(a, e).map(|(_, written)| {
+                        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        stale_pages_in(base, &copied, a, e, &written)
+                    });
+                    if alone.is_some_and(|alone| alone != pages) {
+                        pending_differs("stale pages", pages.len());
+                    }
+                }
+                if pages.is_empty() {
+                    continue;
+                }
+                let _merging = pend_times().then(|| Timed(std::time::Instant::now(), 11));
+                let settle = if merge::wide() {
+                    self.merge_stale_wide(a, e, pages, now, runs_left, masked)
+                } else {
+                    self.merge_stale(a, e, pages, now, runs_left, masked, &mut title)
+                };
+                if settle {
+                    return true;
+                }
+            }
+            return false;
+        }
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3386,12 +3667,18 @@ impl Shadow {
     // the refresh of `[from, to)` (inside the buffer) as it always was; and whether no shader writes in it
     fn update_old(&self, from: usize, to: usize) -> (usize, bool) {
         let mut busy: Vec<(usize, usize)> = {
-            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.is_empty() {
                 pend_add(3, 1);
                 pend_add(4, pending.len() as u64);
             }
-            pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
+            if pending.is_empty() {
+                Vec::new()
+            } else if pending_indexed() {
+                pending.over(from, to)
+            } else {
+                pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
+            }
         };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
