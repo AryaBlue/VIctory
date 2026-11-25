@@ -7156,7 +7156,7 @@ fn heap_split_line() {
     }
     let per = |x: u64| x as f64 / passes as f64;
     tracing::info!(
-        "heap-buffer pass since the last line: {passes} passes over {p} presents and {b} frames begun; per pass: slot walk {:.1} ms          ({:.0} slots, {} full walks in all), spans {:.1} ms ({:.0} copies), unwatched whole refresh {:.1} ms {:.1} MB,          watched refresh {:.1} ms {:.1} MB, textures {:.1} ms",
+        "heap-buffer pass since the last line: {passes} passes over {p} presents and {b} frames begun; per pass: slot walk {:.1} ms          ({:.0} slots, {} full walks in all), spans {:.1} ms ({:.0} copies), unwatched whole refresh {:.1} ms {:.1} MB,          watched refresh {:.1} ms {:.1} MB, textures {:.1} ms; in the walk: mirror {:.1} ms,          buffer_copy {:.1} ms ({:.0} slots from the range cache)",
         per(v[H::WalkUs as usize]) / 1e3,
         per(v[H::Slots as usize]),
         v[H::FullWalks as usize],
@@ -7167,6 +7167,9 @@ fn heap_split_line() {
         per(v[H::RefreshUs as usize]) / 1e3,
         per(v[H::RefreshBytes as usize]) / 1048576.0,
         per(v[H::TexturesUs as usize]) / 1e3,
+        per(v[H::MirrorUs as usize]) / 1e3,
+        per(v[H::CopyUs as usize]) / 1e3,
+        per(v[H::CacheHits as usize]),
     );
 }
 

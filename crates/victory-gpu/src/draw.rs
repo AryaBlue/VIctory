@@ -372,7 +372,7 @@ pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }
 /// Passes since the last split line.
 pub(crate) static HEAP_PASSES_SINCE: AtomicU64 = AtomicU64::new(0);
 /// The pass in parts ([`HeapSplit`]): microseconds and counts, summed.
-pub(crate) static HEAP_SPLIT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+pub(crate) static HEAP_SPLIT: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Indexes into [`HEAP_SPLIT`].
 pub(crate) enum HeapSplit {
     WalkUs,
@@ -385,10 +385,43 @@ pub(crate) enum HeapSplit {
     RefreshBytes,
     TexturesUs,
     Copies,
+    MirrorUs,
+    CopyUs,
+    CacheHits,
 }
 
 fn split(at: HeapSplit, n: u64) {
     HEAP_SPLIT[at as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+// the heap pass reuses a slot's host copy and range while its view record is the same (VICTORY_HEAP_RANGE_CACHE=1)
+fn heap_range_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_RANGE_CACHE").is_ok_and(|v| v == "1"))
+}
+
+/// A slot's view record as the title wrote it (tag, view, generation), the
+/// key the range cache keeps a slot's copy under.
+fn record_key(handle: u64) -> u128 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [a, b, c] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    u128::from(a) << 64 | u128::from(b) << 32 | u128::from(c)
+}
+
+/// What the range cache keeps for a slot: its record and what
+/// `buffer_copy` gave for it.
+type Cached = (u128, std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+/// The cached range of a slot still holding `key`, its copy still listed
+/// (the list of copies holds it too: a copy let go is held by the cache alone).
+#[allow(clippy::type_complexity)]
+fn cached_range<T>(
+    cache: &std::collections::HashMap<u32, (u128, std::sync::Arc<T>, u64, u64)>,
+    index: u32,
+    key: u128,
+) -> Option<(std::sync::Arc<T>, u64, u64)> {
+    let (k, shadow, from, to) = cache.get(&index)?;
+    (*k == key && std::sync::Arc::strong_count(shadow) > 1).then(|| (shadow.clone(), *from, *to))
 }
 
 // heap pass once per presented frame instead of per frame begun (VICTORY_HEAP_PER_PRESENT=1)
@@ -1430,6 +1463,10 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        static CACHE: std::sync::Mutex<Option<std::collections::HashMap<u32, Cached>>> = std::sync::Mutex::new(None);
+        let caching = heap_range_cache();
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.get_or_insert_with(Default::default);
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1457,7 +1494,12 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let key = if caching { record_key(handle) } else { 0 };
+            let t = std::time::Instant::now();
+            let mirrored = host.mirror(index, handle, true);
+            split(HeapSplit::MirrorUs, t.elapsed().as_micros() as u64);
+            let Some(view) = mirrored else {
+                cache.remove(&index);
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1477,9 +1519,22 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let t = std::time::Instant::now();
+            let found = match caching.then(|| cached_range(cache, index, key)).flatten() {
+                Some((shadow, from, to)) => {
+                    split(HeapSplit::CacheHits, 1);
+                    Some((shadow, from, to - from))
+                }
+                None => crate::descriptor::host::buffer_copy(&view),
+            };
+            split(HeapSplit::CopyUs, t.elapsed().as_micros() as u64);
+            let Some((shadow, address, len)) = found else {
+                cache.remove(&index);
                 continue;
             };
+            if caching {
+                cache.insert(index, (key, shadow.clone(), address, address + len));
+            }
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
@@ -3474,5 +3529,25 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod range_cache_tests {
+    #[test]
+    fn the_range_cache_holds_while_the_record_and_the_copy_stay() {
+        let copy = std::sync::Arc::new(());
+        let listed = copy.clone();
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(7u32, (5u128, copy, 0x1000u64, 0x2000u64));
+        let hit = super::cached_range(&cache, 7, 5).map(|(_, a, b)| (a, b));
+        assert_eq!(hit, Some((0x1000, 0x2000)));
+        // another record in the slot
+        assert!(super::cached_range(&cache, 7, 6).is_none());
+        // another slot
+        assert!(super::cached_range(&cache, 8, 5).is_none());
+        // the copy let go: only the cache holds it
+        drop(listed);
+        assert!(super::cached_range(&cache, 7, 5).is_none());
     }
 }
