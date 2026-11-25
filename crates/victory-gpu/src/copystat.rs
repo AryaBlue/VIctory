@@ -150,6 +150,13 @@ pub(crate) enum C {
     Executes,
     WindowHits,
     Binds,
+    /// Indirect calls clamped on their own, by why no window served them:
+    /// a dispatch, a count buffer or several records, shaders that store,
+    /// and window misses (the first record of a window included).
+    ClampDispatch,
+    ClampCounted,
+    ClampStores,
+    ClampMiss,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1329,6 +1336,13 @@ pub(crate) fn log(frames: f64) {
         c[C::Transitions as usize],
         c[C::Executes as usize],
         c[C::WindowHits as usize],
+    );
+    tracing::info!(
+        "  indirect calls clamped per frame, by why no window served them: {:.0} dispatches, {:.0} with a          count buffer or several records, {:.0} whose shaders store, {:.0} window misses",
+        c[C::ClampDispatch as usize],
+        c[C::ClampCounted as usize],
+        c[C::ClampStores as usize],
+        c[C::ClampMiss as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

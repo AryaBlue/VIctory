@@ -3370,6 +3370,19 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    if kind == DISPATCH {
+                        crate::copystat::C::ClampDispatch
+                    } else if max != 1 || count.is_some() {
+                        crate::copystat::C::ClampCounted
+                    } else if stores {
+                        crate::copystat::C::ClampStores
+                    } else {
+                        crate::copystat::C::ClampMiss
+                    },
+                    1,
+                );
                 let ahead = windowed && records > 1;
                 let bounded = if many {
                     crate::indirect::bound_in_ring(list, (&args.buffer, offset), count_arg, (kind, step, records), ahead)
