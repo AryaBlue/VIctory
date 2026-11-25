@@ -757,12 +757,24 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let on_buffer = |b: &&Barrier| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
+        };
+        if barriers.iter().any(|b| on_buffer(&b)) {
+            let read_only = buffer_barriers_read_only(barriers.iter().filter(on_buffer));
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            {
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+                if read_only {
+                    crate::copystat::add(crate::copystat::C::BufferWaitsReadOnly, 1);
+                }
+            }
+            if read_only && narrow_waits() & 2 != 0 {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsNarrowed, 1);
+            } else {
+                host.push(UAV_BARRIER);
+            }
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -780,6 +792,24 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
     }
     0
+}
+
+/// Legacy states that only read: vertex and constant buffers, index,
+/// depth read, shader resources, indirect arguments, copy and resolve
+/// sources, acceleration structures, shading rate. Common (0) counts as a
+/// write.
+const STATE_READS: u32 = 0x1 | 0x2 | 0x20 | 0x40 | 0x80 | 0x200 | 0x800 | 0x2000 | 0x40_0000 | 0x100_0000;
+
+fn state_writes(state: u32) -> bool {
+    state == 0 || state & !STATE_READS != 0
+}
+
+/// Whether buffer barriers are all whole transitions from reads to reads
+/// (an unordered access barrier or a split half is not).
+fn buffer_barriers_read_only<'a>(barriers: impl IntoIterator<Item = &'a Barrier>) -> bool {
+    barriers.into_iter().all(|b| {
+        b.kind == 0 && b.flags == 0 && !state_writes((b.second >> 32) as u32) && !state_writes(b.last as u32)
+    })
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -1990,7 +2020,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -1998,6 +2028,23 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
+    }
+    let kind = if count > 0 && (cfg!(feature = "diagnostics") || narrow_waits() & 1 != 0) {
+        // SAFETY: the title passes `count` groups.
+        unsafe { group_wait(count, groups) }
+    } else {
+        Wait::Needed
+    };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    match kind {
+        Wait::ReadOnly => crate::copystat::add(crate::copystat::C::GroupsReadOnly, 1),
+        Wait::NothingBefore => crate::copystat::add(crate::copystat::C::GroupsNothingBefore, 1),
+        Wait::Needed => {}
+    }
+    if kind != Wait::Needed && narrow_waits() & 1 != 0 {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::copystat::add(crate::copystat::C::WaitsNarrowed, 1);
+        return;
     }
     #[cfg(windows)]
     if count > 0
@@ -2011,6 +2058,105 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// `VICTORY_NARROW_WAITS`: bit 0 (`groups`) leaves out the wait for earlier
+/// shader writes of barrier groups that ask for none (read to read, or
+/// nothing before them), bit 1 (`buffers`) that of buffer barriers moving
+/// from reads to reads; `1` or `both` does both. Off by default.
+fn narrow_waits() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAITS").as_deref() {
+        Ok("groups") => 1,
+        Ok("buffers") => 2,
+        Ok("1" | "both") => 3,
+        _ => 0,
+    })
+}
+
+/// What a barrier asks the host's one wait for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wait {
+    Needed,
+    /// no write before or after: nothing to order
+    ReadOnly,
+    /// sync none before: no earlier work to wait for
+    NothingBefore,
+}
+
+/// Enhanced barrier accesses that only read: vertex, constant and index
+/// buffers, depth read, shader resource, indirect arguments, copy and
+/// resolve sources, acceleration structure reads, shading rate. Common (0)
+/// and anything else count as writes.
+const ACCESS_READS: u32 = 0x1 | 0x2 | 0x4 | 0x40 | 0x80 | 0x200 | 0x800 | 0x2000 | 0x4000 | 0x10000;
+const NO_ACCESS: u32 = 0x8000_0000;
+
+fn access_writes(access: u32) -> bool {
+    access != NO_ACCESS && (access == 0 || access & !ACCESS_READS != 0)
+}
+
+/// The wait barriers `(sync before, access before, access after)` need.
+fn barriers_wait(barriers: impl IntoIterator<Item = (u32, u32, u32)>) -> Wait {
+    let mut any = false;
+    let mut some_before = false;
+    for (sync_before, before, after) in barriers {
+        any = true;
+        if sync_before == 0 {
+            continue;
+        }
+        some_before = true;
+        if access_writes(before) || access_writes(after) {
+            return Wait::Needed;
+        }
+    }
+    match (any, some_before) {
+        (false, _) => Wait::Needed,
+        (true, false) => Wait::NothingBefore,
+        (true, true) => Wait::ReadOnly,
+    }
+}
+
+/// The wait `count` barrier groups at `groups` need: a group is its type
+/// (global 0, texture 1, buffer 2), its barrier count and a pointer to
+/// them; every barrier starts with sync before, sync after, access before
+/// and access after. Anything unexpected needs the wait.
+/// # Safety
+/// `groups` holds `count` groups as the title passes them.
+unsafe fn group_wait(count: u32, groups: *const u8) -> Wait {
+    const MOST: u32 = 4096;
+    if groups.is_null() || count > MOST {
+        return Wait::Needed;
+    }
+    let mut seen = Vec::new();
+    for g in 0..count as usize {
+        // SAFETY: inside the title's groups.
+        let (kind, n, at) = unsafe {
+            let p = groups.add(g * 16);
+            (
+                p.cast::<u32>().read_unaligned(),
+                p.add(4).cast::<u32>().read_unaligned(),
+                p.add(8).cast::<*const u8>().read_unaligned(),
+            )
+        };
+        let size = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => return Wait::Needed,
+        };
+        if n > MOST || (n > 0 && at.is_null()) {
+            return Wait::Needed;
+        }
+        for b in 0..n as usize {
+            // SAFETY: inside the group's barriers.
+            let words = unsafe {
+                let p = at.add(b * size).cast::<u32>();
+                (p.read_unaligned(), p.add(2).read_unaligned(), p.add(3).read_unaligned())
+            };
+            seen.push(words);
+        }
+    }
+    barriers_wait(seen)
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2228,6 +2374,68 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn barrier_groups_wait_only_when_something_writes() {
+        // shader resource to shader resource: nothing to order
+        assert_eq!(barriers_wait([(0x8, 0x80, 0x80)]), Wait::ReadOnly);
+        // unordered access before: the wait stays
+        assert_eq!(barriers_wait([(0x8, 0x80, 0x80), (0x8, 0x10, 0x80)]), Wait::Needed);
+        // a read then a write: the write waits for the read
+        assert_eq!(barriers_wait([(0x8, 0x80, 0x10)]), Wait::Needed);
+        // common counts as a write
+        assert_eq!(barriers_wait([(0x8, 0, 0x80)]), Wait::Needed);
+        // sync none before: no earlier work
+        assert_eq!(barriers_wait([(0, NO_ACCESS, 0x10)]), Wait::NothingBefore);
+        assert_eq!(barriers_wait([]), Wait::Needed);
+    }
+
+    #[test]
+    fn barrier_groups_are_read_from_the_titles_layout() {
+        // a buffer group (40-byte barriers) and a global one (16 bytes)
+        let mut buffer = [0u8; 80];
+        for (i, w) in [0x8u32, 0x8, 0x80, 0x200].iter().enumerate() {
+            buffer[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for (i, w) in [0x8u32, 0x8, 0x10, 0x80].iter().enumerate() {
+            buffer[40 + i * 4..44 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let global = [0x8u32, 0x8, 0x80, 0x80];
+        let mut groups = [0u8; 32];
+        groups[0..4].copy_from_slice(&2u32.to_le_bytes());
+        groups[4..8].copy_from_slice(&1u32.to_le_bytes());
+        groups[8..16].copy_from_slice(&(buffer.as_ptr() as u64).to_le_bytes());
+        groups[20..24].copy_from_slice(&1u32.to_le_bytes());
+        groups[24..32].copy_from_slice(&(global.as_ptr() as u64).to_le_bytes());
+        // SAFETY: both groups point at live barriers.
+        assert_eq!(unsafe { group_wait(2, groups.as_ptr()) }, Wait::ReadOnly);
+        // the buffer group's second barrier writes
+        groups[4..8].copy_from_slice(&2u32.to_le_bytes());
+        // SAFETY: as above.
+        assert_eq!(unsafe { group_wait(2, groups.as_ptr()) }, Wait::Needed);
+        // an unknown type needs the wait
+        groups[4..8].copy_from_slice(&1u32.to_le_bytes());
+        groups[0..4].copy_from_slice(&7u32.to_le_bytes());
+        // SAFETY: as above.
+        assert_eq!(unsafe { group_wait(2, groups.as_ptr()) }, Wait::Needed);
+    }
+
+    #[test]
+    fn buffer_barriers_from_reads_to_reads_need_no_wait() {
+        let t = |before: u32, after: u32| Barrier {
+            kind: 0,
+            flags: 0,
+            first: std::ptr::null(),
+            second: 0xffff_ffff | (u64::from(before) << 32),
+            last: u64::from(after),
+        };
+        assert!(buffer_barriers_read_only([&t(0x80 | 0x40, 0x200)]));
+        assert!(!buffer_barriers_read_only([&t(0x8, 0x80)]));
+        assert!(!buffer_barriers_read_only([&t(0x80, 0x400)]));
+        assert!(!buffer_barriers_read_only([&t(0, 0x80)]));
+        let uav = Barrier { kind: 2, ..t(0, 0) };
+        assert!(!buffer_barriers_read_only([&uav]));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

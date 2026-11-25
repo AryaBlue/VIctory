@@ -190,6 +190,21 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
 }
 
+/// `VICTORY_WINDOW_KEEP=1`: a direct draw or mesh dispatch whose shaders store
+/// to no buffer leaves the window of clamped records open (it cannot change
+/// the arguments, and it does not use the scratch buffer); before, every
+/// direct draw ended it and the next indirect draw was clamped alone.
+fn keep_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// Whether a direct draw ends the window: always without the switch, else
+/// when its shaders may store (or its pipeline is not known).
+fn draw_ends_window(keep: bool, stores: Option<bool>) -> bool {
+    !keep || stores.is_none_or(|s| s)
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -1163,6 +1178,8 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Binds, 1);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1179,6 +1196,8 @@ impl State {
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HeapSets, 1);
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -1201,6 +1220,8 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RootSigSets, 1);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1208,6 +1229,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PsoSets, 1);
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
@@ -2289,6 +2312,18 @@ impl State {
         });
     }
 
+    /// A direct draw is about to be recorded: ends the window of clamped
+    /// records unless [`keep_windows`] lets it stay.
+    fn end_window_for_draw(&mut self) {
+        let stores = || {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .map(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        };
+        if draw_ends_window(keep_windows(), if keep_windows() { stores() } else { None }) {
+            self.window = None;
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2602,7 +2637,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.end_window_for_draw();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2993,7 +3028,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window_for_draw();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3098,7 +3133,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window_for_draw();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3250,6 +3285,8 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         let (bounded, at) = match hit {
             Some((scratch, at, step)) => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WindowHits, 1);
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3339,6 +3376,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Executes, 1);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3722,5 +3761,18 @@ mod range_cache_tests {
         // the copy let go: only the cache holds it
         drop(listed);
         assert!(super::cached_range(&cache, 7, 5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    #[test]
+    fn a_draw_that_stores_nothing_keeps_the_window_only_when_asked() {
+        // without the switch every direct draw ends it, as before
+        assert!(super::draw_ends_window(false, Some(false)));
+        assert!(!super::draw_ends_window(true, Some(false)));
+        assert!(super::draw_ends_window(true, Some(true)));
+        // a pipeline not known: it may store
+        assert!(super::draw_ends_window(true, None));
     }
 }

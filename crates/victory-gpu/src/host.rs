@@ -6123,6 +6123,10 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                #[cfg(feature = "diagnostics")]
+                if before != wanted {
+                    crate::copystat::add(crate::copystat::C::Transitions, 1);
+                }
                 (before != wanted).then_some((texture, before))
             }
         }

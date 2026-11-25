@@ -133,8 +133,25 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Barrier groups and buffer barriers by what they ask: no write on
+    /// either side (read to read), nothing before them (sync none); and
+    /// the waits left out for them under `VICTORY_NARROW_WAITS`.
+    GroupsReadOnly,
+    GroupsNothingBefore,
+    BufferWaitsReadOnly,
+    WaitsNarrowed,
+    /// Host calls per frame around the title's draws: pipelines, root
+    /// signatures and view heaps set, texture state moves, indirect
+    /// executions and those served from a clamped window, binds.
+    PsoSets,
+    RootSigSets,
+    HeapSets,
+    Transitions,
+    Executes,
+    WindowHits,
+    Binds,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1295,6 +1312,23 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  of those waits, per frame: {:.0} groups read to read, {:.0} groups with nothing before them,          {:.0} buffer barriers read to read; {:.0} left out (VICTORY_NARROW_WAITS)",
+        c[C::GroupsReadOnly as usize],
+        c[C::GroupsNothingBefore as usize],
+        c[C::BufferWaitsReadOnly as usize],
+        c[C::WaitsNarrowed as usize],
+    );
+    tracing::info!(
+        "  host calls per frame: {:.0} binds, {:.0} pipelines set, {:.0} root signatures, {:.0} view heaps,          {:.0} texture state moves, {:.0} indirect executions ({:.0} from a clamped window)",
+        c[C::Binds as usize],
+        c[C::PsoSets as usize],
+        c[C::RootSigSets as usize],
+        c[C::HeapSets as usize],
+        c[C::Transitions as usize],
+        c[C::Executes as usize],
+        c[C::WindowHits as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
