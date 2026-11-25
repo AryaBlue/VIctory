@@ -397,6 +397,15 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether physical pages come from a section committed whole
+/// (`VICTORY_INPLACE_POOL=1`; off by default): it costs commit charge for
+/// the whole pool at once (the title asks for 6.1 GiB), but the GPU side
+/// can then read and write the pool in place (`VICTORY_INPLACE=3`).
+fn pool_committed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_POOL").is_some_and(|v| v == "1"))
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -415,20 +424,30 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
     // SAFETY: plain section creation.
-    let handle = unsafe {
+    let make = |kind| unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | kind,
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
         )
     };
+    // Under Wine a committed section is a sparse file, free until
+    // touched, and committing a reserved one page by page costs a
+    // wineserver request each that scans every range committed so far:
+    // commit it whole there. With VICTORY_INPLACE_POOL=1 too, so the GPU
+    // side can open the pool as one host heap; reserved as before if the
+    // host cannot commit it (error 1450).
+    let wanted = on_wine() || pool_committed();
+    let mut committed = wanted;
+    let mut handle = make(if wanted { SEC_COMMIT } else { SEC_RESERVE });
+    if handle.is_null() && wanted && !on_wine() {
+        tracing::warn!(n, error = %std::io::Error::last_os_error(), "the page pool could not be committed whole: reserved instead (VICTORY_INPLACE_POOL)");
+        committed = false;
+        handle = make(SEC_RESERVE);
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -443,7 +462,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;

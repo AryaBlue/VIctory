@@ -67,7 +67,13 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: also view memory that is
+/// one run of a committed section (the page pool with
+/// `VICTORY_INPLACE_POOL=1`): the section is opened once as a host heap
+/// and each buffer is placed at its offset there ([`place_in_section`]);
+/// and with late wait the ranges shaders write in place are declared like
+/// a copy's, so later submissions wait for them, with nothing copied back
+/// ([`declares`]).
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
@@ -131,6 +137,51 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// One host heap per committed section, opened on first use and kept
+/// while the section lives (its views may come and go: the heap is the
+/// section, not a view).
+struct SectionHeap(usize, ID3D12Heap);
+// SAFETY: D3D12 heaps are free-threaded.
+unsafe impl Send for SectionHeap {}
+
+static SECTION_HEAPS: Mutex<Vec<SectionHeap>> = Mutex::new(Vec::new());
+
+fn section_committed(section: usize) -> bool {
+    views().sections.iter().any(|&(s, _, committed)| s == section && committed)
+}
+
+fn section_heap(device: &ID3D12Device, section: usize) -> windows::core::Result<ID3D12Heap> {
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = heaps.iter().find(|h| h.0 == section) {
+        return Ok(h.1.clone());
+    }
+    let heap = open(device, From::Section(section))?;
+    tracing::info!(section = format_args!("{section:#x}"), "a section of title pages opened as a host heap (VICTORY_INPLACE=3)");
+    heaps.push(SectionHeap(section, heap.clone()));
+    Ok(heap)
+}
+
+/// Title bytes `[offset, offset + len)` of a committed `section`, shown
+/// at title address `start`: a buffer placed over the 64 KiB pages that
+/// hold them in the section's heap.
+pub(crate) fn place_in_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -> windows::core::Result<Placed> {
+    let at = offset & !(K64 as u64 - 1);
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let heap = section_heap(device, section)?;
+    let buffer = place(device, &heap, at, bytes)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+    Ok(Placed { buffer, heap, gpu, bias: offset - at })
+}
+
+/// With late wait and stage 3: what shaders write in place is declared as
+/// a copy's writes are (the flights' written ranges), with no snapshot and
+/// nothing copied back, so a later submission that copies the same bytes
+/// waits for the flight instead of reading them half written.
+pub(crate) fn declares() -> bool {
+    level() >= 3 && crate::host::late()
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -139,16 +190,25 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    let run = match cover(start as usize, len as usize) {
+        Cover::None => None,
+        Cover::Run(section, offset) if level() >= 3 && section_committed(section) => Some((section, offset)),
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    // a section heap locks nothing, so only private parts count against the most
+    if run.is_none() && STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match run {
+        Some((section, offset)) => place_in_section(&host.device, section, offset, len).map_err(Some),
+        None => place_part(&host.device, start, len),
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);

@@ -2347,7 +2347,7 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        if self.place.is_some() && !crate::inplace::declares() {
             return;
         }
         let len = len.min(self.left(address));
@@ -3142,6 +3142,11 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Title memory itself ([`Shadow::placed`]): nothing to copy back.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
