@@ -2613,7 +2613,8 @@ fn made_stripes() -> bool {
 static MADE_FAST: crate::switch::Switch = crate::switch::Switch::new("MADE_FAST");
 
 fn made_fast() -> bool {
-    MADE_FAST.on()
+    // on in the tests, as the published keys are kept there
+    cfg!(test) || MADE_FAST.on()
 }
 
 /// Whether the pass over records copied in as bytes also mirrors slots
