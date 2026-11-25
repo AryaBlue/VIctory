@@ -99,6 +99,9 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With `crate::card_mask`: changed dwords (offset, byte mask) to put
+    /// into the card's side by the masked pass, beside `dirty`.
+    masked: Mutex<Vec<(u32, u32)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -367,7 +370,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>, Vec<(u32, u32)>)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -375,22 +378,24 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = shadow
+        let (ranges, masked) = shadow
             .card
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = std::mem::take(&mut *dirty);
+                let masked = std::mem::take(&mut *c.masked.lock().unwrap_or_else(|e| e.into_inner()));
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                    sent.extend(crate::card_mask::byte_runs(&masked).into_iter().map(|(a, b)| (a, b, sent_as)));
                 }
-                ranges
+                (ranges, masked)
             })
             .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+        if !ranges.is_empty() || !masked.is_empty() {
+            out.push((shadow, joined(ranges), masked));
         }
         true
     });
@@ -1790,7 +1795,7 @@ fn merge_gap() -> usize {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2878,6 +2883,11 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    if crate::card_mask::on() && self.card_masked(at, title, held) {
+                        drop(before);
+                        self.took_page(page, base, start, end, a, e, now);
+                        continue;
+                    }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
                         return true;
@@ -2908,18 +2918,48 @@ impl Shadow {
                     }
                 }
                 drop(before);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
-                }
+                self.took_page(page, base, start, end, a, e, now);
             }
         }
         false
+    }
+
+    /// Taken, if the range holds all of the page that is in the copy; else
+    /// the rest of it is the refresh's, which notes only whole pages, and
+    /// the page is looked at again.
+    #[allow(clippy::too_many_arguments)]
+    fn took_page(&self, page: usize, base: usize, start: usize, end: usize, a: usize, e: usize, now: u64) {
+        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = copied.get_mut(page - base) {
+                *at = now;
+            }
+        }
+    }
+
+    /// `crate::card_mask`: the title's changed bytes of the slice at copy
+    /// offset `at` into the CPU's side and, as masked dwords, onto the list
+    /// for the card's side. Whether it took them (not past the cap).
+    fn card_masked(&self, at: usize, title: &[u8], held: &mut [u8]) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        if crate::host::host().and_then(|h| crate::card_mask::program(&h.device)).is_none() {
+            return false;
+        }
+        let runs = changed_runs(title, held);
+        let entries = crate::card_mask::dword_masks(at, &runs);
+        let mut masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+        if masked.len() + entries.len() > crate::card_mask::MOST {
+            return false;
+        }
+        for (r, m) in runs {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+            MERGED[1].fetch_add(1, Ordering::Relaxed);
+            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+        }
+        masked.extend(entries);
+        true
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -3300,9 +3340,12 @@ impl Shadow {
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            // title bytes the masked pass still has to put up are the title's too
+            let masked = crate::card_mask::byte_runs(&card.masked.lock().unwrap_or_else(|e| e.into_inner()));
             dirty
                 .iter()
                 .copied()
+                .chain(masked)
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
@@ -3490,6 +3533,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    masked: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3706,6 +3750,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                masked: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -3985,6 +4030,7 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                masked: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });

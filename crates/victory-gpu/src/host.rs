@@ -1790,6 +1790,8 @@ struct CardPlan {
     /// With [`relay`], the number of this plan's send of changed ranges
     /// (`QUEUE_ORDER`); else 0.
     sent_as: u64,
+    /// Entry tables of `crate::card_mask` passes, alive until the plan is done.
+    _masks: Vec<ID3D12Resource>,
     /// Whether the compare's list fetches the flagged pieces itself
     /// ([`inflight_fetch`]): every compared range has its [`CARD_FETCH`].
     inflight: bool,
@@ -3024,6 +3026,36 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// The masked pass for `masks` (`crate::card_mask`): its program, the GPU
+/// address of a table of the entries (kept in `tables`) and their count.
+fn card_masked_entries(
+    host: &Host,
+    masks: &[(u32, u32)],
+    tables: &mut Vec<ID3D12Resource>,
+) -> Option<(&'static crate::card_mask::Program, u64, u32)> {
+    if masks.is_empty() {
+        return None;
+    }
+    // the bytes are in the CPU's side only: without the pass the card would never get them
+    let Some(program) = crate::card_mask::program(&host.device) else {
+        fail(format_args!("the masked merge's program went missing after merges were taken"));
+    };
+    let Some((table, data)) = host.shared_buffer(masks.len() as u64 * 8) else {
+        fail(format_args!("no table for the masked merge of {} dwords", masks.len()));
+    };
+    for (i, &(word, mask)) in masks.iter().enumerate() {
+        // SAFETY: the mapping holds 8 bytes an entry; nothing of ours reads it yet.
+        unsafe {
+            data.cast::<u32>().add(i * 2).write_unaligned(word);
+            data.cast::<u32>().add(i * 2 + 1).write_unaligned(mask);
+        }
+    }
+    // SAFETY: a live buffer.
+    let gpu = unsafe { table.GetGPUVirtualAddress() };
+    tables.push(table);
+    Some((program, gpu, masks.len() as u32))
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4007,12 +4039,13 @@ impl Host {
                 Some(before)
             }) {
                 whole.push(shadow.clone());
-                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                if !dirty.iter().any(|(s, _, _)| Arc::ptr_eq(s, shadow)) {
+                    dirty.push((shadow.clone(), Vec::new(), Vec::new()));
                 }
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut mask_tables: Vec<ID3D12Resource> = Vec::new();
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
@@ -4021,8 +4054,8 @@ impl Host {
         if let Some(second) = crate::queue2::second().filter(|s| s.uploads()) {
             let bytes: u64 = dirty
                 .iter()
-                .filter(|(shadow, _)| shadow.carded())
-                .flat_map(|(_, ranges)| ranges.iter().map(|&(a, b)| (b - a) as u64))
+                .filter(|(shadow, _, _)| shadow.carded())
+                .flat_map(|(_, ranges, _)| ranges.iter().map(|&(a, b)| (b - a) as u64))
                 .sum();
             // SAFETY: a plain query.
             let completed = unsafe { self.fence.GetCompletedValue() };
@@ -4037,7 +4070,7 @@ impl Host {
                     (|| -> windows::core::Result<()> {
                         let copy = second.up.list()?;
                         let mut at = 0u64;
-                        for (shadow, ranges) in &dirty {
+                        for (shadow, ranges, _) in &dirty {
                             let Some((staging, _, _)) = shadow.card_sides() else {
                                 continue;
                             };
@@ -4074,10 +4107,12 @@ impl Host {
                     list.Reset(allocator, None)?;
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
-                    for (shadow, ranges) in &dirty {
+                    for (shadow, ranges, masks) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        // the masked pass's entries, alive until the plan is done
+                        let masked = card_masked_entries(self, masks, &mut mask_tables);
                         for &(a, b) in ranges {
                             match &landed {
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
@@ -4087,6 +4122,17 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        if let Some((program, table, count)) = masked {
+                            // promoted to a copy's destination by the copies, else still common
+                            let was = if ranges.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
+                            list.ResourceBarrier(&[transition(&shadow.buffer, was, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                            program.record(list, staging.GetGPUVirtualAddress(), table, shadow.buffer.GetGPUVirtualAddress(), count);
+                            list.ResourceBarrier(&[transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )]);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -4096,7 +4142,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if masked.is_none() && !ranges.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -4111,7 +4157,8 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            let spans = if masked.is_some() { crate::card_mask::spans(masks) } else { Vec::new() };
+                            ranges.iter().chain(spans.iter()).map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -4138,7 +4185,8 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty.into_iter().map(|(shadow, _, _)| shadow).collect(),
+            _masks: mask_tables,
             lists: used,
             sent_as,
             inflight: false,
