@@ -3838,12 +3838,33 @@ fn demote(placed: &Arc<Shadow>) -> bool {
     }
 }
 
-// a step of picking on trial: what went in place, and the frame time before it
+// a step of picking on trial: what went in place, and the cost per frame before it
 struct Trial {
     placed: Vec<std::sync::Weak<Shadow>>,
     ids: Vec<u64>,
     before_ms: f64,
-    at: (u64, u64),
+    at: Meter,
+}
+
+// a reading of the frame-line sums: frames, preparing us, card busy us, textures waiting
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub(crate) struct Meter {
+    frames: u64,
+    prep_us: u64,
+    card_us: u64,
+    waiting: u64,
+}
+
+impl Meter {
+    fn now() -> Meter {
+        let j = &crate::host::JUDGE;
+        Meter {
+            frames: j[0].load(Ordering::Relaxed),
+            prep_us: j[1].load(Ordering::Relaxed),
+            card_us: j[2].load(Ordering::Relaxed),
+            waiting: crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3852,35 +3873,61 @@ struct Picking {
     // never again: refused by the host or taken back after a trial
     refused: std::collections::HashSet<u64>,
     trial: Option<Trial>,
-    // where the frame-time baseline starts (frame, ms)
-    base: Option<(u64, u64)>,
+    // where the baseline starts
+    base: Option<Meter>,
     said: u64,
 }
 
-// average frame time since `at`, if 16 frames have gone by
-fn frame_ms_since(at: (u64, u64), now: (u64, u64)) -> Option<f64> {
-    let frames = now.0.saturating_sub(at.0);
-    (frames >= 16).then(|| now.1.saturating_sub(at.1) as f64 / frames as f64)
+// what judging says of a window from `at` to `now`
+#[derive(Debug, PartialEq)]
+pub(crate) enum Judged {
+    // too few frames yet
+    Wait,
+    // textures streaming: start the window again
+    Streaming,
+    // preparing + card busy, ms per frame
+    Cost(f64),
 }
 
-// whether a trial made frames slower than `tolerance` percent allows
+// prep + card ms per frame since `at`, once `frames` frames went by and the texture backlog is small and steady
+pub(crate) fn judge(at: Meter, now: Meter, frames: u64, backlog: u64) -> Judged {
+    let n = now.frames.saturating_sub(at.frames);
+    if n < frames {
+        return Judged::Wait;
+    }
+    let (lo, hi) = (at.waiting.min(now.waiting), at.waiting.max(now.waiting));
+    if hi > backlog || hi - lo > lo.max(1000) / 2 {
+        return Judged::Streaming;
+    }
+    Judged::Cost((now.prep_us.saturating_sub(at.prep_us) + now.card_us.saturating_sub(at.card_us)) as f64 / 1000.0 / n as f64)
+}
+
+// whether a trial made frames costlier than `tolerance` percent allows
 pub(crate) fn trial_failed(before_ms: f64, after_ms: f64, tolerance: f64) -> bool {
     after_ms > before_ms * (1.0 + tolerance / 100.0)
 }
 
 // once a second with VICTORY_INPLACE_PICK or VICTORY_INPLACE_WRITTEN: copies worth it are swapped for title memory
-// in place a step at a time (VICTORY_INPLACE_PICK_STEP_MB), each step kept only if frames did not get slower
+// in place a step at a time (VICTORY_INPLACE_PICK_STEP_MB), each step kept only if prep + card time did not grow
 pub(crate) fn promote() {
     let (pick, written) = (crate::inplace::pick(), crate::inplace::written_on());
     let (cap, reads, windows, bindless) =
         (crate::inplace::written_most(), crate::inplace::pick_reads(), crate::inplace::pick_windows(), crate::inplace::pick_bindless());
     let now = (crate::frame::current(), crate::host::now_ms());
+    let meter = Meter::now();
+    let (frames, backlog) = (crate::inplace::pick_judge_frames(), crate::inplace::pick_backlog());
     static STATE: Mutex<Option<Picking>> = Mutex::new(None);
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let state = state.get_or_insert_with(Default::default);
-    // a trial running: judged once 16 frames went by
-    if let Some(trial) = &state.trial {
-        let Some(after) = frame_ms_since(trial.at, now) else { return };
+    if let Some(trial) = &mut state.trial {
+        let after = match judge(trial.at, meter, frames, backlog) {
+            Judged::Wait => return,
+            Judged::Streaming => {
+                trial.at = meter;
+                return;
+            }
+            Judged::Cost(ms) => ms,
+        };
         let trial = state.trial.take().expect("a trial");
         if trial_failed(trial.before_ms, after, crate::inplace::pick_tolerance()) {
             let mut back = 0;
@@ -3889,15 +3936,22 @@ pub(crate) fn promote() {
             }
             PROMOTED[3].fetch_add(back, Ordering::Relaxed);
             state.refused.extend(trial.ids);
-            tracing::info!(before_ms = trial.before_ms, after_ms = after, back, "in-place picks taken back: frames got slower");
+            tracing::info!(before_ms = trial.before_ms, after_ms = after, back, "in-place picks taken back: prep + card got slower");
         } else {
             tracing::info!(before_ms = trial.before_ms, after_ms = after, kept = trial.ids.len(), "in-place picks kept");
         }
-        state.base = Some(now);
+        state.base = Some(meter);
         return;
     }
-    let base = *state.base.get_or_insert(now);
-    let Some(before_ms) = frame_ms_since(base, now) else { return };
+    let base = *state.base.get_or_insert(meter);
+    let before_ms = match judge(base, meter, frames, backlog) {
+        Judged::Wait => return,
+        Judged::Streaming => {
+            state.base = Some(meter);
+            return;
+        }
+        Judged::Cost(ms) => ms,
+    };
     let mut copies: Vec<Arc<Shadow>> = if pick {
         buffers().values().filter_map(|e| e.shadow.clone()).collect()
     } else {
@@ -3985,7 +4039,7 @@ pub(crate) fn promote() {
     }
     if !ids.is_empty() {
         tracing::info!(copies = ids.len(), mb = bytes >> 20, before_ms, "in-place picks on trial");
-        state.trial = Some(Trial { placed, ids, before_ms, at: now });
+        state.trial = Some(Trial { placed, ids, before_ms, at: meter });
     }
 }
 
@@ -4564,14 +4618,18 @@ mod promote_tests {
         assert_eq!(Heat { frames: 16, cpu_bytes: 32 << 20, ..Default::default() }.pot(), 2 << 20, "cpu bytes per frame");
     }
 
-    // a trial is judged by the frame time: slower than the tolerance takes the step back
+    // a trial is judged by prep + card ms over 64 frames, not while textures stream; costlier than the tolerance takes it back
     #[test]
-    fn trials_take_back_what_made_frames_slower() {
-        assert!(!trial_failed(200.0, 205.0, 3.0));
-        assert!(trial_failed(200.0, 207.0, 3.0));
-        assert!(!trial_failed(200.0, 150.0, 3.0));
-        assert_eq!(frame_ms_since((10, 1000), (20, 3000)), None, "under 16 frames");
-        assert_eq!(frame_ms_since((10, 1000), (30, 5000)), Some(200.0));
+    fn trials_take_back_what_made_prep_and_card_slower() {
+        assert!(!trial_failed(200.0, 215.0, 10.0));
+        assert!(trial_failed(200.0, 225.0, 10.0));
+        assert!(!trial_failed(200.0, 150.0, 10.0));
+        let m = |frames, prep_us, card_us, waiting| Meter { frames, prep_us, card_us, waiting };
+        let at = m(100, 1_000_000, 2_000_000, 8000);
+        assert_eq!(judge(at, m(150, 2_000_000, 3_000_000, 8000), 64, 20000), Judged::Wait, "under 64 frames");
+        assert_eq!(judge(at, m(200, 11_000_000, 7_000_000, 8500), 64, 20000), Judged::Cost(150.0), "100 ms prep + 50 ms card");
+        assert_eq!(judge(at, m(200, 11_000_000, 7_000_000, 25000), 64, 20000), Judged::Streaming, "backlog over the bound");
+        assert_eq!(judge(at, m(200, 11_000_000, 7_000_000, 13000), 64, 20000), Judged::Streaming, "backlog moving");
     }
 
     // a copy demoted from place leaves the tables so the next ask makes an ordinary copy

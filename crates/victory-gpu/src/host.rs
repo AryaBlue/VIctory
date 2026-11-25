@@ -399,6 +399,9 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 /// newer sent; the next send ends that idle stretch.
 static CARD_CLOCK_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+// since the start, summed at each frame line: frames, preparing us, card busy us (for judging in-place trials)
+pub(crate) static JUDGE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Of the thread that holds the submission lock: the microseconds it has
 /// worked so far (preparing, copying back; not its waits for the card), and
 /// since when it works now ([`now_us`] plus one; 0: it does not).
@@ -476,6 +479,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    JUDGE[2].fetch_add((((ms - idle).max(0.0)) * frames * 1000.0) as u64, Ordering::Relaxed);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -7633,6 +7637,8 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        JUDGE[1].fetch_add((cpu * frames * 1000.0) as u64, Ordering::Relaxed);
+        JUDGE[0].fetch_add(frames as u64, Ordering::Relaxed);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames

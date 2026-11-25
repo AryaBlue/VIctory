@@ -335,10 +335,23 @@ pub(crate) fn pick_step() -> u64 {
     *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_STEP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20)
 }
 
-// percent the frame may get slower before a step is taken back, VICTORY_INPLACE_PICK_TOLERANCE (3)
+// percent prep + card ms may grow before a step is taken back, VICTORY_INPLACE_PICK_TOLERANCE (10; frames swing 20% run to run)
 pub(crate) fn pick_tolerance() -> f64 {
     static N: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_TOLERANCE").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(3.0))
+    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_TOLERANCE").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(10.0))
+}
+
+// frames a baseline and a trial are each measured over, VICTORY_INPLACE_PICK_FRAMES (64)
+pub(crate) fn pick_judge_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_FRAMES").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(16))
+}
+
+// textures waiting over which nothing is judged, VICTORY_INPLACE_PICK_BACKLOG (20000; fast-8 sat at 9-12k);
+// a backlog moving by over a half restarts the window too
+pub(crate) fn pick_backlog() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_INPLACE_PICK_BACKLOG").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(20000))
 }
 
 // a big buffer goes in place instead of to the card
@@ -1525,7 +1538,7 @@ mod tests {
     #[test]
     fn scatter_says_why() {
         let mut v = Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() };
-        let mut view = |v: &mut Views, at: usize, len: usize, section: usize, offset: u64| {
+        let view = |v: &mut Views, at: usize, len: usize, section: usize, offset: u64| {
             v.views.insert(at, (len, section, offset));
             for k in 0..len / K64 {
                 v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
