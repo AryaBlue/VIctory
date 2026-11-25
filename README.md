@@ -103,6 +103,10 @@ What did it, on top of the list below:
   - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
     the title remaps memory; the loading phase had 5 readings over a
     second where it had 18.
+  - On agent/fast the first four above (and the wide back copies and
+    card buffers from 1 MiB, 1,024 MB in all) are the defaults; each
+    turns off with `=0`. The in-flight fetch and the merge switches
+    stay off.
   - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
     under flights' shader writes are joined over small gaps (NOT exact:
     read the comment at `merge_gap` before using it).
