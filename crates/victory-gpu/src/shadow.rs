@@ -3883,23 +3883,28 @@ struct Picking {
 pub(crate) enum Judged {
     // too few frames yet
     Wait,
-    // textures streaming: start the window again
+    // textures streaming: a baseline starts again, a trial is taken back unjudged
     Streaming,
     // preparing + card busy, ms per frame
     Cost(f64),
 }
 
-// prep + card ms per frame since `at`, once `frames` frames went by and the texture backlog is small and steady
+// prep + card ms per frame since `at`, once `frames` frames went by; streaming as soon as the texture backlog is big or moving
 pub(crate) fn judge(at: Meter, now: Meter, frames: u64, backlog: u64) -> Judged {
-    let n = now.frames.saturating_sub(at.frames);
-    if n < frames {
-        return Judged::Wait;
-    }
     let (lo, hi) = (at.waiting.min(now.waiting), at.waiting.max(now.waiting));
     if hi > backlog || hi - lo > lo.max(1000) / 2 {
         return Judged::Streaming;
     }
+    let n = now.frames.saturating_sub(at.frames);
+    if n < frames {
+        return Judged::Wait;
+    }
     Judged::Cost((now.prep_us.saturating_sub(at.prep_us) + now.card_us.saturating_sub(at.card_us)) as f64 / 1000.0 / n as f64)
+}
+
+// a trial's copies out of place again; how many went
+fn take_back(trial: &Trial) -> u64 {
+    trial.placed.iter().filter_map(std::sync::Weak::upgrade).map(|placed| u64::from(demote(&placed))).sum()
 }
 
 // whether a trial made frames costlier than `tolerance` percent allows
@@ -3923,17 +3928,19 @@ pub(crate) fn promote() {
         let after = match judge(trial.at, meter, frames, backlog) {
             Judged::Wait => return,
             Judged::Streaming => {
-                trial.at = meter;
+                // fast-6 halved fps: nothing stays in place unjudged; it may be picked again later
+                let trial = state.trial.take().expect("a trial");
+                let back = take_back(&trial);
+                PROMOTED[3].fetch_add(back, Ordering::Relaxed);
+                tracing::info!(back, "in-place picks taken back unjudged: textures streaming");
+                state.base = Some(meter);
                 return;
             }
             Judged::Cost(ms) => ms,
         };
         let trial = state.trial.take().expect("a trial");
         if trial_failed(trial.before_ms, after, crate::inplace::pick_tolerance()) {
-            let mut back = 0;
-            for placed in trial.placed.iter().filter_map(std::sync::Weak::upgrade) {
-                back += u64::from(demote(&placed));
-            }
+            let back = take_back(&trial);
             PROMOTED[3].fetch_add(back, Ordering::Relaxed);
             state.refused.extend(trial.ids);
             tracing::info!(before_ms = trial.before_ms, after_ms = after, back, "in-place picks taken back: prep + card got slower");
@@ -4630,6 +4637,40 @@ mod promote_tests {
         assert_eq!(judge(at, m(200, 11_000_000, 7_000_000, 8500), 64, 20000), Judged::Cost(150.0), "100 ms prep + 50 ms card");
         assert_eq!(judge(at, m(200, 11_000_000, 7_000_000, 25000), 64, 20000), Judged::Streaming, "backlog over the bound");
         assert_eq!(judge(at, m(200, 11_000_000, 7_000_000, 13000), 64, 20000), Judged::Streaming, "backlog moving");
+        assert_eq!(judge(at, m(110, 1_100_000, 2_100_000, 25000), 64, 20000), Judged::Streaming, "streaming is seen before 64 frames");
+    }
+
+    // a trial taken back unjudged puts every copy it placed out of place again
+    #[test]
+    fn a_trial_taken_back_leaves_nothing_in_place() {
+        let Some(device) = warp() else { return };
+        // SAFETY: the test's own allocation, released at the end
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 4 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            let mut held = Vec::new();
+            let mut trial = Trial { placed: Vec::new(), ids: Vec::new(), before_ms: 100.0, at: Meter::default() };
+            for k in 0..2u64 {
+                let (start, len) = (base as u64 + k * (2 << 16), 1 << 16);
+                let resource = (base as usize ^ 0x7c7c) + k as usize;
+                register(resource, start, len);
+                let placed = crate::inplace::place_part(&device, start, len).expect("placed");
+                let shadow = Arc::new(Shadow::placed(placed, start, len, false));
+                buffers().get_mut(&(start, resource)).unwrap().shadow = Some(shadow.clone());
+                trial.placed.push(Arc::downgrade(&shadow));
+                held.push((shadow, resource, start));
+            }
+            assert_eq!(take_back(&trial), 2);
+            for (shadow, resource, start) in &held {
+                assert!(shadow.superseded());
+                assert!(buffers().get(&(*start, *resource)).is_some_and(|e| e.shadow.is_none()));
+            }
+            assert_eq!(take_back(&trial), 0, "nothing left to take back");
+            for (_, resource, start) in &held {
+                unregister(*resource, *start);
+            }
+            drop(held);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 
     // a copy demoted from place leaves the tables so the next ask makes an ordinary copy
