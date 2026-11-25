@@ -6731,6 +6731,21 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
+// flush spreads its refreshes over the wide threads, biggest first, from two copies (VICTORY_FLUSH_WIDE=1)
+fn flush_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FLUSH_WIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("a flush's refreshes run on the wide threads (VICTORY_FLUSH_WIDE=1)");
+        }
+        on
+    })
+}
+
+// below this many bytes of ranges a flush stays on its own thread: waking the pool costs more
+const FLUSH_WIDE_BYTES: usize = 1 << 20;
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -6821,10 +6836,20 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        let wide = if flush_wide() {
+            self.refreshes.len() >= 2
+                && self.refreshes.iter().map(|r| r.2 - r.1).sum::<usize>() >= FLUSH_WIDE_BYTES
+        } else {
+            wide_refresh() && self.refreshes.len() >= 4
+        };
+        if wide {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
+            if flush_wide() {
+                // biggest first so one long copy does not trail at the end
+                self.refreshes.sort_unstable_by_key(|r| std::cmp::Reverse(r.2 - r.1));
+            }
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
