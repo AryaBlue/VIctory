@@ -3095,7 +3095,7 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList], done: &dyn Fn(&std::sync::Arc<crate::shadow::Shadow>, usize, usize) -> bool) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3104,6 +3104,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
+                && !done(shadow, *address, *len)
             {
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
                     Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
@@ -5594,13 +5595,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();

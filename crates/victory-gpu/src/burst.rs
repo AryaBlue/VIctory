@@ -75,6 +75,18 @@ fn window(grouped: &AtomicU64, seq: u64) -> (u64, u64) {
     (grouped.fetch_max(seq, SeqCst), seq)
 }
 
+// a range an earlier submission of the burst brought up to date is not looked at under the flights again (VICTORY_BURST_MERGE=1)
+pub(crate) fn merge_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_BURST_MERGE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("title bytes under flights' writes are looked for once a burst for each range (VICTORY_BURST_MERGE=1, with burst refresh)");
+        }
+        on
+    })
+}
+
 // the old check runs as well and says what a skip would have missed (VICTORY_BURST_REFRESH_CHECK=1)
 pub(crate) fn check() -> bool {
     on() && check_asked()
