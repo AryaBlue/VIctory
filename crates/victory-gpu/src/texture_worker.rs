@@ -3,7 +3,7 @@
 //! the copy once that is done.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -46,21 +46,48 @@ impl Pending {
     }
 }
 
+/// Hands waiting for the worker, and whether it takes the newest first.
+struct Jobs<T> {
+    queue: std::collections::VecDeque<(usize, T)>,
+    newest: bool,
+}
+
+impl<T> Jobs<T> {
+    fn next(&mut self) -> Option<(usize, T)> {
+        if self.newest { self.queue.pop_back() } else { self.queue.pop_front() }
+    }
+}
+
 /// A worker thread that runs `prepare` on what it is handed, one at a time.
 pub(crate) struct Worker<T: Send + 'static> {
     pending: std::sync::Arc<Mutex<Pending>>,
-    send: Mutex<mpsc::Sender<(usize, T)>>,
+    jobs: std::sync::Arc<(Mutex<Jobs<T>>, std::sync::Condvar)>,
 }
 
 impl<T: Send + 'static> Worker<T> {
-    pub(crate) fn new(most: usize, prepare: impl Fn(usize, T) + Send + 'static) -> Self {
+    /// `newest`: the last hand first (the pass hands the slots of the newest writes first each
+    /// frame, so a backlog of old hands no longer holds up what this frame shows).
+    pub(crate) fn new(most: usize, newest: bool, prepare: impl Fn(usize, T) + Send + 'static) -> Self {
         let pending = std::sync::Arc::new(Mutex::new(Pending::new(most)));
-        let (send, receive) = mpsc::channel::<(usize, T)>();
-        let left = pending.clone();
+        let jobs = std::sync::Arc::new((
+            Mutex::new(Jobs { queue: std::collections::VecDeque::new(), newest }),
+            std::sync::Condvar::new(),
+        ));
+        let (left, mine) = (pending.clone(), jobs.clone());
         std::thread::Builder::new()
             .name("victory texture worker".into())
             .spawn(move || {
-                for (key, job) in receive {
+                loop {
+                    let (key, job) = {
+                        let (lock, ready) = &*mine;
+                        let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(next) = jobs.next() {
+                                break next;
+                            }
+                            jobs = ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
                     let started = std::time::Instant::now();
                     prepare(key, job);
                     STATS[3].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -68,7 +95,7 @@ impl<T: Send + 'static> Worker<T> {
                 }
             })
             .expect("texture worker thread");
-        Worker { pending, send: Mutex::new(send) }
+        Worker { pending, jobs }
     }
 
     /// Hands `key` over unless it is with the worker already or the queue is full; true if handed.
@@ -79,16 +106,21 @@ impl<T: Send + 'static> Worker<T> {
             return false;
         }
         STATS[0].fetch_add(1, Relaxed);
-        if self.send.lock().unwrap_or_else(|e| e.into_inner()).send((key, job())).is_err() {
-            self.pending.lock().unwrap_or_else(|e| e.into_inner()).done(key);
-            return false;
-        }
+        let (lock, ready) = &*self.jobs;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).queue.push_back((key, job()));
+        ready.notify_one();
         true
     }
 
     pub(crate) fn busy(&self, key: usize) -> bool {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).keys.contains(&key)
     }
+}
+
+/// VICTORY_TEXTURE_WORKER_NEWEST=1: the worker takes its newest hand first (off by default).
+fn newest_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_WORKER_NEWEST").is_some_and(|v| v == "1"))
 }
 
 /// A host texture for the worker, and its hand's token (`crate::texture::handed`).
@@ -101,7 +133,7 @@ unsafe impl Send for Job {}
 fn worker() -> &'static Worker<Job> {
     static WORKER: std::sync::OnceLock<Worker<Job>> = std::sync::OnceLock::new();
     WORKER.get_or_init(|| {
-        Worker::new(MOST, |resource, Job(texture, token)| {
+        Worker::new(MOST, newest_first(), |resource, Job(texture, token)| {
             crate::texture::prestage(resource as This, &texture, token);
             STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
@@ -123,7 +155,7 @@ pub(crate) fn ready(resource: This, texture: &ID3D12Resource) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pending, Worker};
+    use super::{Jobs, Pending, Worker};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -146,7 +178,7 @@ mod tests {
         let (tell, told) = mpsc::channel();
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = runs.clone();
-        let w = Worker::new(8, move |key, value: u32| {
+        let w = Worker::new(8, false, move |key, value: u32| {
             counted.fetch_add(1, Ordering::SeqCst);
             let _ = tell.send((key, value, std::thread::current().id()));
         });
@@ -164,5 +196,14 @@ mod tests {
         assert!(w.hand(7, || 71), "not handed again after it was done");
         told.recv_timeout(Duration::from_secs(5)).expect("prepared again");
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_newest_hand_is_taken_first_when_asked() {
+        let mut jobs = Jobs { queue: (1..=3).map(|k| (k, ())).collect(), newest: true };
+        assert_eq!(jobs.next().map(|j| j.0), Some(3));
+        assert_eq!(jobs.next().map(|j| j.0), Some(2));
+        let mut jobs = Jobs { queue: (1..=3).map(|k| (k, ())).collect(), newest: false };
+        assert_eq!(jobs.next().map(|j| j.0), Some(1));
     }
 }

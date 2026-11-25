@@ -671,6 +671,17 @@ fn heap_recheck() -> bool {
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
+
+/// With VICTORY_TEXTURE_KEEP, since the frame line: slots found unmapped that kept their host
+/// view, and slots left as they were while the worker made their texture ready.
+pub(crate) static HEAP_TEXTURES_KEPT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// VICTORY_TEXTURE_KEEP=1: a picked slot keeps showing its last host view until there is
+/// something better (off by default).
+pub(crate) fn keep_shown() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_some_and(|v| v == "1"))
+}
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
@@ -2124,6 +2135,11 @@ impl State {
                 let mapped = pass_timed(7, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    // kept: a remap over its pages reads as unmapped for a moment
+                    if keep_shown() && !host.texture_slot_away(index, write, frame) {
+                        HEAP_TEXTURES_KEPT[0].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, most);
@@ -2191,6 +2207,21 @@ impl State {
                         "a texture already on the card is brought up to date although the card has no room for new ones"
                     );
                 }
+            }
+            // kept: the worker is asked before the slot is made; made first, it showed an empty host
+            // texture until the upload a pass or more later
+            if keep_shown()
+                && crate::texture_worker::on()
+                && let Some(title) = heap.handle(index).and_then(crate::descriptor::view)
+                && let Some(View::Shader(object, _)) =
+                    crate::descriptor::host::placed_texture(&title).or_else(|| Some(title.clone()))
+                && let Some(texture) = crate::resource::host_resource(object as This)
+                && crate::texture::title_written(texture)
+                && !(crate::texture::is_staged(object as This) && !crate::texture::prepared(object as This))
+                && !crate::texture_worker::ready(object as This, texture)
+            {
+                HEAP_TEXTURES_KEPT[1].fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             let view = pass_timed(8, || heap.handle(index).and_then(|handle| host.mirror(index, handle, true)));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
