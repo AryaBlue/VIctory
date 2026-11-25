@@ -535,7 +535,7 @@ fn walk_worker(
     let handed = shared.clone();
     std::thread::Builder::new()
         .name("victory heap walk".into())
-        .spawn(move || crate::heap_walk::run(source, handed, 256, std::time::Duration::from_millis(2)))
+        .spawn(move || crate::heap_walk::run(source, handed, 64, std::time::Duration::from_millis(2)))
         .ok()?;
     workers.insert(key, shared.clone());
     Some(shared)
