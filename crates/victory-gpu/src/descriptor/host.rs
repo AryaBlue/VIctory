@@ -736,6 +736,12 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
+// slots made by a draw or the heap pass queued for the pass again, as before (VICTORY_HEAP_REQUEUE=1)
+fn requeue_made() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_REQUEUE").is_some_and(|v| v == "1"))
+}
+
 fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
@@ -1610,7 +1616,9 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        // a slot a draw or the pass makes is queued by its write already:
+        // queued again, every pass walked it twice
+        if was && (!seen || requeue_made()) {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3356,6 +3364,25 @@ mod tests {
     /// waiting for its first upload is left alone, one uploaded before is
     /// counted, and made due two frames on when that is asked for. (The
     /// ranges are handed over here, not through the list all heaps share.)
+    // a buffer slot is queued for the heap pass by its write, not again
+    // when the pass or a draw makes it
+    #[test]
+    fn a_buffer_slot_made_by_the_pass_is_not_queued_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // a structured buffer view, 16-byte elements
+        let mut desc = [0u32; 16];
+        (desc[1], desc[6], desc[7]) = (1, 4, 16);
+        let view = View::Placed(false, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], desc);
+        let _ = heap.buffer_changes();
+        assert!(heap.note_buffer(2, Some(&view), false).is_empty());
+        assert_eq!(heap.buffer_changes(), [2]);
+        assert!(heap.note_buffer(2, Some(&view), true).is_empty());
+        assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
+        assert_eq!(heap.buffer_slots(), [2]);
+    }
+
     #[test]
     fn a_page_write_makes_an_uploaded_texture_slot_due_when_asked() {
         let Some(heap) = HostHeap::new(false, 8) else {
