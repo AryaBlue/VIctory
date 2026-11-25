@@ -5526,6 +5526,16 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         batch.burst = crate::burst::begin(&mut batch.current);
+        // burst group: this submission's refreshes and those of the submissions waiting, per copy
+        let mut early: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            std::collections::HashMap::new();
+        if let Some((after, up_to)) = batch.burst.as_ref().and_then(|pass| pass.group()) {
+            for list in runs {
+                refreshes_into(list, &mut early);
+            }
+            crate::queue::held_runs(after, up_to, |list| refreshes_into(list, &mut early));
+            early.retain(|_, (shadow, from, to)| !batch.covered(shadow, *from, *to - *from));
+        }
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -5547,6 +5557,12 @@ impl Host {
                     }
                 }
             }
+            for (&key, (shadow, from, to)) in &early {
+                if !shadow.unwatched() {
+                    let span = spans.entry(key).or_insert((*from, *to));
+                    *span = (span.0.min(*from), span.1.max(*to));
+                }
+            }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
@@ -5563,6 +5579,15 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+        }
+        if !early.is_empty() {
+            if let Some(pass) = &batch.burst {
+                pass.grouped(early.len());
+            }
+            for (shadow, from, to) in early.into_values() {
+                batch.add(&shadow, from, to - from);
+            }
+            batch.flush();
         }
         for list in runs {
             list.run_deferred(&mut batch);
@@ -6988,6 +7013,21 @@ impl HostList {
                 preparing(0, if exact { us } else { us * u64::from(STEP_SAMPLE) });
             }
             preparing(1, copied as u64);
+        }
+    }
+}
+
+// burst group: per copy (by address), the span of the refreshes `list` asks for
+fn refreshes_into(
+    list: &HostList,
+    spans: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) {
+    for step in &list.deferred().copies {
+        if let Step::Refresh(shadow, address, len) = step {
+            let span = spans
+                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .or_insert_with(|| (shadow.clone(), *address, *address + *len));
+            (span.1, span.2) = (span.1.min(*address), span.2.max(*address + *len));
         }
     }
 }
