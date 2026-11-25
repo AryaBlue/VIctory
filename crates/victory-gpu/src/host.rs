@@ -7133,6 +7133,43 @@ struct Presenter {
     meter: Meter,
 }
 
+/// Frames presented so far.
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn presents() -> u64 {
+    PRESENTS.load(Ordering::Relaxed)
+}
+
+// the heap-buffer pass in parts, over the whole time since the last line (not the last second)
+fn heap_split_line() {
+    use crate::draw::{HEAP_SPLIT, HeapSplit as H};
+    static LAST: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    let (presents, begun) = (presents(), crate::frame::current());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (p, b) = (presents - last.0, begun - last.1);
+    *last = (presents, begun);
+    drop(last);
+    let v: Vec<u64> = HEAP_SPLIT.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    let passes = crate::draw::HEAP_PASSES_SINCE.swap(0, Ordering::Relaxed);
+    if passes == 0 {
+        return;
+    }
+    let per = |x: u64| x as f64 / passes as f64;
+    tracing::info!(
+        "heap-buffer pass since the last line: {passes} passes over {p} presents and {b} frames begun; per pass: slot walk {:.1} ms          ({:.0} slots, {} full walks in all), spans {:.1} ms ({:.0} copies), unwatched whole refresh {:.1} ms {:.1} MB,          watched refresh {:.1} ms {:.1} MB, textures {:.1} ms",
+        per(v[H::WalkUs as usize]) / 1e3,
+        per(v[H::Slots as usize]),
+        v[H::FullWalks as usize],
+        per(v[H::SpanUs as usize]) / 1e3,
+        per(v[H::Copies as usize]),
+        per(v[H::WholeUs as usize]) / 1e3,
+        per(v[H::WholeBytes as usize]) / 1048576.0,
+        per(v[H::RefreshUs as usize]) / 1e3,
+        per(v[H::RefreshBytes as usize]) / 1048576.0,
+        per(v[H::TexturesUs as usize]) / 1e3,
+    );
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -7162,6 +7199,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        PRESENTS.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -7273,6 +7311,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            heap_split_line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

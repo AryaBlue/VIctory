@@ -369,6 +369,33 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Passes since the last split line.
+pub(crate) static HEAP_PASSES_SINCE: AtomicU64 = AtomicU64::new(0);
+/// The pass in parts ([`HeapSplit`]): microseconds and counts, summed.
+pub(crate) static HEAP_SPLIT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Indexes into [`HEAP_SPLIT`].
+pub(crate) enum HeapSplit {
+    WalkUs,
+    Slots,
+    FullWalks,
+    SpanUs,
+    WholeUs,
+    WholeBytes,
+    RefreshUs,
+    RefreshBytes,
+    TexturesUs,
+    Copies,
+}
+
+fn split(at: HeapSplit, n: u64) {
+    HEAP_SPLIT[at as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+// heap pass once per presented frame instead of per frame begun (VICTORY_HEAP_PER_PRESENT=1)
+fn heap_per_present() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_PER_PRESENT").is_ok_and(|v| v == "1"))
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1391,7 +1418,8 @@ impl State {
         // of one frame is seen a frame late.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let gate = if heap_per_present() { crate::host::presents() } else { frame };
+        if FRAME.swap(gate, Ordering::Relaxed) == gate {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1412,10 +1440,12 @@ impl State {
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
+            split(HeapSplit::FullWalks, 1);
             host.buffer_slots()
         } else {
             changed
         };
+        split(HeapSplit::Slots, slots.len() as u64);
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1457,6 +1487,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        split(HeapSplit::WalkUs, started.elapsed().as_micros() as u64);
+        let spanning = std::time::Instant::now();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1468,6 +1500,8 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        split(HeapSplit::Copies, spans.len() as u64);
+        split(HeapSplit::SpanUs, spanning.elapsed().as_micros() as u64);
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1497,13 +1531,23 @@ impl State {
                         whole.insert(key, frame);
                     }
                 }
+                let t = std::time::Instant::now();
+                shadow.refresh(list, *from, to - from);
+                split(HeapSplit::WholeUs, t.elapsed().as_micros() as u64);
+                split(HeapSplit::WholeBytes, to - from);
+                continue;
             }
+            let t = std::time::Instant::now();
             shadow.refresh(list, *from, to - from);
+            split(HeapSplit::RefreshUs, t.elapsed().as_micros() as u64);
+            split(HeapSplit::RefreshBytes, to - from);
         }
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        split(HeapSplit::TexturesUs, textures_began.elapsed().as_micros() as u64);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+        HEAP_PASSES_SINCE.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
