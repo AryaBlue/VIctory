@@ -171,7 +171,42 @@ fn pass_table(names: &[String], sums: &[[u64; 7]], frames: u64, most: usize) -> 
             names[i]
         ));
     }
+    let mut rest: std::collections::BTreeMap<&str, [u64; 8]> = std::collections::BTreeMap::new();
+    for &i in order.iter().skip(most) {
+        let r = rest.entry(pass_kind(&names[i])).or_default();
+        for (a, b) in r.iter_mut().zip(sums[i]) {
+            *a += b;
+        }
+        r[7] += 1;
+    }
+    for (kind, r) in rest {
+        lines.push(format!(
+            "  {:7.2} ms {:6.1} spans {:7.1} draws {:6.1} dispatches {:6.1} clamps {:6.1} batched {:6.1} read  other {} ({} passes)",
+            r[0] as f64 / 1e3 / frames,
+            r[1] as f64 / frames,
+            r[2] as f64 / frames,
+            r[3] as f64 / frames,
+            r[4] as f64 / frames,
+            r[5] as f64 / frames,
+            r[6] as f64 / frames,
+            kind,
+            r[7]
+        ));
+    }
     lines
+}
+
+/// What a pass past the table's cap is summed under.
+fn pass_kind(name: &str) -> &'static str {
+    if name.starts_with("dispatches") {
+        "compute"
+    } else if name.starts_with("draws []") {
+        "depth-only draws"
+    } else if name.starts_with("draws") {
+        "draws to targets"
+    } else {
+        "unkeyed"
+    }
 }
 
 fn make() -> Option<Meter> {
@@ -341,6 +376,13 @@ mod tests {
         assert!(lines[0].contains("40.0 ms in all"), "{}", lines[0]);
         assert!(lines[1].ends_with("gbuffer") && lines[1].contains("30.00 ms"), "{}", lines[1]);
         assert!(lines[2].ends_with("shadow") && lines[2].contains("25.0 clamps") && lines[2].contains("15.0 batched") && lines[2].contains("6.0 read"), "{}", lines[2]);
+        // passes past the cap are summed by kind
+        let names = ["a".to_owned(), "dispatches | x".to_owned(), "dispatches | y".to_owned(), "draws [] depth 8x8 f53 | z".to_owned()];
+        let sums = [[9_000, 1, 1, 0, 0, 0, 0], [2_000, 1, 0, 1, 1, 0, 0], [4_000, 1, 0, 3, 0, 0, 0], [1_000, 1, 5, 0, 2, 4, 3]];
+        let lines = pass_table(&names, &sums, 1, 1);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[2].ends_with("other compute (2 passes)") && lines[2].contains("6.00 ms") && lines[2].contains("4.0 dispatches"), "{}", lines[2]);
+        assert!(lines[3].ends_with("other depth-only draws (1 passes)") && lines[3].contains("4.0 batched") && lines[3].contains("3.0 read"), "{}", lines[3]);
         // the same key twice is one pass
         assert_eq!(pass_key("a test pass".to_owned()), pass_key("a test pass".to_owned()));
     }
