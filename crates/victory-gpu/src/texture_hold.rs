@@ -93,17 +93,19 @@ pub(crate) fn least_used(mut held: Vec<(u64, u64, usize)>, over: u64) -> Vec<usi
 /// Since the line: idle copies held (each sweep that kept one), let go as least used, let go past
 /// the hard line or because the title no longer holds them; made again with their memory as it was at the let-go (count,
 /// bytes), made again with it changed (count, bytes); textures handed over as their bytes landed,
-/// landings that found a texture with a copy.
-pub(crate) static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// landings that found a texture with a copy; idle copies swept under the hard line because the
+/// texture is not placed, was placed over, or its first page was unmapped; made again unchanged
+/// but unmapped at the let-go (zeros both times, not counted as unchanged).
+pub(crate) static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// What the memory looked like when a copy was let go, by texture.
 #[cfg(feature = "diagnostics")]
-static PRINTS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+static PRINTS: Mutex<Option<HashMap<usize, (u64, bool)>>> = Mutex::new(None);
 
 /// A copy of texture `key` is let go: its memory's fingerprint is noted.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn let_go(key: usize, at: u64, len: u64) {
-    let print = crate::texture::fingerprint(at, len);
+    let print = (crate::texture::fingerprint(at, len), crate::texture::committed(at as *const u8, 1));
     let mut prints = PRINTS.lock().unwrap_or_else(|e| e.into_inner());
     let prints = prints.get_or_insert_with(HashMap::new);
     if prints.len() >= 1 << 18 {
@@ -118,7 +120,11 @@ pub(crate) fn made_again(key: usize, at: u64, len: u64, bytes: u64) {
     let Some(was) = PRINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|p| p.remove(&key)) else {
         return;
     };
-    let same = crate::texture::fingerprint(at, len) == was;
+    let same = crate::texture::fingerprint(at, len) == was.0;
+    if same && !was.1 {
+        STATS[12].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let i = if same { 3 } else { 5 };
     STATS[i].fetch_add(1, Ordering::Relaxed);
     STATS[i + 1].fetch_add(bytes, Ordering::Relaxed);
@@ -139,6 +145,54 @@ pub(crate) fn landed(at: u64, len: u64) {
             STATS[7].fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Whether the card's room rule counts the render targets as made once they stop growing
+/// (`VICTORY_ROOM_SETTLED=1`): the room kept for targets and buffer copies not made yet is then
+/// a margin, not the 3 GB and 1 GB of the world's first frame.
+pub(crate) fn room_settled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOM_SETTLED").is_some_and(|v| v == "1"))
+}
+
+/// Kept for targets once settled.
+const SETTLED_MARGIN: u64 = 512 << 20;
+
+/// Targets that grew less than this in [`SETTLE_MS`] have settled.
+const SETTLE_GROWTH: u64 = 64 << 20;
+const SETTLE_MS: u64 = 20_000;
+
+/// The room kept: as before, or with the switch and settled targets only the margin.
+pub(crate) fn room_kept(settled: bool, buffers: u64, targets: u64) -> u64 {
+    if settled { SETTLED_MARGIN } else { buffers + targets }
+}
+
+/// Whether the render targets (`targets` bytes now) have settled, with the switch on.
+pub(crate) fn settled(targets: u64) -> bool {
+    static SEEN: std::sync::Mutex<(u64, Option<std::time::Instant>)> = std::sync::Mutex::new((0, None));
+    if !room_settled() {
+        return false;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    match seen.1 {
+        Some(since) if targets < seen.0 + SETTLE_GROWTH => now.duration_since(since).as_millis() as u64 >= SETTLE_MS,
+        _ => {
+            *seen = (targets, Some(now));
+            false
+        }
+    }
+}
+
+/// The terms of the last refusal of room: the card's use, room kept for buffer copies, for
+/// targets, the line, and what was kept in the end; and refusals since the line.
+pub(crate) static ROOM: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn refused(terms: [u64; 5]) {
+    for (i, t) in terms.into_iter().enumerate() {
+        ROOM[i].store(t, Ordering::Relaxed);
+    }
+    ROOM[5].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Whether `[a, a + n)` and `[b, b + m)` share a byte.
@@ -178,6 +232,12 @@ mod tests {
         assert_eq!(least_used(held.clone(), 150), [1, 2]);
         assert_eq!(least_used(held.clone(), 0), Vec::<usize>::new());
         assert_eq!(least_used(held, 1000), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn settled_targets_keep_only_a_margin() {
+        assert_eq!(super::room_kept(false, 362 << 20, 1803 << 20), 2165 << 20, "as before");
+        assert_eq!(super::room_kept(true, 362 << 20, 1803 << 20), 512 << 20);
     }
 
     #[test]

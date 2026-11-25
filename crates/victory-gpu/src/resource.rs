@@ -1441,7 +1441,15 @@ pub(crate) fn room() -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+            let settled = crate::texture_hold::settled(targets);
+            let kept = crate::texture_hold::room_kept(settled, crate::shadow::card_room_kept(), targets_room_kept());
+            let line = budget / 100 * room_percent();
+            let fits = used + kept < line;
+            if !fits {
+                crate::texture_hold::refused([used, crate::shadow::card_room_kept(), targets_room_kept(), line, kept]);
+            }
+            fits
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1837,6 +1845,17 @@ pub(crate) fn let_go_idle() {
                     trimmable.push((r.host.used.load(Relaxed), size, at));
                 }
                 continue;
+            }
+            // why the title no longer holds it: not placed, placed over, or its first page unmapped
+            let why = if !placed {
+                9
+            } else if r.host.replaced.load(Relaxed) {
+                10
+            } else {
+                11
+            };
+            if level != crate::texture_hold::Level::Sweep {
+                crate::texture_hold::STATS[why].fetch_add(1, Relaxed);
             }
             drop(made);
         }
