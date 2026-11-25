@@ -131,6 +131,39 @@ pub(crate) fn make(noted: Vec<Noted>, mv: fn(usize, usize, usize)) {
     crate::shadow::wide_run(jobs);
 }
 
+// VICTORY_WIDE_GUARDS_ONCE=1: a flush's moves of the same title bytes into the same copy are made once
+pub(crate) fn once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_GUARDS_ONCE").is_some_and(|v| v == "1"))
+}
+
+// since the last line: bytes noted, bytes left out as moved already
+pub(crate) static ONCE_BYTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+// `noted` with moves of the same bytes into the same place made one (the moves all run after the flush's
+// refreshes, so each reads the same title bytes); as given if two places overlap through different sources
+pub(crate) fn once_each(noted: Vec<Noted>) -> Vec<Noted> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let before: usize = noted.iter().map(|m| m.len).sum();
+    ONCE_BYTES[0].fetch_add(before as u64, Relaxed);
+    // by destination: (dst, end, source offset)
+    let mut spans: Vec<(usize, usize, usize)> = noted.iter().map(|m| (m.dst, m.dst + m.len, m.dst.wrapping_sub(m.src))).collect();
+    spans.sort_unstable();
+    let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(spans.len());
+    for (a, b, k) in spans {
+        match out.last_mut() {
+            Some(last) if a <= last.1 && k == last.2 => last.1 = last.1.max(b),
+            // overlapping places through another source: order matters, leave all as noted
+            Some(last) if a < last.1 => return noted,
+            _ => out.push((a, b, k)),
+        }
+    }
+    let once: Vec<Noted> = out.into_iter().map(|(a, b, k)| Noted { dst: a, src: a.wrapping_sub(k), len: b - a }).collect();
+    let after: usize = once.iter().map(|m| m.len).sum();
+    ONCE_BYTES[1].fetch_add((before - after.min(before)) as u64, Relaxed);
+    once
+}
+
 /// A move of a host copy's refresh: title memory through the kernel, as
 /// `crate::host::copy_mapped` does it.
 pub(crate) fn title_move(dst: usize, src: usize, len: usize) {
@@ -140,6 +173,48 @@ pub(crate) fn title_move(dst: usize, src: usize, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moves_of_the_same_bytes_are_made_once() {
+        use super::{Noted, once_each};
+        let m = |dst: usize, src: usize, len: usize| Noted { dst, src, len };
+        // the same block twice, an overlapping part, and a neighbour that touches
+        let noted = vec![m(1000, 9000, 100), m(5000, 20000, 50), m(1000, 9000, 100), m(1050, 9050, 100), m(1150, 9150, 10)];
+        assert_eq!(once_each(noted), vec![m(1000, 9000, 160), m(5000, 20000, 50)]);
+        // the same place from another source: kept as noted, in order
+        let crossing = vec![m(1000, 9000, 100), m(1050, 7000, 100)];
+        assert_eq!(once_each(crossing.clone()), crossing);
+    }
+
+    // every destination byte ends as when each move was made, with the source unchanged between moves
+    #[test]
+    fn moves_made_once_leave_the_same_bytes() {
+        use super::{Noted, once_each};
+        let src: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 1) as u8).collect();
+        let s = src.as_ptr() as usize;
+        let noted = |d: usize| {
+            vec![
+                Noted { dst: d, src: s, len: 1000 },
+                Noted { dst: d + 500, src: s + 500, len: 1500 },
+                Noted { dst: d, src: s, len: 1000 },
+                Noted { dst: d + 3000, src: s + 3000, len: 96 },
+            ]
+        };
+        let run = |list: Vec<Noted>, dst: &mut Vec<u8>| {
+            let d = dst.as_mut_ptr() as usize;
+            for m in list {
+                // SAFETY: inside both buffers
+                unsafe { std::ptr::copy_nonoverlapping(m.src as *const u8, (d + (m.dst - (usize::MAX / 2))) as *mut u8, m.len) };
+            }
+        };
+        // destinations as offsets from a fixed base, rebased onto each buffer
+        let base = usize::MAX / 2;
+        let (mut all, mut once) = (vec![0u8; 4096], vec![0u8; 4096]);
+        run(noted(base), &mut all);
+        run(once_each(noted(base)), &mut once);
+        assert!(all == once);
+        assert!(once[..2000] == src[..2000] && once[3000..3096] == src[3000..3096]);
+    }
 
     #[test]
     fn moves_are_noted_only_inside() {

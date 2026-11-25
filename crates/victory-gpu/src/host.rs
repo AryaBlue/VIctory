@@ -7887,6 +7887,8 @@ impl Batch {
             });
             flush_part(2, deciding);
             let started = std::time::Instant::now();
+            // a block taken by two refreshes of the flush moved once (VICTORY_WIDE_GUARDS_ONCE)
+            let noted = if crate::wide_copy::once() { crate::wide_copy::once_each(noted) } else { noted };
             crate::wide_copy::make(noted, crate::wide_copy::title_move);
             preparing(0, started.elapsed().as_micros() as u64);
             flush_part(3, started);

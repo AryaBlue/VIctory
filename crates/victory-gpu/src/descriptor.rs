@@ -1284,6 +1284,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        let _turn = ahead::tests::TESTS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };

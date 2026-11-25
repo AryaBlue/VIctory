@@ -227,14 +227,22 @@ pub(super) fn line(frames: f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::*;
     use crate::object::{S_OK, slot};
     use super::{pages, step};
 
-    // barren notes of earlier tests' heaps at the same addresses
-    fn fresh_notes() {
-        pages().barren = None;
+    // one heap-sync test at a time: each pass takes every heap's pages, and the queues and barren notes are shared
+    pub(crate) static TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // this test's turn, with no barren notes of earlier tests' heaps (addresses come round again)
+    fn fresh_notes() -> std::sync::MutexGuard<'static, ()> {
+        let turn = TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = pages();
+        p.barren = None;
+        p.helper.clear();
+        p.submit.clear();
+        turn
     }
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
 
@@ -283,7 +291,7 @@ mod tests {
     // a record written after the helper's pass is mirrored by the submit pass
     #[test]
     fn a_record_written_after_the_helper_is_mirrored_at_submit() {
-        fresh_notes();
+        let _turn = fresh_notes();
         let (memory, h) = sampler_heap();
         if let Some(host) = heap(h).host() {
             let (a, b) = (sampler(21), sampler(5));
@@ -302,7 +310,7 @@ mod tests {
     // pages the helper took and had not mirrored yet are mirrored by the submit pass
     #[test]
     fn pages_the_helper_took_are_mirrored_at_submit() {
-        fresh_notes();
+        let _turn = fresh_notes();
         let (memory, h) = sampler_heap();
         if let Some(host) = heap(h).host() {
             copy_in(memory, 7, &sampler(21));
@@ -319,7 +327,7 @@ mod tests {
     // a page that gave the helper nothing last time is left to the submit pass, which mirrors it in the same submission
     #[test]
     fn a_barren_page_is_mirrored_by_the_same_submit_pass() {
-        fresh_notes();
+        let _turn = fresh_notes();
         let (memory, h) = sampler_heap();
         if let Some(host) = heap(h).host() {
             let (a, b) = (sampler(21), sampler(5));
@@ -345,7 +353,7 @@ mod tests {
     fn host_heaps_match_with_and_without_the_helper() {
         let (a, b, c) = (sampler(21), sampler(5), sampler(1));
         let run = |helper: bool| -> Option<Vec<u64>> {
-            fresh_notes();
+            let _turn = fresh_notes();
         let (memory, h) = sampler_heap();
             let mut keys = None;
             if let Some(host) = heap(h).host() {
