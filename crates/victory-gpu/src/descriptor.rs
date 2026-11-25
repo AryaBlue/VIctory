@@ -286,6 +286,18 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Runs `f` on the heap at `at` (first descriptor at `start`) while it
+/// stays registered, so it cannot go meanwhile.
+#[cfg(windows)]
+pub(crate) fn with_live_heap<R>(at: usize, start: u64, f: impl FnOnce(&Heap) -> R) -> Option<R> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        .any(|&(s, _, h)| h == at && s == start)
+        // SAFETY: registered heaps are live (removed when dropped), and the lock is held.
+        .then(|| f(unsafe { &*(at as *const Heap) }))
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

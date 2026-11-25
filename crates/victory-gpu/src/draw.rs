@@ -424,6 +424,123 @@ fn cached_range<T>(
     (*k == key && std::sync::Arc::strong_count(shadow) > 1).then(|| (shadow.clone(), *from, *to))
 }
 
+/// One slot of the heap-buffer pass: the host copy and range its buffer
+/// view reads (`buffer_copy`, not what the view's range alone would find).
+fn walk_slot(
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    caching: bool,
+    cache: &mut std::collections::HashMap<u32, Cached>,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let handle = heap.handle(index)?;
+    let key = if caching { record_key(handle) } else { 0 };
+    let t = std::time::Instant::now();
+    let mirrored = host.mirror(index, handle, true);
+    split(HeapSplit::MirrorUs, t.elapsed().as_micros() as u64);
+    let Some(view) = mirrored else {
+        cache.remove(&index);
+        return None;
+    };
+    let t = std::time::Instant::now();
+    let found = match caching.then(|| cached_range(cache, index, key)).flatten() {
+        Some((shadow, from, to)) => {
+            split(HeapSplit::CacheHits, 1);
+            Some((shadow, from, to - from))
+        }
+        None => crate::descriptor::host::buffer_copy(&view),
+    };
+    split(HeapSplit::CopyUs, t.elapsed().as_micros() as u64);
+    let Some((shadow, address, len)) = found else {
+        cache.remove(&index);
+        return None;
+    };
+    if caching {
+        cache.insert(index, (key, shadow.clone(), address, address + len));
+    }
+    #[cfg(feature = "diagnostics")]
+    if host.shows(index, &shadow.buffer) == Some(false) {
+        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+    }
+    Some((shadow, address, address + len))
+}
+
+/// The heap as the slot-walk worker reads it, by address and first
+/// descriptor (checked against the live heaps on every chunk).
+struct HeapSource {
+    at: usize,
+    start: u64,
+    caching: bool,
+    cache: std::collections::HashMap<u32, Cached>,
+}
+
+impl HeapSource {
+    fn host<R>(&self, f: impl FnOnce(&crate::descriptor::host::HostHeap) -> R) -> Option<R> {
+        crate::descriptor::with_live_heap(self.at, self.start, |heap| heap.host().map(f)).flatten()
+    }
+}
+
+impl crate::heap_walk::Source<crate::shadow::Shadow> for HeapSource {
+    fn changes(&mut self) -> Option<Vec<u32>> {
+        self.host(|host| host.buffer_changes())
+    }
+
+    fn slots(&mut self) -> Option<Vec<u32>> {
+        split(HeapSplit::FullWalks, 1);
+        self.host(|host| host.buffer_slots())
+    }
+
+    fn walk(
+        &mut self,
+        slots: &[u32],
+        ranges: &mut std::collections::HashMap<u32, crate::heap_walk::Range<crate::shadow::Shadow>>,
+    ) -> bool {
+        split(HeapSplit::Slots, slots.len() as u64);
+        let (caching, cache) = (self.caching, &mut self.cache);
+        crate::descriptor::with_live_heap(self.at, self.start, |heap| {
+            let Some(host) = heap.host() else {
+                return false;
+            };
+            for &index in slots {
+                ranges.remove(&index);
+                if let Some(range) = walk_slot(heap, host, index, caching, cache) {
+                    ranges.insert(index, range);
+                }
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+}
+
+/// The heap's slot-walk worker, started on its first pass
+/// (`VICTORY_HEAP_WALK_THREAD=1`).
+fn walk_worker(
+    heap: &crate::descriptor::Heap,
+) -> Option<std::sync::Arc<crate::heap_walk::Shared<crate::shadow::Shadow>>> {
+    if !crate::heap_walk::enabled() {
+        return None;
+    }
+    type Workers = std::collections::HashMap<(usize, u64), std::sync::Arc<crate::heap_walk::Shared<crate::shadow::Shadow>>>;
+    static WORKERS: std::sync::Mutex<Option<Workers>> = std::sync::Mutex::new(None);
+    let key = (std::ptr::from_ref(heap) as usize, heap.start);
+    let mut workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+    let workers = workers.get_or_insert_with(Default::default);
+    workers.retain(|_, w| !w.gone());
+    if let Some(shared) = workers.get(&key) {
+        return Some(shared.clone());
+    }
+    let shared = crate::heap_walk::Shared::new();
+    let source = HeapSource { at: key.0, start: key.1, caching: heap_range_cache(), cache: Default::default() };
+    let handed = shared.clone();
+    std::thread::Builder::new()
+        .name("victory heap walk".into())
+        .spawn(move || crate::heap_walk::run(source, handed, 256, std::time::Duration::from_millis(2)))
+        .ok()?;
+    workers.insert(key, shared.clone());
+    Some(shared)
+}
+
 // heap pass once per presented frame instead of per frame begun (VICTORY_HEAP_PER_PRESENT=1)
 fn heap_per_present() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1463,6 +1580,13 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        let (spans, views, walked) = if let Some(shared) = walk_worker(heap) {
+            // the worker walks the slots; this thread only takes its spans
+            let spans = shared.pass(std::time::Duration::from_secs(2)).unwrap_or_default();
+            split(HeapSplit::WalkUs, started.elapsed().as_micros() as u64);
+            split(HeapSplit::Copies, spans.len() as u64);
+            (spans, 0u32, 0usize)
+        } else {
         static CACHE: std::sync::Mutex<Option<std::collections::HashMap<u32, Cached>>> = std::sync::Mutex::new(None);
         let caching = heap_range_cache();
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1491,17 +1615,7 @@ impl State {
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let key = if caching { record_key(handle) } else { 0 };
-            let t = std::time::Instant::now();
-            let mirrored = host.mirror(index, handle, true);
-            split(HeapSplit::MirrorUs, t.elapsed().as_micros() as u64);
-            let Some(view) = mirrored else {
-                cache.remove(&index);
-                continue;
-            };
+            let found = walk_slot(heap, host, index, caching, cache);
             // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
@@ -1517,46 +1631,21 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let t = std::time::Instant::now();
-            let found = match caching.then(|| cached_range(cache, index, key)).flatten() {
-                Some((shadow, from, to)) => {
-                    split(HeapSplit::CacheHits, 1);
-                    Some((shadow, from, to - from))
-                }
-                None => crate::descriptor::host::buffer_copy(&view),
-            };
-            split(HeapSplit::CopyUs, t.elapsed().as_micros() as u64);
-            let Some((shadow, address, len)) = found else {
-                cache.remove(&index);
-                continue;
-            };
-            if caching {
-                cache.insert(index, (key, shadow.clone(), address, address + len));
+            if let Some(range) = found {
+                ranges.insert(index, range);
             }
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-            }
-            ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
         split(HeapSplit::WalkUs, started.elapsed().as_micros() as u64);
         let spanning = std::time::Instant::now();
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
+        let spans = std::sync::Arc::new(crate::heap_walk::spans(ranges));
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         split(HeapSplit::Copies, spans.len() as u64);
         split(HeapSplit::SpanUs, spanning.elapsed().as_micros() as u64);
+        (spans, views, slots.len())
+        };
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1567,7 +1656,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in spans.iter() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1610,7 +1699,7 @@ impl State {
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);
             tracing::info!(
-                slots = slots.len(),
+                slots = walked,
                 views,
                 copies = spans.len(),
                 mb = bytes >> 20,
