@@ -358,6 +358,13 @@ fn submission_us(i: usize, us: u64) {
     }
 }
 
+// flush parts in us: whole, ask ahead, deciding refreshes, wide moves, asks done
+static FLUSH_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn flush_part(i: usize, since: std::time::Instant) {
+    FLUSH_PARTS[i].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// Adds to [`PREPARING`]'s copies (time, bytes) and to the frame log's totals.
 fn preparing(i: usize, n: u64) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
@@ -7194,6 +7201,12 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let whole = std::time::Instant::now();
+        self.flush_parts();
+        flush_part(0, whole);
+    }
+
+    fn flush_parts(&mut self) {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -7208,7 +7221,9 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
+            flush_part(1, started);
         }
+        let deciding = std::time::Instant::now();
         let wide = if flush_wide() {
             self.refreshes.len() >= 2
                 && self.refreshes.iter().map(|r| r.2 - r.1).sum::<usize>() >= FLUSH_WIDE_BYTES
@@ -7259,9 +7274,11 @@ impl Batch {
                     each();
                 }
             });
+            flush_part(2, deciding);
             let started = std::time::Instant::now();
             crate::wide_copy::make(noted, crate::wide_copy::title_move);
             preparing(0, started.elapsed().as_micros() as u64);
+            flush_part(3, started);
             // the copies stay alive until their bytes are in
             drop(refreshes);
         } else {
@@ -7269,9 +7286,12 @@ impl Batch {
                 Self::update(&shadow, from, to);
                 Self::brought(&mut self.current, &shadow, from, to);
             }
+            flush_part(2, deciding);
         }
         if ahead {
+            let done = std::time::Instant::now();
             crate::watch::ask_ahead_done();
+            flush_part(4, done);
         }
     }
 }
@@ -7735,6 +7755,13 @@ impl Meter {
                 "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames
+            );
+        }
+        {
+            let [all, ahead, deciding, moves, done] =
+                [0, 1, 2, 3, 4].map(|i| FLUSH_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+            tracing::info!(
+                "flushes per frame: {all:.1} ms in all; asking ahead {ahead:.1}, refreshes decided (and copied when not wide) {deciding:.1}, moves made wide {moves:.1}, asks done {done:.1}; prep outside flushes is the frame line's preparing less this"
             );
         }
         crate::shadow::exact_line(frames);
