@@ -1617,6 +1617,8 @@ mod tests {
                 n / 2000
             );
         }
+    }
+
     /// A title write that lands while a submission is prepared (after its
     /// asking, as with an early present while the title builds the next
     /// frame) is not lost to the asking's reset: the submission's own take
