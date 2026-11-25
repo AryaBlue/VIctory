@@ -228,6 +228,66 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+// console protection bits above the host's (winnt.h PAGE_GRAPHICS_*)
+const WRITE_COMBINE: u32 = 0x400;
+const GPU_READ_ONLY: u32 = 0x1000 | 0x4000 | 0x8000;
+const GPU_WRITE: u32 = 0x2000 | 0x10000;
+
+// title allocations by base: bytes and the console protection asked for
+static PROTECTIONS: Mutex<BTreeMap<usize, (usize, u32)>> = Mutex::new(BTreeMap::new());
+
+// VICTORY_INPLACE_UPLOAD: 1 big gpu read-only write-combined buffers go in place too, 2 any gpu read-only (needs VICTORY_INPLACE>=2)
+pub(crate) fn upload_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_UPLOAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+// xmem gave the title [at, at+len) with this console protection
+pub fn title_memory_protection(at: usize, len: usize, protect: u32) {
+    if level() == 0 && probe_level() == 0 {
+        return;
+    }
+    let mut p = PROTECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let end = at.saturating_add(len);
+    // a new allocation over older ones replaces those wholly inside it
+    let inside: Vec<usize> = p.range(at..end).filter(|(b, v)| b.saturating_add(v.0) <= end).map(|(b, _)| *b).collect();
+    for b in inside {
+        p.remove(&b);
+    }
+    p.insert(at, (len, protect));
+}
+
+fn protection_in(p: &BTreeMap<usize, (usize, u32)>, at: usize, len: usize) -> Option<u32> {
+    let end = at.saturating_add(len.max(1));
+    p.range(..=at).rev().take(8).find(|(b, v)| b.saturating_add(v.0) >= end).map(|(_, v)| v.1)
+}
+
+// console protection of the allocation holding the range
+pub(crate) fn protection(at: u64, len: u64) -> Option<u32> {
+    protection_in(&PROTECTIONS.lock().unwrap_or_else(|e| e.into_inner()), at as usize, len as usize)
+}
+
+// 0 gpu read-only write-combined, 1 gpu read-only, 2 gpu written, 3 unknown
+fn class_of(protect: Option<u32>) -> usize {
+    match protect {
+        Some(p) if p & GPU_WRITE == 0 && p & GPU_READ_ONLY != 0 => {
+            if p & WRITE_COMBINE != 0 { 0 } else { 1 }
+        }
+        Some(p) if p & GPU_WRITE != 0 => 2,
+        _ => 3,
+    }
+}
+
+// a big buffer goes in place instead of to the card
+pub(crate) fn upload_in_place(start: u64, len: u64) -> bool {
+    let want = upload_level();
+    if want == 0 || level() < 2 {
+        return false;
+    }
+    let class = class_of(protection(start, len));
+    class == 0 || (want >= 2 && class == 1)
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -1024,13 +1084,31 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
 fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
     let mut known = Vec::new();
     let (mut buffers, mut windows) = (Tally::default(), Tally::default());
+    let mut classes = [[(0u64, 0u64); 4]; 2];
+    let protections = PROTECTIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for &(start, len, window) in spans {
         let kind = kind_of(start as usize, len as usize, &mut known);
         let tally = if window { &mut windows } else { &mut buffers };
         tally.0[kind].0 += 1;
         tally.0[kind].1 += len;
+        let class = &mut classes[window as usize][class_of(protection_in(&protections, start as usize, len as usize))];
+        class.0 += 1;
+        class.1 += len;
     }
     let mut lines = Vec::new();
+    for (name, c) in ["title buffers", "windows outside buffers"].iter().zip(&classes) {
+        lines.push(format!(
+            "census, {name} by the title's protection: gpu read-only write-combined {} of {} MB, gpu read-only {} of {} MB, gpu written {} of {} MB, unknown {} of {} MB",
+            c[0].0,
+            c[0].1 >> 20,
+            c[1].0,
+            c[1].1 >> 20,
+            c[2].0,
+            c[2].1 >> 20,
+            c[3].0,
+            c[3].1 >> 20
+        ));
+    }
     for (name, tally) in [("title buffers", buffers), ("windows outside buffers", windows)] {
         let all = tally.0.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         lines.push(format!("census, {name}: {} of {} MB", all.0, all.1 >> 20));
@@ -1300,6 +1378,24 @@ mod tests {
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    // the title's gpu bits sort memory into upload, read-only, written
+    #[test]
+    fn protection_classes_from_console_bits() {
+        assert_eq!(class_of(Some(0x04 | WRITE_COMBINE | 0x1000)), 0);
+        assert_eq!(class_of(Some(0x04 | 0x8000)), 1);
+        assert_eq!(class_of(Some(0x04 | WRITE_COMBINE | 0x2000)), 2);
+        assert_eq!(class_of(Some(0x04 | 0x1000 | 0x10000)), 2);
+        assert_eq!(class_of(Some(0x04)), 3);
+        assert_eq!(class_of(None), 3);
+        let mut p = BTreeMap::new();
+        p.insert(0x1000_0000usize, (16 * K64, 0x1404u32));
+        p.insert(0x1000_0000 + 4 * K64, (K64, 0x2004u32));
+        assert_eq!(protection_in(&p, 0x1000_0000 + 4 * K64 + 8, 64), Some(0x2004));
+        assert_eq!(protection_in(&p, 0x1000_0000 + 8 * K64, K64), Some(0x1404));
+        assert_eq!(protection_in(&p, 0x1000_0000 + 15 * K64, 2 * K64), None);
+        assert!(!upload_in_place(0x1000_0000, K64 as u64), "off by default");
     }
 
     /// The census names each kind of memory.

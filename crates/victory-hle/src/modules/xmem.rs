@@ -92,6 +92,7 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let console_protect = protect;
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -153,6 +154,10 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // the console's gpu and caching bits, for VICTORY_INPLACE_UPLOAD
+    if !at.is_null() {
+        victory_gpu::title_memory_protection(at as usize, size, console_protect);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -342,7 +347,7 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section(HANDLE, bool);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -463,7 +468,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, committed);
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, committed));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -524,7 +529,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.1).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -821,7 +826,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.1) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -838,9 +843,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
+fn commit(base: usize, len: usize, committed: bool) -> bool {
     if on_wine() {
         return true; // sections are committed whole there
+    }
+    // a SEC_COMMIT pool (VICTORY_INPLACE_POOL) has nothing left to commit
+    if committed {
+        return true;
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
