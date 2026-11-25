@@ -55,6 +55,8 @@ pub mod root;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
+mod safecopy;
+#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
