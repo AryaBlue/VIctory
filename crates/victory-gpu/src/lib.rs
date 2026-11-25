@@ -90,6 +90,8 @@ mod texture_worker;
 pub mod upscale;
 #[cfg(windows)]
 mod readtrace;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod titleprobe;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
