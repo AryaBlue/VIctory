@@ -234,8 +234,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut held = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *held;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
     if j.kept {
@@ -255,6 +255,32 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    if wide_asks() {
+        let now = j.ahead_asked;
+        drop(held);
+        return asked_wide(&pieces, now);
+    }
+    for run in ahead_runs(&pieces) {
+        ask_run(j, run);
+    }
+}
+
+/// Whether [`ask_ahead`]'s kernel askings run on the wide threads
+/// (`VICTORY_WIDE_ASKS=1`; off by default), the journal's lock let go
+/// meanwhile, their answers then noted in order under the same asking.
+///
+/// Why: in the prof-s-1 profile 3.8 ms a frame of the submitting thread
+/// were these askings (`NtGetWriteWatch`) one after another, at each
+/// submission's start.
+fn wide_asks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_ASKS").is_some_and(|v| v == "1"))
+}
+
+/// [`ask_ahead`]'s runs of `pieces` (page ranges in order), as it makes
+/// them.
+fn ahead_runs(pieces: &[(usize, usize)]) -> Vec<&[(usize, usize)]> {
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -267,8 +293,99 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        runs.push(&pieces[i..k]);
         i = k;
+    }
+    runs
+}
+
+/// With [`wide_asks`]: [`ask_ahead`]'s askings of `pieces` on the wide
+/// threads, without the journal; noted at asking `now` in order after.
+fn asked_wide(pieces: &[(usize, usize)], now: u64) {
+    type Answers = Vec<(usize, usize, Vec<usize>)>;
+    let runs: Vec<Vec<(usize, usize)>> = ahead_runs(pieces)
+        .into_iter()
+        .filter(|r| r.len() >= 2)
+        .map(<[_]>::to_vec)
+        .collect();
+    let answers: std::sync::Arc<Mutex<Vec<Answers>>> =
+        std::sync::Arc::new(Mutex::new(vec![Vec::new(); runs.len()]));
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = runs
+        .into_iter()
+        .enumerate()
+        .map(|(k, run)| {
+            let answers = answers.clone();
+            Box::new(move || {
+                let mut found = Vec::new();
+                run_alone(&run, &mut found);
+                answers.lock().unwrap_or_else(|e| e.into_inner())[k] = found;
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    let answers = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (first, last, written) in answers.into_iter().flatten() {
+        note_addresses(&mut j, &written, now);
+        j.ahead.push((first, last));
+    }
+}
+
+/// [`ask_run`] without the journal: the runs the kernel answered, with
+/// the written 4 KiB page addresses it gave, in order.
+fn run_alone(pieces: &[(usize, usize)], out: &mut Vec<(usize, usize, Vec<usize>)>) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(written) = kernel_written(first, last) {
+        out.push((first, last, written));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    run_alone(a, out);
+    run_alone(b, out);
+}
+
+/// The kernel's written 4 KiB page addresses of pages `[first, last)`,
+/// reset; `None` if the range is not write-watched memory of one
+/// reservation.
+fn kernel_written(first: usize, last: usize) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    let mut found = vec![0usize; count];
+    let mut granularity = 0;
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return None;
+    }
+    found.truncate(count);
+    Some(found)
+}
+
+/// [`note_found`] of `addresses` (4 KiB page addresses, in order).
+fn note_addresses(j: &mut Journal, addresses: &[usize], now: u64) {
+    let mut k = 0;
+    while k < addresses.len() {
+        let page = addresses[k] / PAGE;
+        let mut mask = 0u16;
+        while k < addresses.len() && addresses[k] / PAGE == page {
+            mask |= 1 << ((addresses[k] % PAGE) / KERNEL_PAGE);
+            k += 1;
+        }
+        note(j, page, now, mask);
     }
 }
 
@@ -1390,6 +1507,54 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VICTORY_WIDE_ASKS: a run asked without the journal answers the
+    /// written 4 KiB pages of write-watched memory, once (reset), and two
+    /// reservations apart are asked by halves, each alone left out as
+    /// `ask_run` leaves it.
+    #[test]
+    fn a_run_asked_alone_gives_the_written_pages_once() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // SAFETY: fresh memory of our own, released below.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        let first = base / PAGE;
+        let _ = kernel_written(first, first + 8);
+        // SAFETY: inside the allocation.
+        unsafe {
+            ((base + PAGE + 3 * KERNEL_PAGE) as *mut u8).write_volatile(1);
+            ((base + 5 * PAGE) as *mut u8).write_volatile(1);
+        }
+        let mut out = Vec::new();
+        run_alone(&[(first, first + 2), (first + 4, first + 8)], &mut out);
+        assert_eq!(
+            out,
+            vec![(
+                first,
+                first + 8,
+                vec![base + PAGE + 3 * KERNEL_PAGE, base + 5 * PAGE]
+            )]
+        );
+        let mut again = Vec::new();
+        run_alone(&[(first, first + 2), (first + 4, first + 8)], &mut again);
+        assert_eq!(again, vec![(first, first + 8, Vec::new())]);
+        // a run across our memory and memory that is not watched: by halves, none alone
+        let mut split = Vec::new();
+        run_alone(&[(first, first + 2), (first + 64, first + 65)], &mut split);
+        assert!(split.is_empty());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// VICTORY_VIEW_MEMO: a remembered view block is forgotten once title
     /// memory is mapped or unmapped.
