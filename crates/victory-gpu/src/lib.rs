@@ -87,6 +87,8 @@ mod texture_worker;
 #[cfg(windows)]
 pub mod upscale;
 #[cfg(windows)]
+mod readtrace;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod wide_copy;
