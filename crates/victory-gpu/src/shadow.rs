@@ -402,6 +402,22 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>,
     out
 }
 
+// runs of set bits of a page's piece mask as [first, end) pieces, gaps of up to two pieces copied with them
+fn piece_runs(mask: u16) -> Vec<(usize, usize)> {
+    const GAP: usize = 2;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for i in 0..16 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if i - last.1 <= GAP => last.1 = i + 1,
+            _ => out.push((i, i + 1)),
+        }
+    }
+    out
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -1821,7 +1837,7 @@ pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs};
+    use super::{PIECE, back_piece, changed_runs, piece_runs};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -1907,6 +1923,15 @@ mod merge_tests {
         assert_eq!(scratch, [20, 3, 44, 50], "the title's byte where both changed");
         assert_eq!(host[1..5], [20, 3, 44, 50], "the copy takes the result");
         assert_eq!(runs, [(0, 1), (3, 1)], "the GPU's bytes only");
+    }
+
+    #[test]
+    fn piece_runs_join_small_gaps() {
+        assert!(piece_runs(0).is_empty());
+        assert_eq!(piece_runs(u16::MAX), [(0, 16)]);
+        assert_eq!(piece_runs(0b1001), [(0, 4)]);
+        assert_eq!(piece_runs(0b10001), [(0, 1), (4, 5)]);
+        assert_eq!(piece_runs(0x8000 | 0b10), [(1, 2), (15, 16)]);
     }
 
     /// The runs hold exactly the bytes that differ: putting them into the
@@ -3092,6 +3117,10 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        // only the written 4 KiB pieces (VICTORY_FINE_PAGES=1)
+        if crate::watch::fine_pages() {
+            return self.copy_stale_fine(from, to, now, written);
+        }
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -3121,6 +3150,67 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy_stale`] by 4 KiB piece: of a page written once since
+    /// the copy took it, only the pieces the write watch found written.
+    fn copy_stale_fine(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        const P: usize = crate::watch::PIECE_BYTES;
+        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let noted = crate::watch::pieces(from, to);
+        let mut noted = noted.iter().peekable();
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writes = written.iter().peekable();
+        // the open run, in pieces from address 0: [first, end)
+        let (mut bytes, mut run): (usize, Option<(usize, usize)>) = (0, None);
+        // a run of pieces, cut to the range
+        let put = |f: usize, e: usize| {
+            let (a, b) = ((f * P).max(from), (e * P).min(to));
+            if a < b { self.copy(a, b) } else { 0 }
+        };
+        let last = (to - 1) / PAGE;
+        for page in from / PAGE..=last {
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    w
+                }
+                _ => 0,
+            };
+            while noted.peek().is_some_and(|n| n.0 < page) {
+                noted.next();
+            }
+            let here = noted.peek().filter(|n| n.0 == page).map(|n| n.1);
+            let at = &mut copied[page - base];
+            let since = *at;
+            let need = if since == 0 || write > since {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                crate::watch::pieces_needed(since, write, here)
+            } else {
+                0
+            };
+            for (a, b) in piece_runs(need) {
+                let (a, b) = (page * PAGE / P + a, page * PAGE / P + b);
+                if let Some(r) = run.as_mut().filter(|r| r.1 == a) {
+                    r.1 = b;
+                } else if let Some((f, e)) = run.replace((a, b)) {
+                    bytes += put(f, e);
+                }
+            }
+            // runs join across pages only where they touch
+            if need & 0x8000 == 0
+                && let Some((f, e)) = run.take()
+            {
+                bytes += put(f, e);
+            }
+        }
+        if let Some((f, e)) = run {
+            bytes += put(f, e);
         }
         bytes
     }

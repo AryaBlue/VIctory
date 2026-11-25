@@ -33,6 +33,25 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+// 4 KiB pieces of a page, one bit each
+pub(crate) const PIECE_BYTES: usize = KERNEL_PAGE;
+const PIECES: usize = PAGE / KERNEL_PAGE;
+const _: () = assert!(PIECES == 16, "a page's pieces are the bits of a u16");
+
+// refreshes copy the written 4 KiB pieces of a page, not the whole 64 KiB (VICTORY_FINE_PAGES=1)
+pub(crate) fn fine_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FINE_PAGES").is_some_and(|v| v == "1"))
+}
+
+// pieces written at `last`; every other piece last written at or before `older`
+#[derive(Clone, Copy)]
+pub(crate) struct Pieces {
+    pub(crate) last: u64,
+    pub(crate) older: u64,
+    pub(crate) mask: u16,
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -70,6 +89,69 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    // with fine_pages: which pieces of each page the last asking found written
+    pieces: BTreeMap<usize, Pieces>,
+}
+
+// notes `page` written at `now` in the pieces of `mask`
+fn note(j: &mut Journal, page: usize, now: u64, mask: u16) {
+    let prev = j.written.insert(page, now);
+    if !fine_pages() {
+        return;
+    }
+    let prev = prev.unwrap_or(0);
+    let e = j.pieces.entry(page).or_insert(Pieces { last: prev, older: prev, mask: u16::MAX });
+    if e.last == now {
+        e.mask |= mask;
+    } else {
+        // what was written before stays bounded by the old asking
+        e.older = e.last;
+        e.last = now;
+        e.mask = mask;
+    }
+}
+
+// notes the kernel's answer (4 KiB page addresses, in order) at `now`, a page at a time
+fn note_found(j: &mut Journal, count: usize, now: u64) {
+    let mut k = 0;
+    while k < count {
+        let page = j.found[k] / PAGE;
+        let mut mask = 0u16;
+        while k < count && j.found[k] / PAGE == page {
+            mask |= 1 << ((j.found[k] % PAGE) / KERNEL_PAGE);
+            k += 1;
+        }
+        note(j, page, now, mask);
+    }
+}
+
+// the bits of the pieces of `page` that `[from, to)` touches
+fn piece_mask(page: usize, from: usize, to: usize) -> u16 {
+    let (a, b) = (from.max(page * PAGE), to.min((page + 1) * PAGE));
+    if a >= b {
+        return 0;
+    }
+    let (first, last) = ((a - page * PAGE) / KERNEL_PAGE, (b - page * PAGE).div_ceil(KERNEL_PAGE));
+    ((((1u32 << last) - 1) & !((1u32 << first) - 1)) & 0xffff) as u16
+}
+
+/// The pieces noted for the pages of `[start, end)` (whole pages), in page
+/// order; empty without [`fine_pages`].
+pub(crate) fn pieces(start: usize, end: usize) -> Vec<(usize, Pieces)> {
+    if !fine_pages() {
+        return Vec::new();
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.pieces.range(first..last).map(|(&p, &v)| (p, v)).collect()
+}
+
+// the pieces of a page a copy stamped `since` lacks, given the page's last write and its noted pieces
+pub(crate) fn pieces_needed(since: u64, write: u64, noted: Option<Pieces>) -> u16 {
+    match noted {
+        Some(n) if since != 0 && n.last == write && n.older <= since => n.mask,
+        _ => u16::MAX,
+    }
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -79,6 +161,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    pieces: BTreeMap::new(),
 });
 
 /// Ranges of one submission closer than this are asked about together:
@@ -248,8 +331,9 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+    let end = at.saturating_add(len);
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        note(&mut j, page, now, piece_mask(page, at, end));
     }
 }
 
@@ -304,10 +388,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    note_found(j, count, now);
     true
 }
 
@@ -399,9 +480,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    note_found(j, count, now);
+    // guarded blocks are known by the 64 KiB only
+    for page in guarded {
+        note(j, page, now, u16::MAX);
     }
     Some((
         now,
@@ -1055,6 +1137,22 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn piece_masks_and_needs() {
+        assert_eq!(piece_mask(1, PAGE, 2 * PAGE), u16::MAX);
+        assert_eq!(piece_mask(1, PAGE + 4096, PAGE + 4097), 0b10);
+        assert_eq!(piece_mask(1, PAGE - 5, PAGE + 1), 0b1);
+        assert_eq!(piece_mask(1, 0, PAGE), 0);
+        assert_eq!(piece_mask(0, 15 * 4096 + 1, 99 * PAGE), 0x8000);
+        let n = Pieces { last: 7, older: 5, mask: 0b100 };
+        assert_eq!(pieces_needed(6, 7, Some(n)), 0b100, "copied after the older writes");
+        assert_eq!(pieces_needed(5, 7, Some(n)), 0b100);
+        assert_eq!(pieces_needed(4, 7, Some(n)), u16::MAX, "an older write it lacks");
+        assert_eq!(pieces_needed(0, 7, Some(n)), u16::MAX, "never copied");
+        assert_eq!(pieces_needed(6, 8, Some(n)), u16::MAX, "the journal moved on");
+        assert_eq!(pieces_needed(6, 7, None), u16::MAX);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
