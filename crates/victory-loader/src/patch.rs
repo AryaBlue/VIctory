@@ -70,18 +70,36 @@ fn ffx_force(scale: f32) -> [Patch; 2] {
     ]
 }
 
-// VICTORY_SHADOW_CASCADES=1..3: the per-frame clamp of the sun's cascade
-// count (+0x97dc50, `min(count, 4)` into +0x84ddbe0) clamps lower, so the far
-// cascades and their draws go
+// VICTORY_SHADOW_CASCADES=2..3: the sun's cascades drawn. the clamp of the
+// tunable count (+0x97dc50 into +0x84ddbe0) only sets the active count; the
+// count the render thread loops over (+0x84ddbd4) is forced to 4 at +0x98070a
+// (and the active one at +0x9807bb in shadow modes 1-2), so those go to n too
 const CASCADES_RVA: usize = 0x97dc50;
 const CASCADES_OLD: [u8; 8] = [0xb9, 0x04, 0x00, 0x00, 0x00, 0x83, 0xf8, 0x04];
+// movabs rcx, 0x3f800000_00000004 (stored over +0x84ddbd4/+0x84ddbd8)
+const CASCADES_DRAWN_RVA: usize = 0x98070a;
+const CASCADES_DRAWN_OLD: [u8; 10] = [0x48, 0xb9, 0x04, 0, 0, 0, 0, 0, 0x80, 0x3f];
+// mov dword [+0x84ddbdc], 4
+const CASCADES_MODE_RVA: usize = 0x9807bb;
+const CASCADES_MODE_OLD: [u8; 10] = [0xc7, 0x05, 0x17, 0xd4, 0xb5, 0x07, 0x04, 0, 0, 0];
 
-fn cascades(n: u8) -> Option<Patch> {
-    (1..=3).contains(&n).then(|| Patch {
-        module: None,
-        rva: CASCADES_RVA,
-        expect: Some(CASCADES_OLD.to_vec()),
-        bytes: vec![0xb9, n, 0x00, 0x00, 0x00, 0x83, 0xf8, n],
+fn cascades(n: u8) -> Option<[Patch; 3]> {
+    let with = |rva: usize, old: &[u8], at: usize| {
+        let mut bytes = old.to_vec();
+        bytes[at] = n;
+        Patch { module: None, rva, expect: Some(old.to_vec()), bytes }
+    };
+    (2..=3).contains(&n).then(|| {
+        [
+            Patch {
+                module: None,
+                rva: CASCADES_RVA,
+                expect: Some(CASCADES_OLD.to_vec()),
+                bytes: vec![0xb9, n, 0x00, 0x00, 0x00, 0x83, 0xf8, n],
+            },
+            with(CASCADES_DRAWN_RVA, &CASCADES_DRAWN_OLD, 2),
+            with(CASCADES_MODE_RVA, &CASCADES_MODE_OLD, 6),
+        ]
     })
 }
 
@@ -182,7 +200,7 @@ pub(crate) fn from_env() -> Vec<Patch> {
         patches.extend(lod_scale(s));
     }
     if let Some(p) = env::var("VICTORY_SHADOW_CASCADES").ok().and_then(|v| v.trim().parse().ok()).and_then(cascades) {
-        patches.push(p);
+        patches.extend(p);
     }
     patches
 }
@@ -322,12 +340,18 @@ mod tests {
 
     #[test]
     fn cascades_patch_lowers_both_clamp_immediates_only() {
-        let mut image = vec![0u8; CASCADES_RVA + 0x20];
+        let mut image = vec![0u8; CASCADES_MODE_RVA + 0x20];
         image[CASCADES_RVA..CASCADES_RVA + 8].copy_from_slice(&CASCADES_OLD);
-        let p = cascades(2).unwrap();
-        assert_eq!(write_image(&mut image, &p), Ok(CASCADES_OLD.to_vec()));
+        image[CASCADES_DRAWN_RVA..CASCADES_DRAWN_RVA + 10].copy_from_slice(&CASCADES_DRAWN_OLD);
+        image[CASCADES_MODE_RVA..CASCADES_MODE_RVA + 10].copy_from_slice(&CASCADES_MODE_OLD);
+        for p in cascades(2).unwrap() {
+            assert!(write_image(&mut image, &p).is_ok());
+        }
         assert_eq!(&image[CASCADES_RVA..CASCADES_RVA + 8], &[0xb9, 2, 0, 0, 0, 0x83, 0xf8, 2]);
-        assert!(cascades(0).is_none() && cascades(4).is_none());
+        // the drawn count: only the immediate's low byte, the 1.0 beside it stays
+        assert_eq!(&image[CASCADES_DRAWN_RVA..CASCADES_DRAWN_RVA + 10], &[0x48, 0xb9, 2, 0, 0, 0, 0, 0, 0x80, 0x3f]);
+        assert_eq!(&image[CASCADES_MODE_RVA..CASCADES_MODE_RVA + 10], &[0xc7, 0x05, 0x17, 0xd4, 0xb5, 0x07, 2, 0, 0, 0]);
+        assert!(cascades(1).is_none() && cascades(4).is_none());
     }
 
     // the shipped exe's bytes at an rva (VICTORY_TITLE_EXE or the usual copy), if it is there
@@ -359,6 +383,8 @@ mod tests {
             return;
         };
         assert_eq!(found, CASCADES_OLD);
+        assert_eq!(title_bytes(CASCADES_DRAWN_RVA, 10).unwrap(), CASCADES_DRAWN_OLD);
+        assert_eq!(title_bytes(CASCADES_MODE_RVA, 10).unwrap(), CASCADES_MODE_OLD);
         assert_eq!(title_bytes(FFX_TYPE_RVA, 6).unwrap(), FFX_TYPE_OLD);
         assert_eq!(title_bytes(SHADOW_DIST_LEA_RVA, 7).unwrap(), SHADOW_DIST_LEA_OLD);
         assert_eq!(title_bytes(SHADOW_FAR_RVA, 9).unwrap(), SHADOW_FAR_OLD);
@@ -396,9 +422,11 @@ mod tests {
 
     #[test]
     fn cascades_patch_refuses_other_bytes() {
-        let mut image = vec![0x90u8; CASCADES_RVA + 0x20];
+        let mut image = vec![0x90u8; CASCADES_MODE_RVA + 0x20];
         let before = image.clone();
-        assert!(write_image(&mut image, &cascades(3).unwrap()).is_err());
+        for p in cascades(3).unwrap() {
+            assert!(write_image(&mut image, &p).is_err());
+        }
         assert_eq!(image, before);
     }
 
