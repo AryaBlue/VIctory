@@ -1761,6 +1761,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len);
+    if pages {
+        crate::texture_hold::landed(at as u64, len as u64);
+    }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`

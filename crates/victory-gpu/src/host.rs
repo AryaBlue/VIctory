@@ -8545,6 +8545,23 @@ impl Meter {
                     "picked textures that kept their last view since the last line (VICTORY_TEXTURE_KEEP=1):                      {kept_away} looks that found the memory unmapped, {kept_waiting} passes over a texture the worker had not made ready"
                 );
             }
+            let refusals = crate::texture_hold::ROOM[5].swap(0, Ordering::Relaxed);
+            if refusals > 0 {
+                let [used, buffers, targets, line, kept] =
+                    [0, 1, 2, 3, 4].map(|i| crate::texture_hold::ROOM[i].load(Ordering::Relaxed) >> 20);
+                tracing::info!(
+                    "room for textures refused {refusals} times since the last line; the last: the card's use                      {used} MB + kept {kept} MB (buffer copies not made {buffers} MB, targets not made {targets} MB)                      against the line {line} MB (VICTORY_ROOM_SETTLED=1 keeps a margin once targets stop growing)"
+                );
+            }
+            let [held, least, swept, same, same_bytes, changed, changed_bytes, handed_in, landings, unplaced, over, unmapped, zeros] =
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(|i| crate::texture_hold::STATS[i].swap(0, Ordering::Relaxed));
+            if held + least + swept + same + changed + zeros + landings > 0 {
+                tracing::info!(
+                    "host copies of filled textures since the last line: {same} made again with their memory as it                      was at the let-go ({:.0} MB), {changed} with it changed ({:.0} MB), {zeros} unmapped both times; held (VICTORY_TEXTURE_HOLD=1):                      {held} idle copies kept a sweep, {least} let go as least used past the soft line, {swept} let go                      past the hard line or as the title let them go ({unplaced} not placed, {over} placed over,                      {unmapped} first page unmapped); arrivals (VICTORY_TEXTURE_ARRIVE=1): {landings}                      DirectStorage writes landed on copies, {handed_in} textures handed to be read again",
+                    same_bytes as f64 / 1048576.0,
+                    changed_bytes as f64 / 1048576.0
+                );
+            }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
