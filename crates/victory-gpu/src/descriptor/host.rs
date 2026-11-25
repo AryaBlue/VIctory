@@ -2074,6 +2074,9 @@ impl HostHeap {
                 }
                 if let Some(held) = &held {
                     self.mirror_in(held, index, handle, false, &mut put_off);
+                    if batch_publish() && self.publish(held, index) {
+                        made_count(PUBLISHED_BATCH);
+                    }
                 }
             } else {
                 // past the heap: said as mirror says it, without the lock
@@ -2130,16 +2133,24 @@ impl HostHeap {
         let view = {
             let held = self.made.hold(index);
             let view = self.mirror_in(&held, index, handle, for_draw, &mut put_off);
-            if let (Some(ready), Some(key)) = (self.ready.get(index as usize), held.get(index))
-                && key != 0
-            {
-                // the slot's descriptor is written: later draws need no lock
-                ready.store(key, std::sync::atomic::Ordering::Release);
-            }
+            self.publish(&held, index);
             view
         };
         self.unmake_put_off(put_off);
         view
+    }
+
+    /// Publishes slot `index`'s made key, if it is made (under its lock,
+    /// right after [`HostHeap::mirror_in`]): the slot's descriptor is
+    /// written, so later draws need no lock. True if published.
+    fn publish(&self, held: &Held, index: u32) -> bool {
+        if let (Some(ready), Some(key)) = (self.ready.get(index as usize), held.get(index))
+            && key != 0
+        {
+            ready.store(key, std::sync::atomic::Ordering::Release);
+            return true;
+        }
+        false
     }
 
     /// With [`made_fast`]: the view at `handle` if slot `index` was made
@@ -2511,8 +2522,8 @@ fn sync_batch() -> bool {
 /// published keys withdrawn, by cause (the key changed under a mirror for
 /// a draw, or one of the heap's passes; the record is no view; unmade;
 /// forgotten; made again by levels on demand).
-static MADE_FAST_COUNTS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static MADE_FAST_COUNTS: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 const FAST_HIT: usize = 0;
 const FAST_UNPUBLISHED: usize = 1;
 const FAST_OTHER_VIEW: usize = 2;
@@ -2523,6 +2534,8 @@ const WITHDRAWN_NOT_A_VIEW: usize = 6;
 const WITHDRAWN_UNMAKE: usize = 7;
 const WITHDRAWN_FORGET: usize = 8;
 const WITHDRAWN_REMAKE: usize = 9;
+// keys published by the heap pass's batch path (VICTORY_MADE_BATCH_PUBLISH)
+const PUBLISHED_BATCH: usize = 10;
 
 fn made_count(i: usize) {
     MADE_FAST_COUNTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2539,7 +2552,7 @@ pub(crate) fn made_fast_line(frames: f64) {
     tracing::info!(
         "made keys without the lock (VICTORY_MADE_FAST) per frame: {:.0} hits; to the lock {:.0} (not published {:.0}, \
          another view at the handle {:.0}, view gone {:.0}); withdrawn: key changed under a draw {:.0}, under a heap \
-         pass {:.0}, no view {:.0}, unmade {:.0}, forgotten {:.0}, made again {:.0}",
+         pass {:.0}, no view {:.0}, unmade {:.0}, forgotten {:.0}, made again {:.0}; published by the batch path {:.0}",
         n[0],
         n[1] + n[2] + n[3],
         n[1],
@@ -2550,8 +2563,26 @@ pub(crate) fn made_fast_line(frames: f64) {
         n[6],
         n[7],
         n[8],
-        n[9]
+        n[9],
+        n[10]
     );
+}
+
+/// Whether the heap pass's batch path ([`HostHeap::mirror_due`] with
+/// `VICTORY_HEAP_SYNC_BATCH`) publishes the keys of the slots it makes, as
+/// [`HostHeap::mirror`] does (`VICTORY_MADE_BATCH_PUBLISH=1`; off by
+/// default, on in the tests).
+///
+/// Why: in tonight-4/5/6 the pass withdrew 3.5-4.9k published keys a frame
+/// (records the title really changed) and made the slots again without
+/// publishing them, so the next draw of each went to the lock as "not
+/// published", the largest class of misses at 8-10k a frame.
+fn batch_publish() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test)
+        || *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_MADE_BATCH_PUBLISH").is_some_and(|v| v == "1")
+        })
 }
 
 // the made keys' lock is one per STRIPE slots (VICTORY_MADE_STRIPES=1; on in the tests)
@@ -3845,6 +3876,52 @@ mod tests {
         publish(4);
         super::super::record(handle, View::Constant(0x2000, 256));
         assert!(heap.mirror_ready(4, handle).is_none());
+    }
+
+    /// VICTORY_MADE_BATCH_PUBLISH: the heap pass's batch path publishes
+    /// the slots it makes (a draw then answers without the lock) and not
+    /// those it leaves for later or finds no view in.
+    #[test]
+    fn the_batch_path_publishes_the_slots_it_makes() {
+        let Some(heap) = HostHeap::new(true, 8) else {
+            return; // no host GPU
+        };
+        // a point sampler that wraps, its largest LOD `lod`
+        let sampler = |lod: f32| {
+            let mut w = [0u32; 13];
+            w[1..4].fill(1);
+            w[6] = 1;
+            w[12] = lod.to_bits();
+            View::Sampler(w)
+        };
+        let mut records = [[0u32; 8]; 3];
+        let [h0, h1, h2] = records.each_mut().map(|r| r.as_mut_ptr() as u64);
+        super::super::record(h0, sampler(4.0));
+        super::super::record(h1, sampler(8.0));
+        let key_of = |h: u64| {
+            // SAFETY: a record written above (or zeros).
+            let [_, i, generation] = unsafe { (h as *const [u32; 3]).read_unaligned() };
+            u64::from(generation) << 32 | u64::from(i)
+        };
+        let ready = |slot: usize| heap.ready[slot].load(std::sync::atomic::Ordering::Acquire);
+        let count = |i: usize| MADE_FAST_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed);
+        let published = count(PUBLISHED_BATCH);
+        heap.mirror_due(&[(1, h0), (2, h1), (3, h2)], true);
+        assert_eq!(ready(1), key_of(h0));
+        assert_eq!(ready(2), key_of(h1));
+        assert_eq!(ready(3), 0, "no view: nothing published");
+        assert!(count(PUBLISHED_BATCH) >= published + 2);
+        let hits = count(FAST_HIT);
+        assert!(heap.mirror(1, h0, true).is_some());
+        assert!(count(FAST_HIT) > hits, "a draw answered without the lock");
+        // the title writes another view there: withdrawn, made and published again by the pass
+        super::super::record(h0, sampler(2.0));
+        heap.mirror_due(&[(1, h0)], true);
+        assert_eq!((ready(1), heap.made_key(1)), (key_of(h0), key_of(h0)));
+        // a constant buffer is left for its draw: not published
+        super::super::record(h1, View::Constant(0x4000, 256));
+        heap.mirror_due(&[(2, h1)], true);
+        assert_eq!(ready(2), 0);
     }
 
     // VICTORY_MADE_STRIPES: draws on several threads and two passes over the same pages leave every slot made from its record
