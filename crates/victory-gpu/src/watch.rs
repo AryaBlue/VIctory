@@ -90,7 +90,7 @@ struct Journal {
     /// [`ask_once_end`].
     kept: bool,
     // with fine_pages: which pieces of each page the last asking found written
-    pieces: BTreeMap<usize, Pieces>,
+    pieces: Pages<Pieces>,
     // with ask_lean: first pages of ranges the kernel turned down lately, and pre-askings since cleared
     refused: BTreeSet<usize>,
     refused_age: u32,
@@ -144,7 +144,7 @@ fn note(j: &mut Journal, page: usize, now: u64, mask: u16) {
         return;
     }
     let prev = prev.unwrap_or(0);
-    let e = j.pieces.entry(page).or_insert(Pieces { last: prev, older: prev, mask: u16::MAX });
+    let e = j.pieces.entry(page, Pieces { last: prev, older: prev, mask: u16::MAX });
     if e.last == now {
         e.mask |= mask;
     } else {
@@ -186,8 +186,22 @@ pub(crate) fn pieces(start: usize, end: usize) -> Vec<(usize, Pieces)> {
         return Vec::new();
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.pieces.range(first..last).map(|(&p, &v)| (p, v)).collect()
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.pieces.range(first, last)
+}
+
+/// The journal's 4 KiB piece notes kept flat as its pages are
+/// (`VICTORY_PIECES_FLAT=1`; off by default; with `VICTORY_FINE_PAGES=1`):
+/// each refresh's [`pieces`] is a slice copy, not a tree walk collected.
+fn pieces_flat() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIECES_FLAT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the write journal's piece notes are kept flat (VICTORY_PIECES_FLAT=1)");
+        }
+        on
+    })
 }
 
 // the pieces of a page a copy stamped `since` lacks, given the page's last write and its noted pieces
@@ -200,12 +214,12 @@ pub(crate) fn pieces_needed(since: u64, write: u64, noted: Option<Pieces>) -> u1
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: Pages::new(),
+    written: Pages::new(journal_flat),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
-    pieces: BTreeMap::new(),
+    pieces: Pages::new(pieces_flat),
     refused: BTreeSet::new(),
     refused_age: 0,
 });
@@ -610,38 +624,52 @@ const FRESH_MOST: usize = 1024;
 
 /// Page number → the asking that last found it written; a tree, or with
 /// [`journal_flat`] a sorted vec and the pages not merged into it yet.
-struct Pages {
-    tree: BTreeMap<usize, u64>,
-    flat: Vec<(usize, u64)>,
-    fresh: BTreeMap<usize, u64>,
+struct Pages<V: Copy = u64> {
+    tree: BTreeMap<usize, V>,
+    flat: Vec<(usize, V)>,
+    fresh: BTreeMap<usize, V>,
     // decided at the first use (tests set it)
     mode: u8,
+    // the switch that keeps this one flat
+    switch: fn() -> bool,
 }
 
-impl Pages {
-    const fn new() -> Self {
+impl<V: Copy> Pages<V> {
+    const fn new(switch: fn() -> bool) -> Self {
         Pages {
             tree: BTreeMap::new(),
             flat: Vec::new(),
             fresh: BTreeMap::new(),
             mode: 0,
+            switch,
         }
     }
 
     fn is_flat(&mut self) -> bool {
         if self.mode == 0 {
-            self.mode = if journal_flat() { 2 } else { 1 };
+            self.mode = if (self.switch)() { 2 } else { 1 };
         }
         self.mode == 2
     }
 
-    fn insert(&mut self, page: usize, now: u64) -> Option<u64> {
+    fn insert(&mut self, page: usize, now: V) -> Option<V> {
         if !self.is_flat() {
             return self.tree.insert(page, now);
         }
         match self.flat.binary_search_by_key(&page, |e| e.0) {
             Ok(i) => Some(std::mem::replace(&mut self.flat[i].1, now)),
             Err(_) => self.fresh.insert(page, now),
+        }
+    }
+
+    /// The page's value, `new` put in first if it has none.
+    fn entry(&mut self, page: usize, new: V) -> &mut V {
+        if !self.is_flat() {
+            return self.tree.entry(page).or_insert(new);
+        }
+        match self.flat.binary_search_by_key(&page, |e| e.0) {
+            Ok(i) => &mut self.flat[i].1,
+            Err(_) => self.fresh.entry(page).or_insert(new),
         }
     }
 
@@ -662,13 +690,15 @@ impl Pages {
                 (None, Some(_)) => false,
                 (None, None) => break,
             };
-            out.push(if take_a { a.next() } else { b.next() }.unwrap_or_default());
+            if let Some(e) = if take_a { a.next() } else { b.next() } {
+                out.push(e);
+            }
         }
         self.flat = out;
     }
 
     /// The pages in `[first, last)` with their askings, in page order.
-    fn range(&mut self, first: usize, last: usize) -> Vec<(usize, u64)> {
+    fn range(&mut self, first: usize, last: usize) -> Vec<(usize, V)> {
         if !self.is_flat() {
             return self.tree.range(first..last).map(|(&p, &w)| (p, w)).collect();
         }
@@ -1758,7 +1788,7 @@ mod tests {
     /// tree does, through new pages, rewrites and merges in any order.
     #[test]
     fn a_flat_journal_answers_as_the_tree_does() {
-        let (mut tree, mut flat) = (Pages::new(), Pages::new());
+        let (mut tree, mut flat) = (Pages::<u64>::new(journal_flat), Pages::<u64>::new(journal_flat));
         tree.mode = 1;
         flat.mode = 2;
         let mut seed = 0x9e37_79b9u32;
@@ -1781,12 +1811,49 @@ mod tests {
         assert!(flat.range(5, 5).is_empty() && flat.range(9, 3).is_empty());
     }
 
+    /// VICTORY_PIECES_FLAT: piece notes kept flat take the same updates
+    /// through `entry` and answer every range as the tree does.
+    #[test]
+    fn flat_piece_notes_answer_as_the_tree_does() {
+        let (mut tree, mut flat) = (Pages::<Pieces>::new(pieces_flat), Pages::<Pieces>::new(pieces_flat));
+        tree.mode = 1;
+        flat.mode = 2;
+        let mut seed = 0x2545_f491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        let key = |v: Vec<(usize, Pieces)>| v.into_iter().map(|(p, x)| (p, x.last, x.older, x.mask)).collect::<Vec<_>>();
+        for now in 1..5000u64 {
+            let page = next() % 2500;
+            let mask = (next() & 0xffff) as u16;
+            for t in [&mut tree, &mut flat] {
+                let e = t.entry(page, Pieces { last: now - 1, older: now - 1, mask: u16::MAX });
+                if e.last == now {
+                    e.mask |= mask;
+                } else {
+                    e.older = e.last;
+                    e.last = now;
+                    e.mask = mask;
+                }
+            }
+            if now % 5 == 0 {
+                let a = next() % 2600;
+                let b = a + next() % 300;
+                assert_eq!(key(tree.range(a, b)), key(flat.range(a, b)), "range {a}..{b}");
+            }
+        }
+        assert_eq!(key(tree.range(0, usize::MAX)), key(flat.range(0, usize::MAX)));
+    }
+
     /// offline numbers: a 40k-page journal, ranges of 2,700 pages (the heap)
     #[test]
     #[ignore]
     fn bench_journal_ranges() {
         for mode in [1u8, 2] {
-            let mut j = Pages::new();
+            let mut j = Pages::<u64>::new(journal_flat);
             j.mode = mode;
             for page in 0..40_000usize {
                 j.insert(page * 3, 1);
