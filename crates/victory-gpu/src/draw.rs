@@ -124,7 +124,7 @@ fn write_skip() -> bool {
 /// the first in that copy, how many, and the list's scratch buffer that
 /// holds them clamped, record `i` at `i * step`.
 #[derive(Clone)]
-struct Window {
+struct Window<S = ID3D12Resource> {
     copy: u64,
     kind: u32,
     stride: u32,
@@ -133,7 +133,43 @@ struct Window {
     step: u32,
     base: u64,
     records: u32,
-    scratch: ID3D12Resource,
+    scratch: S,
+    /// Where the window's first record is in the scratch buffer, and the
+    /// ring epoch it was clamped in (0 without [`windows_many`]).
+    at: u64,
+    epoch: u64,
+}
+
+/// `VICTORY_WINDOWS_MANY=1`: every clamp of a list takes a region of the
+/// scratch buffer of its own (`HostList::indirect_ring`), so a list keeps up
+/// to [`WINDOWS_KEPT`] windows open at once: draws that switch between
+/// argument buffers, and calls clamped alone (a count buffer, several
+/// records), no longer end the others. Off by default.
+fn windows_many() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_MANY").is_some_and(|v| v == "1"))
+}
+
+/// The most windows a list keeps open with [`windows_many`].
+const WINDOWS_KEPT: usize = 8;
+
+/// The most with `VICTORY_CLAMP_BATCH` too: a batch opens a segment's windows at once.
+const WINDOWS_KEPT_BATCHED: usize = 64;
+
+/// Where record `offset` is in the scratch buffer if one of `windows`
+/// (oldest first) holds it: the window's index and the record's offset there.
+/// Windows of another epoch than `epoch` hold nothing any more.
+fn window_hit<S>(windows: &[Window<S>], copy: u64, kind: u32, stride: u32, offset: u64, epoch: u64) -> Option<(usize, u64)> {
+    windows.iter().enumerate().rev().find_map(|(i, w)| {
+        let inside = w.copy == copy
+            && w.kind == kind
+            && w.stride == stride
+            && w.epoch == epoch
+            && offset >= w.base
+            && (offset - w.base) % u64::from(w.step) == 0
+            && (offset - w.base) / u64::from(w.step) < u64::from(w.records);
+        inside.then(|| (i, w.at + (offset - w.base)))
+    })
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -190,6 +226,21 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
 }
 
+/// `VICTORY_WINDOW_KEEP=1`: a direct draw or mesh dispatch whose shaders store
+/// to no buffer leaves the window of clamped records open (it cannot change
+/// the arguments, and it does not use the scratch buffer); before, every
+/// direct draw ended it and the next indirect draw was clamped alone.
+fn keep_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// Whether a direct draw ends the window: always without the switch, else
+/// when its shaders may store (or its pipeline is not known).
+fn draw_ends_window(keep: bool, stores: Option<bool>) -> bool {
+    !keep || stores.is_none_or(|s| s)
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -221,8 +272,10 @@ pub(crate) struct State {
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
-    /// them ([`windows`]).
-    window: Option<Window>,
+    /// them ([`windows`]); several with [`windows_many`], oldest first.
+    window: Vec<Window>,
+    /// The segment of windows the list is in (`crate::clamp_batch`).
+    segment: crate::clamp_batch::Segment,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1210,6 +1263,8 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Binds, 1);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1226,6 +1281,8 @@ impl State {
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HeapSets, 1);
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -1248,6 +1305,8 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RootSigSets, 1);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1255,6 +1314,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PsoSets, 1);
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
@@ -2356,10 +2417,35 @@ impl State {
         });
     }
 
+    /// A direct draw is about to be recorded: ends the window of clamped
+    /// records unless [`keep_windows`] lets it stay.
+    fn end_window_for_draw(&mut self) {
+        let stores = || {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .map(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        };
+        if draw_ends_window(keep_windows(), if keep_windows() { stores() } else { None }) {
+            self.end_windows();
+        }
+    }
+
+    /// The windows end (they may be written, or another list began): the segment's plan
+    /// is kept for its head (`crate::clamp_batch`).
+    fn end_windows(&mut self) {
+        self.window.clear();
+        if let Some((key, plan, unread)) = self.segment.end() {
+            crate::clamp_batch::STATS[3].fetch_add(unread as u64, Ordering::Relaxed);
+            if !plan.is_empty() {
+                crate::clamp_batch::STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            crate::clamp_batch::keep(key, plan);
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.end_windows();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2669,7 +2755,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.end_window_for_draw();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3060,7 +3146,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window_for_draw();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3165,7 +3251,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.end_window_for_draw();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3305,18 +3391,27 @@ impl State {
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
-            self.window = None;
+        let many = windows_many();
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        // With many windows a call clamped alone takes a region of its own and
+        // ends no window, unless it may write the arguments.
+        let ends = !windowed && (!many || kind == DISPATCH || stores);
+        let fresh = list.first_use(WINDOW_USE);
+        if fresh || ends {
+            self.end_windows();
         }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        if fresh {
+            self.segment.new_list();
+        }
+        let epoch = if many { list.ring_epoch() } else { 0 };
+        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride && w.epoch == epoch;
+        let hit = window_hit(&self.window, args.id(), kind, stride, offset, epoch)
+            .map(|(i, at)| (self.window[i].scratch.clone(), at, self.window[i].step));
         let (bounded, at) = match hit {
             Some((scratch, at, step)) => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WindowHits, 1);
+                self.segment.read(args.id(), offset);
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3338,8 +3433,8 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
+                let (step, records) = match self.window.iter().rev().find(|w| same(w)) {
+                    Some(w) if windowed => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = offset.saturating_sub(last);
                         let walks = step >= u64::from(stride)
@@ -3365,28 +3460,114 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    if kind == DISPATCH {
+                        crate::copystat::C::ClampDispatch
+                    } else if max != 1 || count.is_some() {
+                        crate::copystat::C::ClampCounted
+                    } else if stores {
+                        crate::copystat::C::ClampStores
+                    } else {
+                        crate::copystat::C::ClampMiss
+                    },
+                    1,
+                );
+                let ahead = windowed && records > 1;
+                // with VICTORY_CLAMP_BATCH a segment's first clamp brings along the windows the
+                // same segment read last time, in one compute pass
+                let batch = crate::clamp_batch::on() && many && windowed;
+                let mut head_now = false;
+                let mut batched = None;
+                if batch && !self.segment.open() {
+                    head_now = true;
+                    let key = self.segment.begin((self.pipeline as usize, kind, stride), args.id(), offset);
+                    if let Some(plan) = crate::clamp_batch::plan(key) {
+                        let fits: Vec<crate::clamp_batch::Planned> = plan
+                            .into_iter()
+                            .filter(|p| {
+                                let at = offset as i64 + p.delta;
+                                let address = arguments as i64 + p.delta;
+                                let bytes = u64::from(p.step) * u64::from(p.records);
+                                at >= 0
+                                    && address > 0
+                                    && args.left(address as u64) >= bytes
+                                    && window_hit(&self.window, args.id(), kind, stride, at as u64, epoch).is_none()
+                            })
+                            .collect();
+                        if !fits.is_empty() {
+                            for p in &fits {
+                                let bytes = u64::from(p.step) * u64::from(p.records);
+                                args.refresh(list, (arguments as i64 + p.delta) as u64, bytes);
+                            }
+                            let mut jobs = vec![((&args.buffer, offset), (kind, step, records), ahead)];
+                            jobs.extend(fits.iter().map(|p| {
+                                ((&args.buffer, (offset as i64 + p.delta) as u64), (kind, p.step, p.records), p.records > 1)
+                            }));
+                            if let Some((buffer, epoch, ats)) = crate::indirect::bound_batch_in_ring(list, &jobs) {
+                                crate::clamp_batch::STATS[0].fetch_add(1, Ordering::Relaxed);
+                                crate::clamp_batch::STATS[1].fetch_add(fits.len() as u64, Ordering::Relaxed);
+                                batched = Some((buffer, ats, epoch, fits));
+                            }
+                        }
+                    }
+                }
+                let bounded = if let Some((buffer, ats, epoch, fits)) = batched {
+                    // the plan's windows go in before the head's, which is looked up first
+                    for (p, &at) in fits.iter().zip(&ats[1..]) {
+                        let base = (offset as i64 + p.delta) as u64;
+                        self.window.push(Window {
+                            copy: args.id(),
+                            kind,
+                            stride,
+                            step: p.step,
+                            base,
+                            records: p.records,
+                            scratch: buffer.clone(),
+                            at,
+                            epoch,
+                        });
+                        self.segment.note(args.id(), base, p.step, p.records, false);
+                    }
+                    Some((buffer, ats[0], epoch))
+                } else if many {
+                    crate::indirect::bound_in_ring(list, (&args.buffer, offset), count_arg, (kind, step, records), ahead)
+                } else if ahead {
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records)).map(|b| (b, 0, 0))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)).map(|b| (b, 0, 0))
                 };
-                let Some(bounded) = bounded else {
-                    self.window = None;
+                let Some((bounded, at, epoch)) = bounded else {
+                    self.end_windows();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                if batch && !head_now {
+                    self.segment.note(args.id(), offset, step, records, true);
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
+                if !many {
+                    self.end_windows();
+                }
+                if windowed {
+                    self.window.push(Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                        at,
+                        epoch,
+                    });
+                    let kept = if crate::clamp_batch::on() { WINDOWS_KEPT_BATCHED } else { WINDOWS_KEPT };
+                    while self.window.len() > kept {
+                        self.window.remove(0);
+                    }
+                }
+                (bounded, at)
             }
         };
         let ran = match kind {
@@ -3406,6 +3587,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Executes, 1);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3789,5 +3972,51 @@ mod range_cache_tests {
         // the copy let go: only the cache holds it
         drop(listed);
         assert!(super::cached_range(&cache, 7, 5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    #[test]
+    fn a_draw_that_stores_nothing_keeps_the_window_only_when_asked() {
+        // without the switch every direct draw ends it, as before
+        assert!(super::draw_ends_window(false, Some(false)));
+        assert!(!super::draw_ends_window(true, Some(false)));
+        assert!(super::draw_ends_window(true, Some(true)));
+        // a pipeline not known: it may store
+        assert!(super::draw_ends_window(true, None));
+    }
+
+    #[test]
+    fn records_are_found_in_any_window_of_the_current_epoch() {
+        let w = |copy: u64, base: u64, at: u64, epoch: u64| super::Window {
+            copy,
+            kind: 10,
+            stride: 12,
+            step: 32,
+            base,
+            records: 16,
+            scratch: (),
+            at,
+            epoch,
+        };
+        let windows = [w(1, 0x100, 0, 5), w(2, 0x4000, 0x400, 5)];
+        // the third record of the first window, then the second window's first
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x140, 5), Some((0, 0x40)));
+        assert_eq!(super::window_hit(&windows, 2, 10, 12, 0x4000, 5), Some((1, 0x400)));
+        // not on the step, past the end, another kind, an old epoch
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x110, 5), None);
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x100 + 16 * 32, 5), None);
+        assert_eq!(super::window_hit(&windows, 1, 2, 12, 0x140, 5), None);
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x140, 6), None);
+    }
+
+    #[test]
+    fn the_scratch_ring_goes_round_into_a_new_epoch() {
+        let mut ring = (0, 1);
+        assert_eq!(crate::indirect::ring_take(&mut ring, 256, 1024, || 2), (0, 1));
+        assert_eq!(crate::indirect::ring_take(&mut ring, 512, 1024, || 2), (256, 1));
+        assert_eq!(crate::indirect::ring_take(&mut ring, 512, 1024, || 2), (0, 2));
+        assert_eq!(ring, (512, 2));
     }
 }

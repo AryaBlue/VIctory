@@ -503,6 +503,23 @@ fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
     }
 }
 
+static CODE_PATCH: std::sync::OnceLock<fn(&mut Vec<u8>)> = std::sync::OnceLock::new();
+
+/// Installs a rewrite of every program's machine code as it is read, for
+/// diagnostics (the first one installed stays).
+pub fn set_code_patch(f: fn(&mut Vec<u8>)) {
+    let _ = CODE_PATCH.set(f);
+}
+
+fn patched(code: &[u8]) -> Vec<u8> {
+    let mut code = code.to_vec();
+    if let Some(f) = CODE_PATCH.get() {
+        f(&mut code);
+    }
+    code
+}
+
+
 fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if fssm.get(0..4) != Some(b"FSSM") {
         return Err(Malformed("native blob lacks FSSM magic"));
@@ -596,7 +613,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             layout,
             used,
             io,
-            code: code.to_vec(),
+            code: patched(code),
         });
     }
     Ok(out)

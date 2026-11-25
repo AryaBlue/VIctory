@@ -188,6 +188,14 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
+    // VICTORY_CULL_PASSALL: the patched cull shaders skip the cache both ways
+    #[cfg(feature = "diagnostics")]
+    let host = if crate::cullpass::wanted(container) {
+        victory_shader::emit::translate(container).map_err(|e| e.to_string())?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
+    #[cfg(not(feature = "diagnostics"))]
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs

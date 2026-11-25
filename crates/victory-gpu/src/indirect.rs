@@ -366,6 +366,39 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// [`bound`] or (`ahead`) [`bound_ahead`] into a region of the scratch
+/// buffer of its own (`HostList::indirect_ring`), so that what earlier
+/// clamps of the recording left stays readable: the buffer, the region's
+/// offset and its epoch.
+pub(crate) fn bound_in_ring(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64, u64)> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, at, epoch) = list.indirect_ring(bytes)?;
+    let before = list.indirect_state(&dst);
+    let recorded = record_clamp_at(c, &list.list, (&dst, at, before), budget, src, count, spec, ahead);
+    if recorded {
+        list.indirect_readable(&dst);
+    }
+    recorded.then_some((dst, at, epoch))
+}
+
+/// Takes `size` bytes from a ring cursor `(used, epoch)` over `cap` bytes:
+/// the offset and the epoch; going round starts a new epoch (`next`).
+pub(crate) fn ring_take(ring: &mut (u64, u64), size: u64, cap: u64, next: impl FnOnce() -> u64) -> (u64, u64) {
+    if ring.0 + size > cap {
+        *ring = (0, next());
+    }
+    let at = ring.0;
+    ring.0 += size;
+    (at, ring.1)
+}
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
@@ -399,55 +432,93 @@ fn record_clamp_as(
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
-    (src, src_offset): (&ID3D12Resource, u64),
+    src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
-    (kind, stride, records): (u32, u32, u32),
+    spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    let Some(bytes) = validate_layout(
-        (kind, stride, records),
-        src_offset,
-        count.map(|(_, off)| off),
-    ) else {
-        return false;
-    };
+    record_clamp_at(c, l, (dst, 0, before), budget, src, count, spec, ahead)
+}
+
+/// [`record_clamp_as`] into `dst` from byte `dst_offset` on.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_at(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, dst_offset, before): (&ID3D12Resource, u64, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamps_at(c, l, (dst, before), budget, &[ClampJob { dst_offset, src, count, spec, ahead }])
+}
+
+/// One clamp of [`record_clamps_at`]: where it writes in the scratch buffer, its records'
+/// source, count buffer, layout (kind, stride, records), and whether they are a window
+/// clamped ahead.
+pub(crate) struct ClampJob<'a> {
+    pub(crate) dst_offset: u64,
+    pub(crate) src: (&'a ID3D12Resource, u64),
+    pub(crate) count: Option<(&'a ID3D12Resource, u64)>,
+    pub(crate) spec: (u32, u32, u32),
+    pub(crate) ahead: bool,
+}
+
+/// A job's root constants and addresses: constants, source, count and destination GPU
+/// addresses; `None` if its layout or addresses do not fit the clamp.
+fn job_roots(dst: &ID3D12Resource, job: &ClampJob) -> Option<([u32; 6], u64, u64, u64)> {
+    let (kind, stride, records) = job.spec;
+    let (src, src_offset) = job.src;
+    let bytes = validate_layout(job.spec, src_offset, job.count.map(|(_, off)| off))?;
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return false;
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + job.dst_offset) };
+    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) {
+        return None;
     }
     let (src_gpu, args_offset) = match src_offset
         .checked_add(bytes)
         .filter(|&end| end <= u64::from(u32::MAX))
     {
         Some(_) => (src_base, src_offset as u32),
-        None => {
-            let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
-            };
-            (rebased, 0)
-        }
+        None => (src_base.checked_add(src_offset)?, 0),
     };
-    let (count_gpu, has_count, count_offset) = match count {
+    let (count_gpu, has_count, count_offset) = match job.count {
         Some((buf, off)) => {
             // SAFETY: a live D3D12 buffer resource.
             let base = unsafe { buf.GetGPUVirtualAddress() };
             if !base.is_multiple_of(4) {
-                return false;
+                return None;
             }
             match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
                 Some(_) => (base, 1u32, off as u32),
-                None => {
-                    let Some(rebased) = base.checked_add(off) else {
-                        return false;
-                    };
-                    (rebased, 1u32, 0u32)
-                }
+                None => (base.checked_add(off)?, 1u32, 0u32),
             }
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(job.ahead) << 1), count_offset];
+    Some((constants, src_gpu, count_gpu, dst_gpu))
+}
+
+/// Records the clamps `jobs` into regions of `dst` (in state `before`) with one pair of
+/// waits around them all: the dispatches run back to back and write disjoint regions,
+/// and `dst` is left in `INDIRECT_ARGUMENT`. False, with nothing recorded, if any job's
+/// layout or addresses do not fit the clamp.
+fn record_clamps_at(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    jobs: &[ClampJob],
+) -> bool {
+    if !budget.is_multiple_of(4) {
+        return false;
+    }
+    let Some(roots) = jobs.iter().map(|job| job_roots(dst, job)).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -457,7 +528,7 @@ fn record_clamp_as(
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    crate::copystat::add(crate::copystat::C::IndirectBounded, jobs.len() as u64);
     #[cfg(feature = "diagnostics")]
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
@@ -478,19 +549,60 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
+        let mut bound = false;
+        for (job, (constants, src_gpu, count_gpu, dst_gpu)) in jobs.iter().zip(&roots) {
+            let records = job.spec.2;
+            if records == 0 {
+                continue;
+            }
+            if !bound {
+                l.SetComputeRootSignature(&c.root);
+                l.SetPipelineState(&c.pso);
+                bound = true;
+            }
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootShaderResourceView(1, *src_gpu);
+            l.SetComputeRootShaderResourceView(2, *count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, *dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
     true
+}
+
+/// [`bound_in_ring`] for several windows at once (`crate::clamp_batch`): one region of the
+/// ring for them all, one pair of waits, the dispatches back to back. Each job is
+/// (source, layout, ahead); returns the buffer, the epoch and each job's offset.
+pub(crate) fn bound_batch_in_ring(
+    list: &HostList,
+    jobs: &[((&ID3D12Resource, u64), (u32, u32, u32), bool)],
+) -> Option<(ID3D12Resource, u64, Vec<u64>)> {
+    let sizes = jobs
+        .iter()
+        .map(|&(src, spec, _)| validate_layout(spec, src.1, None).map(|b| b.next_multiple_of(256)))
+        .collect::<Option<Vec<u64>>>()?;
+    let total: u64 = sizes.iter().sum();
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, at, epoch) = list.indirect_ring(total)?;
+    let mut offsets = Vec::with_capacity(jobs.len());
+    let mut next = at;
+    for size in &sizes {
+        offsets.push(next);
+        next += size;
+    }
+    let made: Vec<ClampJob> = jobs
+        .iter()
+        .zip(&offsets)
+        .map(|(&(src, spec, ahead), &dst_offset)| ClampJob { dst_offset, src, count: None, spec, ahead })
+        .collect();
+    let before = list.indirect_state(&dst);
+    if !record_clamps_at(c, &list.list, (&dst, before), budget, &made) {
+        return None;
+    }
+    list.indirect_readable(&dst);
+    Some((dst, epoch, offsets))
 }
 
 /// Whether every draw served from a window is checked against a fresh
@@ -1381,6 +1493,70 @@ void main() {
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
     /// to the most and spend the budget.
+    // VICTORY_CLAMP_BATCH: windows clamped in one batch come out as each clamped on its own
+    #[test]
+    fn warp_a_batch_of_clamps_writes_each_window_as_its_own_clamp_would() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 32;
+        const RECORDS: u32 = 8;
+        let total = (STRIDE * RECORDS * 3) as usize;
+        let mut src = vec![0u8; total];
+        for i in 0..(RECORDS * 3) as usize {
+            let words = [1 + i as u32, 1, 1, 0xBE00 + i as u32];
+            for (w, word) in words.into_iter().enumerate() {
+                let at = i * STRIDE as usize + w * 4;
+                src[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // two windows of the source, the first and the third third, into regions 0 and 512
+        let windows = [(0u64, 0u64), (u64::from(2 * STRIDE * RECORDS), 512u64)];
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(1024);
+        let dst_buf = warp.default_uav(1024);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 1024);
+        }
+        let jobs: Vec<ClampJob> = windows
+            .iter()
+            .map(|&(from, to)| ClampJob { dst_offset: to, src: (&src_buf, from), count: None, spec: (KIND_MESH, STRIDE, RECORDS), ahead: true })
+            .collect();
+        assert!(record_clamps_at(&warp.clamp, &warp.list, (&dst_buf, D3D12_RESOURCE_STATE_COMMON), budget_gpu, &jobs));
+        // SAFETY: an open list; the scratch buffer is left readable as arguments.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 1024);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 256).to_vec(),
+            )
+        };
+        let mut charged = 0;
+        for &(from, to) in &windows {
+            for r in 0..RECORDS as usize {
+                let i = from as usize / STRIDE as usize + r;
+                let at = to as usize / 4 + r * (STRIDE as usize / 4);
+                assert_eq!(out[at..at + 4], [1 + i as u32, 1, 1, 0xBE00 + i as u32], "record {r} of the window from {from:#x}");
+                charged += (1 + i as u32) * 128;
+            }
+        }
+        assert_eq!(spent, charged, "both windows charge the budget");
+    }
+
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
         let Some(mut warp) = WarpHarness::new() else {

@@ -2001,6 +2001,10 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// With `VICTORY_WINDOWS_MANY`: the bytes of the scratch buffer handed out
+    /// to clamps in this recording, and the epoch of what they hold (a new one
+    /// whenever the buffer is replaced or the cursor goes round).
+    ring: (u64, u64),
 }
 
 impl Deferred {
@@ -6127,6 +6131,10 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                #[cfg(feature = "diagnostics")]
+                if before != wanted {
+                    crate::copystat::add(crate::copystat::C::Transitions, 1);
+                }
                 (before != wanted).then_some((texture, before))
             }
         }
@@ -6742,6 +6750,39 @@ impl HostList {
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
+    /// A region of `size` bytes of the scratch buffer that no other clamp of
+    /// this recording holds until the cursor goes round: the buffer, the
+    /// region's offset, and the epoch the region belongs to (records clamped
+    /// in an older epoch may be overwritten). The card orders a clamp after
+    /// every earlier execution's reads, so going round only matters to the
+    /// windows that remember what a region holds.
+    pub(crate) fn indirect_ring(&self, size: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        static EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        const RING: u64 = 1 << 20;
+        let size = size.next_multiple_of(256);
+        let have = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| (s.0.clone(), s.1));
+        let (buffer, cap) = match have {
+            Some((b, cap)) if cap >= size.max(RING) => (b, cap),
+            _ => {
+                let b = self.indirect_scratch(size.max(RING))?;
+                let cap = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.1);
+                self.deferred().ring = (0, EPOCHS.fetch_add(1, Ordering::Relaxed));
+                (b, cap)
+            }
+        };
+        let mut d = self.deferred();
+        if d.ring.1 == 0 {
+            d.ring.1 = EPOCHS.fetch_add(1, Ordering::Relaxed);
+        }
+        let (at, epoch) = crate::indirect::ring_take(&mut d.ring, size, cap, || EPOCHS.fetch_add(1, Ordering::Relaxed));
+        Some((buffer, at, epoch))
+    }
+
+    /// The epoch of the scratch ring's regions (`indirect_ring`) in this recording.
+    pub(crate) fn ring_epoch(&self) -> u64 {
+        self.deferred().ring.1
+    }
+
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
@@ -7742,6 +7783,12 @@ impl Meter {
                     each(asking),
                     each(views),
                     each(uploads)
+                );
+            }
+            let [batches, planned, plans, unread] = [0, 1, 2, 3].map(|i| crate::clamp_batch::STATS[i].swap(0, Ordering::Relaxed));
+            if batches + plans > 0 {
+                tracing::info!(
+                    "indirect clamps batched since the last line (VICTORY_CLAMP_BATCH=1): {batches} batches with {planned} windows clamped ahead,                      {plans} plans kept, {unread} planned windows no draw read"
                 );
             }
             let [handed, made, refused, worked] = [0, 1, 2, 3].map(|i| crate::texture_worker::STATS[i].swap(0, Ordering::Relaxed));
