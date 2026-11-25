@@ -19,6 +19,37 @@ pub(super) fn wide() -> bool {
     })
 }
 
+/// `VICTORY_MERGE_DENSE=1` (off by default): the plain merge
+/// ([`Shadow::merge_dense`]) compares a page a word at a time straight into
+/// masked dwords or runs, with no byte runs in between and its counts
+/// added once a page.
+///
+/// Why: in fast-15s the "asking once" stage was 37-47 ms a frame, most of
+/// it this merge over 241-286 pages with 356,000-512,000 changed runs of
+/// about 6 bytes (some 1,400 a page): a byte-by-byte run list, its dword
+/// masks byte by byte, and per run a copy, a lock of the dirty list and
+/// two counters.
+pub(super) fn dense() -> bool {
+    #[cfg(test)]
+    if DENSE.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MERGE_DENSE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("title pages under flights' shader writes go straight from the word compare to masks or runs (VICTORY_MERGE_DENSE=1)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    // a test's plain merges take the dense way
+    static DENSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // pages held under one lock of the reference
 const BATCH: usize = 64;
 // pages to a piece of work
@@ -197,6 +228,58 @@ struct Scan {
 static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 impl Shadow {
+    /// With [`dense`], [`Shadow::merge_stale`]'s work for the page read
+    /// into `title` at copy offset `at`, under the reference's lock
+    /// (`before`): the same bytes go to the same places, and the same
+    /// entries, runs and counts are noted. Whether the flights must
+    /// settle.
+    pub(super) fn merge_dense(&self, at: usize, title: &[u8], before: &mut Option<Vec<u8>>, runs_left: &mut usize, masked: bool) -> bool {
+        let n = title.len();
+        let counted = |count: usize, bytes: usize| {
+            MERGED[1].fetch_add(count as u64, Ordering::Relaxed);
+            MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+        };
+        if let Some(c) = &self.card {
+            // SAFETY: inside the mapping of the copy's CPU side, which only the submitting thread writes.
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            if masked {
+                let mut entries = Vec::new();
+                let (count, bytes) = masks(at, title, held, &mut entries);
+                let mut notes = c.masked.lock().unwrap_or_else(|e| e.into_inner());
+                if notes.pending.len() + entries.len() <= crate::card_mask::MOST {
+                    notes.pending.extend_from_slice(&entries);
+                    drop(notes);
+                    // the bytes outside the masks are equal already
+                    held.copy_from_slice(title);
+                    counted(count, bytes);
+                    return false;
+                }
+            }
+            let runs = joined_over(runs(title, held), merge_gap());
+            if runs.len() > *runs_left {
+                return true;
+            }
+            *runs_left -= runs.len();
+            held.copy_from_slice(title);
+            dirty_runs(&mut c.dirty.lock().unwrap_or_else(|e| e.into_inner()), at, &runs);
+            counted(runs.len(), runs.iter().map(|r| r.1).sum());
+            return false;
+        }
+        let Some(snapshot) = before.as_mut() else {
+            return true;
+        };
+        // SAFETY: the snapshot's allocation holds the copy's bytes at the copy's offsets.
+        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+        let runs = runs(title, held);
+        for &(r, m) in &runs {
+            // SAFETY: inside the copy's mapping; only the changed bytes, as the card may be writing beside them.
+            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+        }
+        held.copy_from_slice(title);
+        counted(runs.len(), runs.iter().map(|r| r.1).sum());
+        false
+    }
+
     /// [`Shadow::merge_stale`] with the switch: pages are read and compared
     /// `BATCH` at a time under one lock of the reference, on the wide
     /// threads, then taken in order as the plain merge takes them.
@@ -368,7 +451,7 @@ impl Shadow {
 #[cfg(test)]
 mod tests {
     use super::super::{Card, Shadow, changed_runs};
-    use super::{PAGE, masks, runs};
+    use super::{DENSE, PAGE, masks, runs};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -554,6 +637,22 @@ mod tests {
         runs_left: usize,
         wide: bool,
     ) -> (Outcome, f64) {
+        merge_way(buffer, title, held, kind, ranges, runs_left, wide, false)
+    }
+
+    // the plain merge the byte way or the dense way (`dense`), or the wide one
+    #[allow(clippy::too_many_arguments)]
+    fn merge_way(
+        buffer: &ID3D12Resource,
+        title: &Title,
+        held: &[u8],
+        kind: Kind,
+        ranges: &[(usize, usize)],
+        runs_left: usize,
+        wide: bool,
+        dense: bool,
+    ) -> (Outcome, f64) {
+        DENSE.with(|d| d.set(dense));
         let mut side = held.to_vec();
         let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.start as u64, title.len as u64);
         let card = matches!(kind, Kind::Card | Kind::Masked);
@@ -593,6 +692,7 @@ mod tests {
             }
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
+        DENSE.with(|d| d.set(false));
         let card = shadow.card.take();
         let out = Outcome {
             settle,
@@ -637,6 +737,69 @@ mod tests {
         assert!(plain.settle);
     }
 
+    /// VICTORY_MERGE_DENSE: the dense way puts, notes and counts what the
+    /// byte way does, over pages sparse and dense, whole pages rewritten,
+    /// ranges that end at and inside pages, and every kind of copy.
+    #[test]
+    fn the_dense_merge_puts_what_the_byte_merge_puts() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        let title = Title::new();
+        let mut rng = Rng(0x0dd5_eed5_1234_8765);
+        let held: Vec<u8> = (0..title.len).map(|_| rng.next() as u8).collect();
+        title.bytes().copy_from_slice(&held);
+        // per page: untouched, a few runs, or dense (about 1,400 a page, as fast-15s)
+        for page in 0..PAGES - 2 {
+            let density = match page % 4 {
+                0 => 0,
+                1 => 1 + rng.next() % 8,
+                2 => 1 + rng.next() % 200,
+                _ => 1_400,
+            };
+            let lo = page * PAGE;
+            scribble(&mut rng, &mut title.bytes()[lo..lo + PAGE], density);
+        }
+        // a page rewritten whole, the first and last bytes of pages, and one never readable
+        title.bytes()[30 * PAGE..31 * PAGE].iter_mut().for_each(|b| *b = !*b);
+        for page in [40, 41, 42] {
+            title.bytes()[page * PAGE] ^= 0x5a;
+            title.bytes()[page * PAGE - 1] ^= 0xa5;
+        }
+        title.hide(7);
+        let s = title.start;
+        let ranges = [
+            (s, s + 3 * PAGE + 77),
+            (s + 5 * PAGE - 1, s + 60 * PAGE + 1),
+            (s + 2 * PAGE + 3, s + 9 * PAGE),
+            (s + 61 * PAGE, s + title.len),
+        ];
+        let mut cut = 0;
+        for kind in [Kind::Card, Kind::Masked, Kind::Snapshot, Kind::NoSnapshot] {
+            for runs_left in [usize::MAX, 200_000, 20_000, 700, 0] {
+                let (byte, _) = merge_way(&buffer, &title, &held, kind, &ranges, runs_left, false, false);
+                let (dense, _) = merge_way(&buffer, &title, &held, kind, &ranges, runs_left, false, true);
+                assert!(
+                    byte == dense,
+                    "{kind:?} with {runs_left} runs: settle {} vs {}, left {} vs {}, dirty {} vs {}, pending {} vs {}",
+                    byte.settle,
+                    dense.settle,
+                    byte.runs_left,
+                    dense.runs_left,
+                    byte.dirty.len(),
+                    dense.dirty.len(),
+                    byte.pending.len(),
+                    dense.pending.len()
+                );
+                cut += usize::from(byte.settle);
+            }
+        }
+        // the caps did cut some
+        assert!(cut >= 3, "{cut}");
+        let (byte, _) = merge_way(&buffer, &title, &held, Kind::Masked, &ranges, 0, false, false);
+        assert!(!byte.pending.is_empty() && !byte.settle, "masked takes pages past the run cap");
+    }
+
     // timings for the report: cargo test --release merge_timings -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -677,14 +840,15 @@ mod tests {
         });
         println!("one 64 KiB page, {} runs: changed_runs {byte_runs:.3} ms, word runs {word_runs:.3} ms; masks byte {byte_masks:.3} ms, word {word_masks:.3} ms", changed_runs(&page_now, page_was).len());
         for kind in [Kind::Card, Kind::Masked, Kind::Snapshot] {
-            let (mut plain, mut wide) = (0.0, 0.0);
+            let (mut plain, mut wide, mut dense) = (0.0, 0.0, 0.0);
             for _ in 0..5 {
                 let (p, pt) = merge_timed(&buffer, &title, &held, kind, &ranges, usize::MAX, false);
                 let (w, wt) = merge_timed(&buffer, &title, &held, kind, &ranges, usize::MAX, true);
-                (plain, wide) = (plain + pt / 5.0, wide + wt / 5.0);
-                assert!(p == w);
+                let (d, dt) = merge_way(&buffer, &title, &held, kind, &ranges, usize::MAX, false, true);
+                (plain, wide, dense) = (plain + pt / 5.0, wide + wt / 5.0, dense + dt / 5.0);
+                assert!(p == w && p == d);
             }
-            println!("{kind:?}: {} pages: plain {plain:.1} ms, wide {wide:.1} ms (merge only)", PAGES * 4 / 5);
+            println!("{kind:?}: {} pages: plain {plain:.1} ms, wide {wide:.1} ms, dense {dense:.1} ms (merge only)", PAGES * 4 / 5);
         }
     }
 }

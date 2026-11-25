@@ -3056,6 +3056,14 @@ impl Shadow {
             }
             MERGED[0].fetch_add(1, Ordering::Relaxed);
             let at = lo - start;
+            if merge::dense() {
+                if self.merge_dense(at, title, &mut before, runs_left, masked) {
+                    return true;
+                }
+                drop(before);
+                self.took_page(page, base, start, end, a, e, now);
+                continue;
+            }
             if self.card.is_some() {
                 // SAFETY: inside the mapping of the copy's CPU side,
                 // which only the submitting thread writes.
