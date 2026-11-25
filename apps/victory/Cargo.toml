@@ -29,6 +29,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# dlss as an upscaler backend (VICTORY_UPSCALER=dlss); needs VICTORY_DLSS_SDK to build
+dlss = ["victory-hle/dlss"]
 
 [lints]
 workspace = true

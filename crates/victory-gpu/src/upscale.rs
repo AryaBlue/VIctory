@@ -64,9 +64,25 @@ pub fn set_backend(backend: Box<dyn Upscaler>) {
     *BACKEND.lock().unwrap_or_else(|e| e.into_inner()) = Some(backend);
 }
 
+// VICTORY_UPSCALER=dlss (with the dlss feature and VICTORY_DLSS set) else spatial
+fn chosen_backend() -> Box<dyn Upscaler> {
+    #[cfg(feature = "dlss")]
+    if chosen() == "dlss" {
+        match crate::dlss::DlssBackend::from_env() {
+            Some(dlss) => return Box::new(dlss),
+            None => tracing::warn!("VICTORY_UPSCALER=dlss without VICTORY_DLSS=quality|balanced|performance|ultra; spatial instead"),
+        }
+    }
+    #[cfg(not(feature = "dlss"))]
+    if chosen() == "dlss" {
+        tracing::warn!("VICTORY_UPSCALER=dlss but this build has no dlss feature; spatial instead");
+    }
+    Box::new(Spatial::default())
+}
+
 fn with_backend<R>(f: impl FnOnce(&mut dyn Upscaler) -> R) -> R {
     let mut slot = BACKEND.lock().unwrap_or_else(|e| e.into_inner());
-    f(slot.get_or_insert_with(|| Box::new(Spatial::default())).as_mut())
+    f(slot.get_or_insert_with(chosen_backend).as_mut())
 }
 
 static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -259,5 +275,38 @@ mod tests {
     #[test]
     fn spatial_shader_compiles() {
         crate::host::compile(SPATIAL, s!("main"), s!("cs_5_1")).unwrap();
+    }
+}
+
+#[cfg(feature = "dlss")]
+impl Upscaler for crate::dlss::DlssBackend {
+    fn name(&self) -> &'static str {
+        crate::dlss::DlssBackend::name(self)
+    }
+
+    fn setup(&mut self, device: &ID3D12Device, setup: &UpscaleSetup) -> bool {
+        crate::dlss::DlssBackend::setup(self, device, setup.flags)
+    }
+
+    fn dispatch(&mut self, _: &ID3D12Device, list: &ID3D12GraphicsCommandList, f: &UpscaleFrame) -> bool {
+        let (Some(depth), Some(motion)) = (f.depth, f.motion) else { return false };
+        let inputs = crate::dlss::UpscaleInputs {
+            color: f.colour,
+            depth,
+            motion_vectors: motion,
+            exposure: f.exposure,
+            output: f.output,
+            jitter: f.jitter,
+            mv_scale: f.motion_scale,
+            render_size: f.render_size,
+            reset: f.reset,
+            pre_exposure: f.pre_exposure,
+            frame_time_ms: f.frame_ms,
+        };
+        crate::dlss::DlssBackend::dispatch(self, list, &inputs)
+    }
+
+    fn release(&mut self) {
+        crate::dlss::DlssBackend::release(self);
     }
 }
