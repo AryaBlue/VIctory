@@ -21,6 +21,8 @@ mod capture;
 #[cfg(windows)]
 mod burst;
 #[cfg(windows)]
+mod ask_early;
+#[cfg(windows)]
 mod card_mask;
 #[cfg(windows)]
 mod present_later;
