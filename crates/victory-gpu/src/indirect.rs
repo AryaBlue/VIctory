@@ -495,7 +495,7 @@ fn record_clamp_as(
 
 /// Whether every draw served from a window is checked against a fresh
 /// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
-/// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
+/// windows on; off by default). A window clamps its
 /// records once, ahead of their draws; if anything wrote a record between
 /// the window's clamp and its draw, the draw reads the old one. The check
 /// clamps the record again just before the draw (into a buffer of its own,
@@ -1531,13 +1531,13 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        // groups charge in whatever order they run, lanes in order (fxceless's group charge)
+        let mut kept = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1547,7 +1547,8 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert!(kept == [1, 2] || kept == [64, 65], "the first two real draws of one group fit the budget: {kept:?}");
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
