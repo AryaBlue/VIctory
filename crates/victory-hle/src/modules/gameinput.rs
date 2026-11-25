@@ -512,6 +512,12 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        // with a host pad in, the keyboard's buttons (Esc = Menu, Enter = A, ...) go to the first
+        // pad: the stand-in pad is not there then, and Esc did nothing
+        let mut pads = pads;
+        if let Some(first) = pads.iter_mut().flatten().next() {
+            first.buttons |= fallback(&keys).buttons;
+        }
         let latch = Latch::on();
         for (slot, pad) in pads.into_iter().enumerate() {
             let pad = pad.map(|p| if latch { self.latch.pad(slot, p) } else { p });
@@ -1213,21 +1219,8 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "keys")]
-            if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
-            }
-            Some(pad)
+            // keys, scripted ones (`VICTORY_KEYS`) too, reach the first pad in `State::poll`
+            Some(convert(&state.Gamepad))
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1618,6 +1611,17 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn with_a_host_pad_in_esc_still_presses_menu_on_it() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState { buttons: A, ..Default::default() });
+        host.lock().unwrap().keys = vec![key(0x1B)];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, A | MENU, "Esc reaches the pad the title reads");
+        release(r);
     }
 
     #[test]
