@@ -26,6 +26,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// With [`made_fast`]: each slot's made key once its host descriptor
+    /// is written (0: ask under the lock), read by draws without the lock.
+    ready: Vec<std::sync::atomic::AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -957,6 +960,9 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            ready: (0..if made_fast() || cfg!(test) { count } else { 0 })
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1402,6 +1408,8 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            // made again: draws wait for it under the lock
+            self.unready(slot);
             if let Some(kept) = make(&view, self.cpu(slot)) {
                 self.keep(slot, kept);
                 remade += 1;
@@ -1427,6 +1435,7 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
+        self.unready(index);
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
@@ -1965,8 +1974,46 @@ impl HostHeap {
             }
             return None;
         }
+        if let Some(view) = self.mirror_ready(index, handle) {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        self.mirror_in(&mut made, index, handle, for_draw)
+        let view = self.mirror_in(&mut made, index, handle, for_draw);
+        if let (Some(ready), Some(&key)) =
+            (self.ready.get(index as usize), made.get(index as usize))
+            && key != 0
+        {
+            // the slot's descriptor is written: later draws need no lock
+            ready.store(key, std::sync::atomic::Ordering::Release);
+        }
+        view
+    }
+
+    /// With [`made_fast`]: the view at `handle` if slot `index` was made
+    /// from it and nothing changed it since ([`HostHeap::mirror`] would
+    /// only give it back), without the made keys' lock.
+    fn mirror_ready(&self, index: u32, handle: u64) -> Option<View> {
+        let ready = self
+            .ready
+            .get(index as usize)?
+            .load(std::sync::atomic::Ordering::Acquire);
+        if ready == 0 {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || ready != u64::from(generation) << 32 | u64::from(i) {
+            return None;
+        }
+        view_at(i, generation)
+    }
+
+    /// Slot `index`'s made key is about to change: draws ask under the
+    /// lock again.
+    fn unready(&self, index: u32) {
+        if let Some(ready) = self.ready.get(index as usize) {
+            ready.store(0, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// [`HostHeap::mirror`] with the made keys' lock already taken
@@ -1981,6 +2028,7 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                self.unready(index);
                 made[index as usize] = 0;
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
@@ -1991,6 +2039,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            self.unready(index);
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2040,6 +2089,7 @@ impl HostHeap {
     // the slot's host descriptor is made again at the next mirror (its copy left the tables)
     pub(crate) fn forget_made(&self, index: u32) {
         if let Some(key) = self.made.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            self.unready(index);
             *key = 0;
         }
     }
@@ -2278,6 +2328,21 @@ type Kept = Option<ID3D12Resource>;
 fn sync_batch() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// Whether a draw's [`HostHeap::mirror`] of a slot already made from the
+/// view the title has there answers without the made keys' lock
+/// (`VICTORY_MADE_FAST=1`; off by default).
+///
+/// Why: in the s2-prep-1 profile the recording threads waited 107 ms a
+/// frame, all together, for that lock in `mirror`, nearly always to find
+/// the slot made from that view already. A slot's key is published once
+/// its host descriptor is written, under the lock, and withdrawn before
+/// anything changes the slot; a draw that finds it current takes the view
+/// as `mirror` would have given it back.
+fn made_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MADE_FAST").is_some_and(|v| v == "1"))
 }
 
 /// Whether the pass over records copied in as bytes also mirrors slots
@@ -3496,6 +3561,39 @@ mod tests {
         assert!(heap.note_buffer(2, Some(&view), true).is_empty());
         assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
         assert_eq!(heap.buffer_slots(), [2]);
+    }
+
+    /// VICTORY_MADE_FAST: a slot published made from the view at a handle
+    /// answers without the lock until anything changes the slot, and not
+    /// for another view.
+    #[test]
+    fn a_made_slot_answers_without_the_lock_until_it_changes() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        super::super::record(handle, View::Constant(0x1000, 256));
+        // SAFETY: the record just written.
+        let [_, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let publish = |slot: u32| {
+            heap.made.lock().unwrap()[slot as usize] = key;
+            heap.ready[slot as usize].store(key, std::sync::atomic::Ordering::Release);
+        };
+        assert!(heap.mirror_ready(2, handle).is_none());
+        publish(2);
+        assert!(heap.mirror_ready(2, handle).is_some());
+        assert!(heap.mirror_ready(3, handle).is_none());
+        heap.forget_made(2);
+        assert!(heap.mirror_ready(2, handle).is_none());
+        publish(3);
+        assert!(heap.texture_slot_gone(3));
+        assert!(heap.mirror_ready(3, handle).is_none());
+        // another view at the handle
+        publish(4);
+        super::super::record(handle, View::Constant(0x2000, 256));
+        assert!(heap.mirror_ready(4, handle).is_none());
     }
 
     /// VICTORY_HEAP_SYNC_BATCH: a page's slots made under one taking of
