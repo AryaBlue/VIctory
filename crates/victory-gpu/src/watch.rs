@@ -91,6 +91,50 @@ struct Journal {
     kept: bool,
     // with fine_pages: which pieces of each page the last asking found written
     pieces: BTreeMap<usize, Pieces>,
+    // with ask_lean: first pages of ranges the kernel turned down lately, and pre-askings since cleared
+    refused: BTreeSet<usize>,
+    refused_age: u32,
+}
+
+// a submission's pre-asking leaves out view memory and ranges the kernel turned down lately (VICTORY_ASK_LEAN=1)
+pub(crate) fn ask_lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_LEAN").is_some_and(|v| v == "1"))
+}
+
+// pre-askings between clearings of the turned-down ranges
+const REFUSED_AGE: u32 = 512;
+
+// ranges left out of pre-askings since the frame line: guarded views, turned down lately
+pub(crate) static LEAN_SKIPPED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+// the ranges worth a pre-asking: a skipped one is asked by `writes` at its refresh, as before
+fn lean_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let refused: Vec<bool> = {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.refused_age += 1;
+        if j.refused_age >= REFUSED_AGE {
+            j.refused_age = 0;
+            j.refused.clear();
+        }
+        ranges.iter().map(|r| j.refused.contains(&(r.0 / PAGE))).collect()
+    };
+    let mut out = Vec::with_capacity(ranges.len());
+    for (&(start, end), refused) in ranges.iter().zip(refused) {
+        if start >= end {
+            continue;
+        }
+        if refused {
+            LEAN_SKIPPED[1].fetch_add(1, Relaxed);
+        } else if known_view(start) {
+            LEAN_SKIPPED[0].fetch_add(1, Relaxed);
+        } else {
+            out.push((start, end));
+        }
+    }
+    out
 }
 
 // notes `page` written at `now` in the pieces of `mask`
@@ -162,6 +206,8 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead_asked: 0,
     kept: false,
     pieces: BTreeMap::new(),
+    refused: BTreeSet::new(),
+    refused_age: 0,
 });
 
 /// Ranges of one submission closer than this are asked about together:
@@ -280,6 +326,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    let lean = ask_lean().then(|| lean_ranges(ranges));
+    let ranges = lean.as_deref().unwrap_or(ranges);
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -298,8 +346,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            if ask_kernel(j, first, last) {
+                j.ahead.push((first, last));
+            } else if ask_lean() {
+                j.refused.insert(first);
+            }
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -1137,6 +1189,15 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn lean_pre_askings_leave_out_turned_down_ranges() {
+        let (down, kept) = (0x7ff0_0000_0000usize, 0x7ff1_0000_0000usize);
+        JOURNAL.lock().unwrap().refused.insert(down / PAGE);
+        let out = lean_ranges(&[(down, down + PAGE), (kept, kept + PAGE), (kept, kept)]);
+        assert_eq!(out, [(kept, kept + PAGE)]);
+        JOURNAL.lock().unwrap().refused.remove(&(down / PAGE));
+    }
 
     #[test]
     fn piece_masks_and_needs() {

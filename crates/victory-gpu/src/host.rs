@@ -7555,6 +7555,13 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            if crate::watch::ask_lean() {
+                let [views, refused] =
+                    [0, 1].map(|i| crate::watch::LEAN_SKIPPED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "ranges left out of submissions' write-watch pre-askings per frame (VICTORY_ASK_LEAN=1): {views:.0} guarded views, {refused:.0} turned down lately"
+                );
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
