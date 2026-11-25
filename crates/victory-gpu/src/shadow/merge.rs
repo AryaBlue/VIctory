@@ -32,7 +32,7 @@ pub(super) fn dense() -> bool {
     if DENSE.with(std::cell::Cell::get) {
         return true;
     }
-    static ON: OnceLock<bool> = OnceLock::new();
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_MERGE_DENSE").is_some_and(|v| v == "1");
         if on {
