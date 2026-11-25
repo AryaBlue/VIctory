@@ -7785,6 +7785,12 @@ impl Meter {
                     worked as f64 / 1000.0
                 );
             }
+            let [kept_away, kept_waiting] = [0, 1].map(|i| crate::draw::HEAP_TEXTURES_KEPT[i].swap(0, Ordering::Relaxed));
+            if kept_away + kept_waiting > 0 {
+                tracing::info!(
+                    "picked textures that kept their last view since the last line (VICTORY_TEXTURE_KEEP=1):                      {kept_away} looks that found the memory unmapped, {kept_waiting} passes over a texture the worker had not made ready"
+                );
+            }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(

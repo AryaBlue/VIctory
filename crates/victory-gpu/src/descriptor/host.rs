@@ -503,6 +503,11 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Looks that find a slot's memory unmapped before its host slot goes null, with
+/// VICTORY_TEXTURE_KEEP (about 170 frames): a remap passing over its pages reads as unmapped
+/// for a moment, and the slot showed black till its next upload.
+pub(crate) const AWAY_LOOKS: u8 = 24;
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -611,6 +616,21 @@ impl TextureQueue {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
+    }
+
+    /// With VICTORY_TEXTURE_KEEP: slot `index` was found unmapped; true once it has been so for
+    /// [`AWAY_LOOKS`] looks and its host slot is to go null, else it keeps what it shows and is
+    /// looked at again after 1, 2, 4, then every 8 frames.
+    fn away(&mut self, index: u32, write: u64, frame: u64) -> bool {
+        let Some(w) = self.same(index, write) else {
+            return false;
+        };
+        if w.looks >= AWAY_LOOKS {
+            return true;
+        }
+        w.due = frame + (1u64 << w.looks.min(3));
+        w.looks += 1;
+        false
     }
 
     /// The card has no room for the host copy slot `index` needs: it is
@@ -1193,6 +1213,11 @@ impl HostHeap {
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.later(index, write, frame, most);
+    }
+
+    /// See [`TextureQueue::away`].
+    pub(crate) fn texture_slot_away(&self, index: u32, write: u64, frame: u64) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).away(index, write, frame)
     }
 
     /// See [`TextureQueue::hold`].
@@ -3332,6 +3357,26 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    /// VICTORY_TEXTURE_KEEP: a slot found unmapped keeps its host view and is looked at again
+    /// next frame, then after 2, 4 and every 8 frames, and goes null only after AWAY_LOOKS looks.
+    #[test]
+    fn a_slot_found_unmapped_is_kept_for_a_while_before_it_goes() {
+        let mut q = TextureQueue::default();
+        q.written(3, 1, 0, false);
+        let w = q.due(1, 10)[0].1;
+        let mut frame = 1;
+        for (look, wait) in (0..AWAY_LOOKS).zip([1u64, 2, 4, 8].into_iter().chain(std::iter::repeat(8))) {
+            assert!(!q.away(3, w, frame), "let go at look {look}");
+            assert!(!q.due(frame + wait - 1, 10).iter().any(|d| d.0 == 3));
+            frame += wait;
+            assert_eq!(q.due(frame, 10)[0].0, 3);
+        }
+        assert!(q.away(3, w, frame), "kept past the looks");
+        // a slot written again meanwhile is not the one the pass looked at
+        q.written(3, frame, 0, false);
+        assert!(!q.away(3, w, frame));
     }
 
     /// The queue of textures picked by index serves the slots looked at
