@@ -27,6 +27,8 @@ pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
+#[cfg(all(windows, feature = "dlss"))]
+pub mod dlss;
 pub mod device;
 #[cfg(windows)]
 mod drvwatch;
