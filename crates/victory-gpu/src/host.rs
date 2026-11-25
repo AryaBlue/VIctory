@@ -3736,6 +3736,8 @@ fn read_backs(list: &HostList) {
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
+                // title memory written by us: burst refresh's ranges over it end
+                crate::burst::wrote(*at, rows.saturating_sub(1) * pitch + row);
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
                 if walls_trace() && *rows == 1 && *row <= 96 {
