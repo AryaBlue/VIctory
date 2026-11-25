@@ -962,10 +962,20 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_flags_changes(crate::host::CARD_COMPARE, false);
+    }
+
+    // the same with a group per piece (VICTORY_CARD_HASH_WAVE=1)
+    #[test]
+    fn warp_wave_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_flags_changes(crate::host::CARD_COMPARE_WAVE, true);
+    }
+
+    fn card_compare_flags_changes(source: &str, wave: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -991,7 +1001,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_groups(PIECES, wave);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.

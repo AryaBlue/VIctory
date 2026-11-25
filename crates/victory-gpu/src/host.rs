@@ -1588,6 +1588,78 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`CARD_COMPARE`] with a group of 64 threads per piece
+/// (`VICTORY_CARD_HASH_WAVE=1`; off by default): each thread hashes every
+/// 64th 16 bytes of the piece and the first folds the 64 hashes in order,
+/// so a pass takes 64 steps, not 4,096, and neighbouring threads read
+/// neighbouring bytes. The hashes differ from the old shader's; the switch
+/// is read once, so the compare only ever meets hashes its own shader made.
+pub(crate) const CARD_COMPARE_WAVE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 lanes[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint i = group.x + group.y * 65535u;
+    // no return before the barrier: a group past the pieces hashes nothing
+    bool live = i < pieces;
+    uint piece = first + i;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = live ? (hi + 15u) & ~15u : 0u;
+    const uint4 seed = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    const uint4 mul = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    uint4 h = seed;
+    [loop]
+    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * mul;
+        h = h.yzwx ^ (h >> 15);
+    }
+    lanes[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane != 0u || !live) return;
+    uint4 f = seed;
+    for (uint k = 0u; k < 64u; k++) {
+        f = (f ^ lanes[k]) * mul;
+        f = f.yzwx ^ (f >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + i * 4u, any(f != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, f);
+    } else {
+        hashes.Store4(piece * 16u, f);
+    }
+}
+"#;
+
+// one group per piece for the wave compare (VICTORY_CARD_HASH_WAVE=1)
+pub(crate) fn card_hash_wave() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WAVE").is_some_and(|v| v == "1"))
+}
+
+/// The groups a compare or hash pass over `pieces` pieces is dispatched as.
+pub(crate) fn card_groups(pieces: u32, wave: bool) -> (u32, u32) {
+    if wave {
+        (pieces.clamp(1, 65535), pieces.div_ceil(65535).max(1))
+    } else {
+        (pieces.div_ceil(64), 1)
+    }
+}
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).
@@ -3833,9 +3905,10 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = if card_hash_wave() { CARD_COMPARE_WAVE } else { CARD_COMPARE };
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4167,7 +4240,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_groups(run.pieces, card_hash_wave());
+                            list.Dispatch(x, y, 1);
                         }
                     }
                     list.Close()?;
@@ -4257,7 +4331,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_groups(r.span.pieces, card_hash_wave());
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
