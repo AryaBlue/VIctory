@@ -1595,7 +1595,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// (`VICTORY_COMMIT_NOTICE`, which stops asking Windows about absent
 /// blocks at every pass).
 pub fn title_memory_committed(at: usize, len: usize) {
-    // f1: crate::burst::wrote(at, len)
+    crate::burst::wrote(at, len);
     if len == 0 {
         return;
     }
