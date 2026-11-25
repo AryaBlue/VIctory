@@ -12,7 +12,7 @@ developer or publisher.
 
 ## Status (2026-11-25)
 
-**In game and controllable, but not playable yet: about 5 frames per second.**
+**In game and controllable, but not playable yet: about 7.5 frames per second.**
 
 Tested on one machine: Windows 11, NVIDIA RTX 3060 12 GB, AMD 16-thread
 CPU, 48 GB RAM.
@@ -24,30 +24,58 @@ CPU, 48 GB RAM.
 | Gameplay (the prologue) | you can walk and look around as Lucia; world, characters and textures render |
 | Series S profile (`--console series-s`) | reaches gameplay; the game's own upscaler path runs |
 | Upscaling | the game's FSR calls are served on the PC: NVIDIA DLSS (Super Resolution) or AMD FSR 3.1, 1280x720 to 1920x1080 |
-| Frame rate in the world | **5.2-5.6 fps** with Series S + DLSS (180-194 ms a frame); 4.5-4.6 fps on the Series X profile at 1080p |
+| Frame rate in the world | **7.4-7.6 fps** settled with Series S + DLSS (131-135 ms a frame, median of four five-minute runs; the fastest stretches reach 8). It was 5.2-5.6 fps earlier the same day and about 6.2 before per-draw table reuse. The Series X profile has not been re-measured (4.5-4.6 fps at 1080p before) |
 | Stability | full five-minute runs with no device loss |
+| Pause menu, HUD layer | the game presents its interface as a second 4K layer; drawing it is fixed on a branch (the pause menu shows in full there) and not merged here yet |
 | Light in shadow | still dark: the game's ray-traced lighting does not run yet |
 
 ### Where the frame goes
 
 | Part | ms per frame |
 |------|--------------|
-| Our submit thread preparing the frame (tracking what the game changed in its memory, copying it to the card) | ~150-160 |
-| The game's own GPU work (Series S, DLSS) | ~76-81 |
-| The card waiting for us | ~100 |
+| Our submit thread preparing the frame (tracking what the game changed in its memory, copying it to the card) | ~105-111 |
+| The game's command lists on the GPU (Series S, DLSS) | ~75-79 |
+| The card waiting for us | ~50-54 |
+| Copying back what the GPU wrote, before the game's signals go out | ~55 |
+| The game's recording threads inside our calls, summed over threads | ~250 |
 
 The Xbox shares one memory between CPU and GPU; on a PC that has to be
-emulated by copying, and that work currently runs on one thread. The work in
-progress spreads it over the idle threads, overlaps frames, and cuts the
-per-draw GPU cost. Even with zero CPU overhead the GPU work alone allows
-about 13 fps, so 30 fps also needs the game's GPU work roughly halved.
+emulated by copying, and most of that work still runs on one thread. Inside
+the ~105 ms: merging what changed under the GPU's own writes ~32, deferred
+refresh steps ~25, the last flush ~24, descriptor heap sync ~18, card checks
+~13. The target is 15 fps (66 ms a frame), which needs each of the three
+budgets (preparing, recording threads, GPU) under about 66 ms; 10 fps needs
+100 ms frames.
+
+What moved the number on 2026-11-25: reusing a descriptor table already seen
+in the frame (`VICTORY_TABLE_REUSE`, 151 to 131 ms a frame), lock striping for
+made views, batched heap publishing, and a held texture reserve
+(`VICTORY_TEXTURE_HOLD`, 93 % fewer megabytes of textures made again).
+Measured and found to give nothing here: switching off the driver's
+background shader work, in-place (system memory) copies on this GPU, and a
+GPU upload heap (this card reports no support).
 
 ### Running the fastest configuration
 
 ```
 VICTORY_UPSCALER=dlss  VICTORY_DLSS=quality  VICTORY_DLSS_DLL_DIR=<folder with nvngx_dlss.dll>
+VICTORY_TABLE_REUSE=1  VICTORY_TEXTURE_HOLD=1  VICTORY_TEXTURE_KEEP=1  VICTORY_TEXTURE_WORKER=1
+VICTORY_TEXTURE_WORKER_NEWEST=1  VICTORY_TEXTURE_SHORT_HOLD=1
+VICTORY_MADE_FAST=1  VICTORY_MADE_STRIPES=1  VICTORY_MADE_BATCH_PUBLISH=1  VICTORY_HEAP_SYNC_BATCH=1
+VICTORY_HEAP_WALK_THREAD=1  VICTORY_LOOKUP_FAST=1  VICTORY_VIEW_MEMO=1  VICTORY_WINDOWS_MANY=1
+VICTORY_MERGE_MASKED=1  VICTORY_MERGE_MASKED_INDEX=1  VICTORY_CARD_HASH_WAVE=1  VICTORY_CARD_REHASH_RUNS=1
+VICTORY_WIDE_COPIES=1  VICTORY_WIDE_GUARDS=1  VICTORY_WIDE_ASKS=1  VICTORY_FLUSH_WIDE=0
+VICTORY_FINE_PAGES=1  VICTORY_FAST_READ=1  VICTORY_GUARD_SEEN=1  VICTORY_GUARD_COUNT=1  VICTORY_ASK_LEAN=1
+VICTORY_JOURNAL_FLAT=1  VICTORY_PIECES_FLAT=1  VICTORY_COMMIT_NOTICE=1  VICTORY_COPY_FLUSH_OVERLAP=1
+VICTORY_JOIN_PARTS=1  VICTORY_BACK_OWN_VIEW=1  VICTORY_INDIRECT_GATHER=1  VICTORY_CLAMP_BATCH=1
+VICTORY_LATE_WAIT_LISTS=512
 victory run <path to game_scarlett_master.exe> --execute --console series-s
 ```
+
+That is the set the 7.4-7.6 fps runs used. They also set
+`VICTORY_SHADOW_CASCADES=3`, which trims shadow detail for about 1.5 ms of
+GPU time; it is left out above because it lowers picture quality. All
+in-place (`VICTORY_INPLACE*`) switches were off.
 
 Build with the `dlss` cargo feature and `VICTORY_DLSS_SDK` pointing at
 NVIDIA's [DLSS SDK](https://github.com/NVIDIA/DLSS); the DLSS runtime is not
@@ -65,8 +93,18 @@ path too. `VICTORY_DISPLAY_MODE` sets the display size the game is told
   masked merge bookkeeping indexed, texture uploads moved to a worker with a
   backlog-aware time cap, write-watch and page-query cuts, copies spread over
   worker threads (`VICTORY_WIDE_COPIES`).
+- Frame time, 2026-11-25: per-draw descriptor table reuse, striped and
+  lock-free lookups of made views, batched heap publishing, a held texture
+  reserve, stale heap slots made again when their copy changes, an indexed
+  list of pending GPU-write ranges (`VICTORY_PENDING_INDEX`, with a checker),
+  per-megabyte change counters for refresh steps (`VICTORY_PUSH_DIRTY`, with a
+  checker), and switches that flip in the middle of a run for A/B timing
+  (`VICTORY_ALT`).
+- Input: keyboard Esc and Enter reach the first connected controller, so the
+  pause opens with a pad plugged in.
 - Diagnostics: per-frame frame log and card meter (from victory-fork), a
-  driver-error watch, census of title memory for in-place use.
+  driver-error watch, census of title memory for in-place use, step timers
+  for the submit thread.
 - Selective in-place memory (`VICTORY_INPLACE_PICK`, experimental): putting
   everything in system memory halved the frame rate on this GPU, so only
   buffers the card reads rarely are tried, and each trial is taken back if
@@ -94,7 +132,12 @@ each is described where it is read.
 
 ### Known problems
 
-- About 5 fps; not playable yet.
+- About 7.5 fps; not playable yet.
+- Long frames (over 400 ms) while the game streams new areas: its render
+  thread waits on loading, and our disk-read emulation is the suspect.
+- The Series S profile runs the game's lowest geometry settings
+  (tessellation, terrain and trees at Low), so the world looks low-poly.
+- The pause menu and HUD layer are not drawn in this branch yet.
 - Everything in shadow is dark (ray-traced lighting not running).
 - 2 shaders still don't translate, and 315 draws a frame are dropped
   (mostly the ray-tracing structure builder).
