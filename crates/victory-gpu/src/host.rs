@@ -7475,7 +7475,7 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = (crate::capture::wanted(frame) || crate::capture::listed(frame)) && !crate::capture::ahead();
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -7521,17 +7521,34 @@ impl Host {
                 ),
             ]);
             copy.close();
+            let mut flown = 0;
             match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
                 }
                 None => self.execute(&[copy]),
             }
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+            {
+                // shots of presents sent ahead are saved once they have run
+                static SHOTS: Mutex<Vec<(u64, u64, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>> =
+                    Mutex::new(Vec::new());
+                let mut shots = SHOTS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((buffer, footprint)) = capture {
+                    shots.push((frame, flown, buffer, footprint));
+                }
+                let finished = FINISHED.load(Ordering::Acquire);
+                shots.retain(|(n, flown, buffer, footprint)| {
+                    let done = *flown <= finished;
+                    if done {
+                        crate::capture::save_read_back(*n, buffer, footprint);
+                    }
+                    !done
+                });
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = flown;
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]

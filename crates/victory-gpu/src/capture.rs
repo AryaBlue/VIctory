@@ -142,6 +142,14 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// `VICTORY_CAPTURE_AHEAD=1`: saved frames keep being presented ahead
+/// (`late_free_present`), read back in the present's own list and saved
+/// once it has run, so a shot shows what that present showed
+pub(crate) fn ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CAPTURE_AHEAD").is_ok_and(|v| v == "1"))
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
