@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod lookup;
+
 mod merge;
 
 /// A title buffer's host copy.
@@ -3672,10 +3674,13 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+// every holder of this may change the table: lookup memos made before it are stale
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    lookup::changed();
+    map
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -4147,6 +4152,18 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if lookup::fast() {
+        return lookup::shared(address, len, any);
+    }
+    lookup_locked(address, len, any)
+}
+
+// the table's buffer for the ask: (key, end, its copy) among the 64 that start below
+fn innermost(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<((u64, usize), Option<&Arc<Shadow>>)> {
+    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, e)| (*k, e.shadow.as_ref()))
+}
+
+fn lookup_locked(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
