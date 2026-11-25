@@ -1544,12 +1544,16 @@ mod tests {
             assert!(same(start as *const u8, &got), "the GPU reads the title buffer's bytes");
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
-            // the rig's list still holds the buffer, and so the heap
             drop(rig);
             drop(placed);
-            // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // Half of it decommitted: turned down, the host not asked. On
+            // memory no heap ever stood on (WARP lets a heap go when it
+            // likes, and pages under one cannot be decommitted).
+            let other = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            assert_ne!(mem::VirtualFree(other.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            let start = other as u64 + K64 as u64 + 0x1230;
             assert!(matches!(place_part(&device, start, len), Err(None)));
+            mem::VirtualFree(other.cast(), 0, mem::MEM_RELEASE);
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
     }
