@@ -109,7 +109,7 @@ pub(crate) fn passes() -> bool {
 struct Passes {
     names: Vec<String>,
     ids: std::collections::BTreeMap<String, u32>,
-    sums: Vec<[u64; 5]>,
+    sums: Vec<[u64; 7]>,
     frames: u64,
     since: Option<std::time::Instant>,
 }
@@ -135,22 +135,23 @@ pub(crate) fn pass_key(name: String) -> u32 {
     let id = p.names.len() as u32;
     p.names.push(name.clone());
     p.ids.insert(name, id);
-    p.sums.push([0; 5]);
+    p.sums.push([0; 7]);
     id
 }
 
-/// What a pass recorded: 0 a draw, 1 a dispatch, 2 a clamp of ours.
+/// What a pass recorded: 0 a draw, 1 a dispatch, 2 a clamp of ours, 3 a window batched
+/// ahead (`crate::clamp_batch`), 4 a batched window a draw read.
 pub(crate) fn pass_count(id: u32, what: usize) {
     if id == u32::MAX {
         return;
     }
     if let Some(s) = passes_lock().sums.get_mut(id as usize) {
-        s[2 + what.min(2)] += 1;
+        s[2 + what.min(4)] += 1;
     }
 }
 
 /// The table's lines, largest time first: per frame over `frames`.
-fn pass_table(names: &[String], sums: &[[u64; 5]], frames: u64, most: usize) -> Vec<String> {
+fn pass_table(names: &[String], sums: &[[u64; 7]], frames: u64, most: usize) -> Vec<String> {
     let frames = frames.max(1) as f64;
     let mut order: Vec<usize> = (0..sums.len()).filter(|&i| sums[i][0] > 0 || sums[i][2] + sums[i][3] > 0).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(sums[i][0]));
@@ -159,16 +160,53 @@ fn pass_table(names: &[String], sums: &[[u64; 5]], frames: u64, most: usize) -> 
     for &i in order.iter().take(most) {
         let s = sums[i];
         lines.push(format!(
-            "  {:7.2} ms {:6.1} spans {:7.1} draws {:6.1} dispatches {:6.1} clamps  {}",
+            "  {:7.2} ms {:6.1} spans {:7.1} draws {:6.1} dispatches {:6.1} clamps {:6.1} batched {:6.1} read  {}",
             s[0] as f64 / 1e3 / frames,
             s[1] as f64 / frames,
             s[2] as f64 / frames,
             s[3] as f64 / frames,
             s[4] as f64 / frames,
+            s[5] as f64 / frames,
+            s[6] as f64 / frames,
             names[i]
         ));
     }
+    let mut rest: std::collections::BTreeMap<&str, [u64; 8]> = std::collections::BTreeMap::new();
+    for &i in order.iter().skip(most) {
+        let r = rest.entry(pass_kind(&names[i])).or_default();
+        for (a, b) in r.iter_mut().zip(sums[i]) {
+            *a += b;
+        }
+        r[7] += 1;
+    }
+    for (kind, r) in rest {
+        lines.push(format!(
+            "  {:7.2} ms {:6.1} spans {:7.1} draws {:6.1} dispatches {:6.1} clamps {:6.1} batched {:6.1} read  other {} ({} passes)",
+            r[0] as f64 / 1e3 / frames,
+            r[1] as f64 / frames,
+            r[2] as f64 / frames,
+            r[3] as f64 / frames,
+            r[4] as f64 / frames,
+            r[5] as f64 / frames,
+            r[6] as f64 / frames,
+            kind,
+            r[7]
+        ));
+    }
     lines
+}
+
+/// What a pass past the table's cap is summed under.
+fn pass_kind(name: &str) -> &'static str {
+    if name.starts_with("dispatches") {
+        "compute"
+    } else if name.starts_with("draws []") {
+        "depth-only draws"
+    } else if name.starts_with("draws") {
+        "draws to targets"
+    } else {
+        "unkeyed"
+    }
 }
 
 fn make() -> Option<Meter> {
@@ -318,7 +356,7 @@ pub(crate) fn collect() {
             for line in pass_table(&p.names, &p.sums, p.frames, 40) {
                 tracing::info!("{line}");
             }
-            p.sums.iter_mut().for_each(|s| *s = [0; 5]);
+            p.sums.iter_mut().for_each(|s| *s = [0; 7]);
             p.frames = 0;
             p.since = Some(now);
         }
@@ -332,12 +370,19 @@ mod tests {
     #[test]
     fn the_pass_table_lists_the_longest_passes_per_frame_first() {
         let names = ["shadow".to_owned(), "gbuffer".to_owned(), "idle".to_owned()];
-        let sums = [[20_000, 4, 100, 0, 50], [60_000, 2, 200, 0, 0], [0, 0, 0, 0, 0]];
+        let sums = [[20_000, 4, 100, 0, 50, 30, 12], [60_000, 2, 200, 0, 0, 0, 0], [0; 7]];
         let lines = pass_table(&names, &sums, 2, 10);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("40.0 ms in all"), "{}", lines[0]);
         assert!(lines[1].ends_with("gbuffer") && lines[1].contains("30.00 ms"), "{}", lines[1]);
-        assert!(lines[2].ends_with("shadow") && lines[2].contains("25.0 clamps"), "{}", lines[2]);
+        assert!(lines[2].ends_with("shadow") && lines[2].contains("25.0 clamps") && lines[2].contains("15.0 batched") && lines[2].contains("6.0 read"), "{}", lines[2]);
+        // passes past the cap are summed by kind
+        let names = ["a".to_owned(), "dispatches | x".to_owned(), "dispatches | y".to_owned(), "draws [] depth 8x8 f53 | z".to_owned()];
+        let sums = [[9_000, 1, 1, 0, 0, 0, 0], [2_000, 1, 0, 1, 1, 0, 0], [4_000, 1, 0, 3, 0, 0, 0], [1_000, 1, 5, 0, 2, 4, 3]];
+        let lines = pass_table(&names, &sums, 1, 1);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[2].ends_with("other compute (2 passes)") && lines[2].contains("6.00 ms") && lines[2].contains("4.0 dispatches"), "{}", lines[2]);
+        assert!(lines[3].ends_with("other depth-only draws (1 passes)") && lines[3].contains("4.0 batched") && lines[3].contains("3.0 read"), "{}", lines[3]);
         // the same key twice is one pass
         assert_eq!(pass_key("a test pass".to_owned()), pass_key("a test pass".to_owned()));
     }

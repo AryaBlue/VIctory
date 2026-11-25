@@ -2546,12 +2546,8 @@ impl State {
     /// is kept for its head (`crate::clamp_batch`).
     fn end_windows(&mut self) {
         self.window.clear();
-        if let Some((key, plan, unread)) = self.segment.end() {
-            crate::clamp_batch::STATS[3].fetch_add(unread as u64, Ordering::Relaxed);
-            if !plan.is_empty() {
-                crate::clamp_batch::STATS[2].fetch_add(1, Ordering::Relaxed);
-            }
-            crate::clamp_batch::keep(key, plan);
+        if let Some((key, seen)) = self.segment.end() {
+            crate::clamp_batch::keep(key, &seen);
         }
     }
 
@@ -3524,7 +3520,9 @@ impl State {
             Some((scratch, at, step)) => {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::WindowHits, 1);
-                self.segment.read(args.id(), offset);
+                if self.segment.read(args.id(), offset) && crate::cardmeter::passes() {
+                    crate::cardmeter::pass_count(self.pass_id, 4);
+                }
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3620,11 +3618,16 @@ impl State {
                             }
                             let mut jobs = vec![((&args.buffer, offset), (kind, step, records), ahead)];
                             jobs.extend(fits.iter().map(|p| {
-                                ((&args.buffer, (offset as i64 + p.delta) as u64), (kind, p.step, p.records), p.records > 1)
+                                ((&args.buffer, (offset as i64 + p.delta) as u64), (kind, p.step, p.records), true)
                             }));
                             if let Some((buffer, epoch, ats)) = crate::indirect::bound_batch_in_ring(list, &jobs) {
                                 crate::clamp_batch::STATS[0].fetch_add(1, Ordering::Relaxed);
                                 crate::clamp_batch::STATS[1].fetch_add(fits.len() as u64, Ordering::Relaxed);
+                                if crate::cardmeter::passes() {
+                                    for _ in &fits {
+                                        crate::cardmeter::pass_count(self.pass_id, 3);
+                                    }
+                                }
                                 batched = Some((buffer, ats, epoch, fits));
                             }
                         }
