@@ -404,6 +404,39 @@ pub(crate) fn before_sync() {
     }
 }
 
+/// Whether any queue's line holds something.
+#[cfg(windows)]
+pub(crate) fn holds_any() -> bool {
+    !lock(&WAITING).is_empty()
+}
+
+/// For a thread that blocks until `reached`: the lines run on this thread
+/// as far as they are free to, and the flights are settled, until it is
+/// reached or nothing moves any more.
+#[cfg(windows)]
+pub(crate) fn run_until(reached: impl Fn() -> bool) -> bool {
+    let mut last = usize::MAX;
+    loop {
+        if !RELEASING_HERE.get() {
+            release_held_now(false);
+        }
+        crate::host::settle_for_fence();
+        if reached() {
+            return true;
+        }
+        let left: usize = lock(&WAITING)
+            .clone()
+            .into_iter()
+            // SAFETY: a live queue: one released is taken off the list.
+            .map(|q| lock(unsafe { &(*(q as *const Queue)).held }).len())
+            .sum();
+        if left >= last {
+            return false;
+        }
+        last = left;
+    }
+}
+
 #[cfg(windows)]
 fn release_held_now(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
@@ -1212,6 +1245,33 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
 
 static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+
+/// Tests elsewhere: a queue whose line holds a wait for `gate` to reach
+/// `at`, then a signal of `fence` to `value`.
+#[cfg(all(test, windows))]
+pub(crate) fn holding_signal_behind(gate: This, at: u64, fence: This, value: u64) -> This {
+    let null = std::ptr::null();
+    let desc = QueueDesc {
+        kind: 0,
+        priority: 0,
+        flags: 0,
+        nodes: 0,
+    };
+    let mut q = null;
+    assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+    lock(&queue(q).held).extend([
+        Held::Wait(gate as usize, at),
+        Held::Signal(fence as usize, value),
+    ]);
+    lock(&WAITING).push(q as usize);
+    q
+}
+
+/// Tests elsewhere: lets go of a queue from [`holding_signal_behind`].
+#[cfg(all(test, windows))]
+pub(crate) fn let_go(q: This) {
+    assert_eq!(release(q), 0);
+}
 
 #[cfg(test)]
 mod tests {

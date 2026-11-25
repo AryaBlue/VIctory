@@ -89,13 +89,14 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     if event.is_null() {
         // With submissions sent to the card and not waited for
-        // (`crate::host::late`) the signal may be behind them: they are
-        // settled, which sets it.
+        // (`crate::host::late`) the signal may be behind them, or still in
+        // a queue's line (with `crate::queue::behind` our thread may not
+        // have got to it): the lines run and the flights are settled until
+        // it is set or nothing moves.
         #[cfg(windows)]
-        if crate::host::late() {
+        if crate::host::late() || crate::queue::holds_any() {
             drop(waiters);
-            crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
+            if crate::queue::run_until(|| fence.value.load(Ordering::Acquire) >= value) {
                 return S_OK;
             }
             tracing::warn!(value, "blocking fence wait not implemented");
@@ -189,5 +190,25 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+    /// A blocking wait for a signal a queue still holds behind a fence
+    /// that has been reached: the line runs and the wait returns, where it
+    /// failed with E_NOTIMPL before.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_wait_runs_the_line_that_holds_its_signal() {
+        let null = std::ptr::null();
+        let (mut gate, mut told) = (null, null);
+        assert_eq!(create(null, 0, 0, &FENCE_IIDS[0], &mut gate), S_OK);
+        assert_eq!(create(null, 0, 0, &FENCE_IIDS[0], &mut told), S_OK);
+        let q = crate::queue::holding_signal_behind(gate, 1, told, 7);
+        // the gate moves without the lines being run
+        fence(gate).value.store(1, Ordering::Release);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(told, 0x48);
+        assert_eq!(wait(told, 7, std::ptr::null_mut()), S_OK);
+        assert_eq!(completed(told), 7);
+        // nothing left that can set it: still refused, not a hang
+        assert_eq!(wait(told, 9, std::ptr::null_mut()), E_NOTIMPL);
+        crate::queue::let_go(q);
     }
 }
