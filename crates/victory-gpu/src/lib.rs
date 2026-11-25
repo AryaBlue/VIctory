@@ -109,6 +109,8 @@ mod wide_guard;
 #[cfg(windows)]
 mod guard_log;
 pub mod switch;
+#[cfg(windows)]
+pub mod placement;
 
 #[cfg(windows)]
 pub use host::on_failure;

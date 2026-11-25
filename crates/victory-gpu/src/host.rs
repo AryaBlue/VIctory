@@ -3298,7 +3298,10 @@ fn late_helper() {
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
+        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(|| {
+            crate::placement::helper();
+            late_helper()
+        }) {
             tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
         }
         tracing::info!(
@@ -3308,7 +3311,10 @@ fn late_threads() {
         );
         if relay() {
             // Without it nothing would ever land.
-            if let Err(e) = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker) {
+            if let Err(e) = std::thread::Builder::new().name("victory-relay".into()).spawn(|| {
+                crate::placement::helper();
+                relay_worker()
+            }) {
                 fail(format_args!("no thread to land submissions sent ahead (VICTORY_RELAY=1): {e}"));
             }
             tracing::info!(

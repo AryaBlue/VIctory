@@ -55,7 +55,10 @@ pub(super) fn submit_begin() -> Option<std::time::Instant> {
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
-        let _ = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(helper);
+        let _ = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(|| {
+            crate::placement::helper();
+            helper()
+        });
     });
     WANTED.fetch_add(1, Relaxed);
     BEGUN.set(true);

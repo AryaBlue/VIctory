@@ -1370,6 +1370,7 @@ fn workers() -> &'static Workers {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::placement::helper();
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {

@@ -34,6 +34,7 @@ fn pool() -> &'static Pool {
     STARTED.call_once(|| {
         for i in 0..pool.threads {
             let _ = std::thread::Builder::new().name(format!("victory-land-{i}")).spawn(|| {
+                crate::placement::helper();
                 let pool = POOL.get().expect("made above");
                 loop {
                     let job = {

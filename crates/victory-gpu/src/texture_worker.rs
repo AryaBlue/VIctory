@@ -77,6 +77,7 @@ impl<T: Send + 'static> Worker<T> {
         std::thread::Builder::new()
             .name("victory texture worker".into())
             .spawn(move || {
+                crate::placement::helper();
                 loop {
                     let (key, job) = {
                         let (lock, ready) = &*mine;
