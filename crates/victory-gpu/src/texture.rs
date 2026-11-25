@@ -632,6 +632,10 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
+    // a texture with the worker is not staged after this (taken under the staging lock, as `prestage` checks)
+    if let Some(handed) = HANDED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        handed.remove(&resource);
+    }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -1281,14 +1285,49 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
 
-/// On the texture worker: makes `resource`'s staging buffer and detiles into it, unless a list
-/// staged it already (that one is a table's, brought up to date at its submissions).
-pub(crate) fn prestage(resource: This, texture: &ID3D12Resource) {
-    if is_staged(resource) {
-        return;
+/// Title textures handed to the texture worker, by address, with their hand's token: [`forget`]
+/// drops them, so the worker never reads a released one. Locked after [`STAGING`].
+static HANDED: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// On the recording thread, while `resource` is live: notes it handed to the worker; the token
+/// to give [`prestage`].
+pub(crate) fn handed(resource: This) -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    HANDED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(resource as usize, token);
+    token
+}
+
+/// Whether `resource` is still handed with `token` (not released since); takes the hand.
+fn take_hand(resource: usize, token: u64) -> bool {
+    let mut handed = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+    let handed = handed.get_or_insert_with(HashMap::new);
+    if handed.get(&resource) != Some(&token) {
+        return false;
     }
-    let Some(s) = staging(resource, texture) else {
-        return;
+    handed.remove(&resource);
+    true
+}
+
+/// On the texture worker: makes `resource`'s staging buffer and detiles into it, unless the
+/// title released it since it was handed (`token`) or a list staged it already (a table's,
+/// brought up to date at its submissions). Not for textures with levels on demand.
+pub(crate) fn prestage(resource: This, texture: &ID3D12Resource, token: u64) {
+    let s = {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        // under the staging lock `forget` waits, so a texture still handed stays live meanwhile
+        if !take_hand(resource as usize, token) {
+            return;
+        }
+        let map = map.get_or_insert_with(HashMap::new);
+        if map.contains_key(&(resource as usize)) {
+            return;
+        }
+        let Some(s) = make_staging(map, resource, texture, false) else {
+            return;
+        };
+        s
     };
     s.refresh_now();
     s.prepared.store(true, std::sync::atomic::Ordering::Release);
@@ -1476,7 +1515,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
+    make_staging(map.get_or_insert_with(HashMap::new), resource, texture, on_demand)
+}
+
+/// [`staging`] with the table locked by the caller.
+fn make_staging(
+    map: &mut HashMap<usize, Arc<Staging>>,
+    resource: This,
+    texture: &ID3D12Resource,
+    on_demand: bool,
+) -> Option<Arc<Staging>> {
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
@@ -1551,6 +1599,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod handed_tests {
+    #[test]
+    fn a_texture_released_after_it_was_handed_over_is_not_staged() {
+        let resource = 0x7a7a_0000usize;
+        let token = super::handed(resource as crate::object::This);
+        super::forget(resource);
+        assert!(!super::take_hand(resource, token), "a released texture is still handed");
+        let again = super::handed(resource as crate::object::This);
+        assert!(!super::take_hand(resource, token), "an old hand counts for a new one");
+        assert!(super::take_hand(resource, again));
+        assert!(!super::take_hand(resource, again), "a hand taken twice");
+    }
 }
 
 #[cfg(test)]

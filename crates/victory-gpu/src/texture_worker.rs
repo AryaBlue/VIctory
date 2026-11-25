@@ -91,8 +91,8 @@ impl<T: Send + 'static> Worker<T> {
     }
 }
 
-/// A host texture for the worker.
-struct Job(ID3D12Resource);
+/// A host texture for the worker, and its hand's token (`crate::texture::handed`).
+struct Job(ID3D12Resource, u64);
 
 // SAFETY: D3D12 resources are free-threaded; the worker only reads its description and maps
 // a staging buffer for it.
@@ -101,22 +101,22 @@ unsafe impl Send for Job {}
 fn worker() -> &'static Worker<Job> {
     static WORKER: std::sync::OnceLock<Worker<Job>> = std::sync::OnceLock::new();
     WORKER.get_or_init(|| {
-        Worker::new(MOST, |resource, Job(texture)| {
-            crate::texture::prestage(resource as This, &texture);
+        Worker::new(MOST, |resource, Job(texture, token)| {
+            crate::texture::prestage(resource as This, &texture, token);
             STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
     })
 }
 
-/// Whether `resource`'s staging is ready for the pass to record its upload; if not, it is
-/// handed to the worker (once).
+/// Whether the pass records `resource`'s upload now: its staging is ready, or it is not one for
+/// the worker (levels on demand); else it is handed to the worker (once) and waits.
 pub(crate) fn ready(resource: This, texture: &ID3D12Resource) -> bool {
-    if crate::texture::prepared(resource) {
+    if crate::texture::prepared(resource) || crate::resource::host_tiled(resource).is_some() {
         return true;
     }
     let worker = worker();
     if !worker.busy(resource as usize) {
-        worker.hand(resource as usize, || Job(texture.clone()));
+        worker.hand(resource as usize, || Job(texture.clone(), crate::texture::handed(resource)));
     }
     false
 }
