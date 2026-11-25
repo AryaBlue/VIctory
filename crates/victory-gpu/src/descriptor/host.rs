@@ -2033,6 +2033,12 @@ impl HostHeap {
         view_at(i, generation)
     }
 
+    // whether slot `index` is still made from record key `key` (None: not tracked, ask `mirror`)
+    pub(crate) fn still_made(&self, index: u32, key: u64) -> Option<bool> {
+        let ready = self.ready.get(index as usize)?;
+        Some(ready.load(std::sync::atomic::Ordering::Acquire) == key)
+    }
+
     /// Slot `index`'s made key is about to change: draws ask under the
     /// lock again.
     fn unready(&self, index: u32) {

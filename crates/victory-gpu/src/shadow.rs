@@ -2379,6 +2379,7 @@ impl Shadow {
 
     // out of the tables: refreshed whole from now on (in-place writes are not write-watched)
     fn supersede(&self) {
+        crate::tablereuse::bump();
         if !self.superseded.swap(true, Ordering::Relaxed) {
             if self.place.is_none() {
                 self.watched.store(NOT_WATCHED, Ordering::Relaxed);
@@ -3680,6 +3681,7 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    crate::tablereuse::bump();
     buffers().insert(
         (start, resource),
         Entry {
@@ -3691,6 +3693,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
+    crate::tablereuse::bump();
     buffers().remove(&(start, resource));
 }
 

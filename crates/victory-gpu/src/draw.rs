@@ -241,6 +241,8 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    // VICTORY_TABLE_REUSE: table slots this list took, by title handle
+    reuse: crate::tablereuse::Reuse<View, crate::tablereuse::HostCopy>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -275,6 +277,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.reuse.clear();
         self.tables_gone = true;
     }
 }
@@ -1228,6 +1231,7 @@ impl State {
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
+            self.reuse.clear();
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -2771,7 +2775,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2782,12 +2786,70 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        if crate::tablereuse::on() {
+            self.entry_reused(list, u.kind, host, index, handle);
+            return;
+        }
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
+        }
+    }
+
+    // table_entry with VICTORY_TABLE_REUSE: a slot this list took before is given back as it was
+    fn entry_reused(
+        &mut self,
+        list: &HostList,
+        kind: ResourceType,
+        host: &crate::descriptor::host::HostHeap,
+        index: u32,
+        handle: u64,
+    ) {
+        let (record, now) = (crate::tablereuse::record_at(handle), crate::tablereuse::now());
+        let (view, known) = match self.reuse.get(handle, record, now, |c| !c.0.superseded()) {
+            Some((view, copy)) => {
+                // the host slot must still be the one made from this record
+                if host.still_made(index, crate::tablereuse::key(record)) != Some(true) {
+                    host.mirror(index, handle, true);
+                }
+                (view, Some(copy))
+            }
+            None => match host.mirror(index, handle, true) {
+                Some(view) => (view, None),
+                None => return,
+            },
+        };
+        let used = readable_with(list, kind, &view, known.clone());
+        if known.is_none() {
+            self.reuse.put(handle, record, now, view.clone(), used);
+        }
+        if crate::descriptor::host::is_texture_view(&view) {
+            host.texture_slot_tabled(index, true);
+        }
+    }
+
+    // a fresh table's slot made readable, through the list's reuse with VICTORY_TABLE_REUSE
+    fn read_slot(&mut self, list: &HostList, kind: ResourceType, handle: u64) {
+        if !crate::tablereuse::on() {
+            if let Some(view) = crate::descriptor::view(handle) {
+                readable(list, kind, &view);
+            }
+            return;
+        }
+        let (record, now) = (crate::tablereuse::record_at(handle), crate::tablereuse::now());
+        let (view, known) = match self.reuse.get(handle, record, now, |c| !c.0.superseded()) {
+            Some((view, copy)) => (view, Some(copy)),
+            None => match crate::descriptor::view(handle) {
+                Some(view) => (view, None),
+                None => return,
+            },
+        };
+        let used = readable_with(list, kind, &view, known.clone());
+        if known.is_none() {
+            self.reuse.put(handle, record, now, view, used);
         }
     }
 
@@ -2906,10 +2968,7 @@ impl State {
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
-                    }
+                    self.read_slot(list, u.kind, table + u64::from(u.table_offset_dwords) * 4);
                 }
                 for k in selected {
                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
@@ -3510,12 +3569,27 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    readable_with(list, kind, view, None);
+}
+
+// readable with the buffer copy already known (VICTORY_TABLE_REUSE); gives back the copy it used
+fn readable_with(
+    list: &HostList,
+    kind: ResourceType,
+    view: &View,
+    known: Option<Option<crate::tablereuse::HostCopy>>,
+) -> Option<crate::tablereuse::HostCopy> {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    let copy = match known {
+        Some(copy) if placed.is_none() => copy,
+        _ => crate::descriptor::host::buffer_copy(view),
+    };
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, address, len)) = &copy {
+        let (address, len) = (*address, *len);
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
@@ -3579,6 +3653,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+    copy
 }
 
 /// The pixel shaders whose draws get their slots listed
