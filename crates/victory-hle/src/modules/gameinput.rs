@@ -105,6 +105,61 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+// VICTORY_INPUT_LATCH (default on, "0" off): a button, key or trigger
+// pressed between two title reads stays down until one read has seen it; at
+// ~1 fps the title reads once a second
+#[derive(Default)]
+struct Latch {
+    buttons: [u32; PADS + 1],
+    triggers: [(f32, f32); PADS + 1],
+    keys: Vec<KeyState>,
+}
+
+impl Latch {
+    fn on() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("VICTORY_INPUT_LATCH").map_or(true, |v| v != "0"));
+        *ON
+    }
+
+    // pad `index` (host slot or the stand-in) as the title should see it
+    fn pad(&mut self, index: usize, mut pad: PadState) -> PadState {
+        self.buttons[index] |= pad.buttons;
+        let (lt, rt) = &mut self.triggers[index];
+        *lt = lt.max(pad.left_trigger);
+        *rt = rt.max(pad.right_trigger);
+        pad.buttons = self.buttons[index];
+        pad.left_trigger = *lt;
+        pad.right_trigger = *rt;
+        pad
+    }
+
+    fn keys(&mut self, mut keys: Vec<KeyState>) -> Vec<KeyState> {
+        for k in &keys {
+            if !self.keys.iter().any(|p| p.virtual_key == k.virtual_key) {
+                self.keys.push(*k);
+            }
+        }
+        for p in &self.keys {
+            if !keys.iter().any(|k| k.virtual_key == p.virtual_key) {
+                keys.push(*p);
+            }
+        }
+        keys
+    }
+
+    // the title has read pads (kind bit) or keys: what it saw is delivered
+    fn read(&mut self, kind: u32) {
+        if kind & GAMEPAD_KIND != 0 {
+            self.buttons = [0; PADS + 1];
+            self.triggers = [(0.0, 0.0); PADS + 1];
+        }
+        if kind & KEYBOARD_KIND != 0 {
+            self.keys.clear();
+        }
+    }
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -325,6 +380,7 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    latch: Latch,
 }
 
 pub struct Hub {
@@ -369,6 +425,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                latch: Latch::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -455,10 +512,20 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        let latch = Latch::on();
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = pad.map(|p| if latch { self.latch.pad(slot, p) } else { p });
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let keys = if latch { self.latch.keys(keys) } else { keys };
+        let fallback = (!any_pad).then(|| {
+            let pad = fallback(&keys);
+            Value::Pad(if latch {
+                self.latch.pad(FALLBACK, pad)
+            } else {
+                pad
+            })
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -593,7 +660,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -618,7 +685,9 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let hr = hand(out, found);
+    state.latch.read(kind);
+    hr
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
@@ -1314,6 +1383,34 @@ mod tests {
             virtual_key,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_press_between_two_reads_is_seen_once_then_released() {
+        let mut latch = Latch::default();
+        let a = PadState {
+            buttons: A,
+            right_trigger: 1.0,
+            ..Default::default()
+        };
+        // pressed and released between two title reads
+        assert_eq!(latch.pad(FALLBACK, a), a);
+        assert_eq!(latch.pad(FALLBACK, PadState::default()), a);
+        latch.read(GAMEPAD_KIND);
+        assert_eq!(latch.pad(FALLBACK, PadState::default()), PadState::default());
+        // held across reads stays down, released after
+        assert_eq!(latch.pad(0, a), a);
+        latch.read(GAMEPAD_KIND);
+        assert_eq!(latch.pad(0, a), a);
+        latch.read(GAMEPAD_KIND);
+        assert_eq!(latch.pad(0, PadState::default()), PadState::default());
+        // keys: a keyboard read clears keys only
+        assert_eq!(latch.keys(vec![key(b'W')]), vec![key(b'W')]);
+        assert_eq!(latch.keys(vec![]), vec![key(b'W')]);
+        latch.read(GAMEPAD_KIND);
+        assert_eq!(latch.keys(vec![]), vec![key(b'W')]);
+        latch.read(KEYBOARD_KIND);
+        assert_eq!(latch.keys(vec![]), vec![]);
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {
