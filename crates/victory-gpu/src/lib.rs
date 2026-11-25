@@ -97,6 +97,10 @@ pub mod upscale;
 #[cfg(windows)]
 mod readtrace;
 #[cfg(windows)]
+mod tablereuse;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod titleprobe;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod wide_copy;

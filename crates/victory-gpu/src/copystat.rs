@@ -1088,6 +1088,7 @@ pub(crate) fn present_begins() {
 
 /// A frame was presented.
 pub(crate) fn presented() {
+    crate::titleprobe::start();
     add(C::Frames, 1);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);

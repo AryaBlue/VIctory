@@ -909,6 +909,8 @@ fn record(handle: u64, view: View) {
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
+    crate::tablereuse::bump();
+    #[cfg(windows)]
     WAITING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
