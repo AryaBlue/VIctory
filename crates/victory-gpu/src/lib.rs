@@ -104,6 +104,7 @@ mod wide_copy;
 mod wide_guard;
 #[cfg(windows)]
 mod guard_log;
+mod spans_once;
 
 #[cfg(windows)]
 pub use host::on_failure;

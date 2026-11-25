@@ -3113,6 +3113,12 @@ fn stale_under_flights(runs: &[&HostList], done: &dyn Fn(&std::sync::Arc<crate::
             }
         }
     }
+    stale_under_spans(&spans)
+}
+
+/// [`stale_under_flights`] of per-copy spans already built (and with
+/// `crate::spans_once`).
+fn stale_under_spans(spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> bool {
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5566,11 +5572,35 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // the refresh steps walked once for both the asking's spans and the look under flights
+        let once = (crate::spans_once::on() && (crate::watch::once() || behind)).then(|| {
+            let merge_once = crate::burst::merge_once();
+            let mut spans = crate::spans_once::Spans::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let covered = batch.covered(shadow, *address, *len);
+                        let asked = !shadow.unwatched() && !covered;
+                        let looked = behind && shadow.writes_pending() && !(merge_once && covered);
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        spans.add(shadow, key, *address, *len, asked, looked);
+                    }
+                }
+            }
+            spans
+        });
+        let stale_now = |batch: &Batch| match &once {
+            Some(spans) => stale_under_spans(&spans.stale),
+            None => stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)),
+        };
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
+            if let Some(once) = &once {
+                spans.clone_from(&once.ask);
+            }
+            for list in runs.iter().filter(|_| once.is_none()) {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
@@ -5595,13 +5625,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)) {
+            if behind && stale_now(&batch) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)) {
+        } else if behind && stale_now(&batch) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
