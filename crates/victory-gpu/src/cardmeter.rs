@@ -128,6 +128,8 @@ struct Passes {
     names: Vec<String>,
     ids: std::collections::BTreeMap<String, u32>,
     sums: Vec<[u64; 7]>,
+    /// Direct dispatches' thread groups: in all, the most in one.
+    groups: Vec<[u64; 2]>,
     frames: u64,
     since: Option<std::time::Instant>,
 }
@@ -136,6 +138,7 @@ static PASSES: Mutex<Passes> = Mutex::new(Passes {
     names: Vec::new(),
     ids: std::collections::BTreeMap::new(),
     sums: Vec::new(),
+    groups: Vec::new(),
     frames: 0,
     since: None,
 });
@@ -154,7 +157,25 @@ pub(crate) fn pass_key(name: String) -> u32 {
     p.names.push(name.clone());
     p.ids.insert(name, id);
     p.sums.push([0; 7]);
+    p.groups.push([0; 2]);
     id
+}
+
+/// A direct dispatch of pass `id` asked for `n` thread groups.
+pub(crate) fn pass_groups(id: u32, n: u64) {
+    if let Some(g) = passes_lock().groups.get_mut(id as usize) {
+        g[0] += n;
+        g[1] = g[1].max(n);
+    }
+}
+
+/// The pass names with what their direct dispatches asked for, where they had any.
+fn with_groups(names: &[String], sums: &[[u64; 7]], groups: &[[u64; 2]]) -> Vec<String> {
+    names
+        .iter()
+        .zip(sums.iter().zip(groups))
+        .map(|(n, (s, g))| if g[0] > 0 { format!("{n}  groups {:.0} a dispatch, most {}", g[0] as f64 / s[3].max(1) as f64, g[1]) } else { n.clone() })
+        .collect()
 }
 
 /// What a pass recorded: 0 a draw, 1 a dispatch, 2 a clamp of ours, 3 a window batched
@@ -488,10 +509,12 @@ pub(crate) fn collect() {
         p.frames += 1;
         let since = *p.since.get_or_insert(now);
         if now.duration_since(since) >= std::time::Duration::from_secs(10) {
-            for line in pass_table(&p.names, &p.sums, p.frames, pass_rows()) {
+            let names = with_groups(&p.names, &p.sums, &p.groups);
+            for line in pass_table(&names, &p.sums, p.frames, pass_rows()) {
                 tracing::info!("{line}");
             }
             p.sums.iter_mut().for_each(|s| *s = [0; 7]);
+            p.groups.iter_mut().for_each(|g| *g = [0; 2]);
             p.frames = 0;
             p.since = Some(now);
         }
@@ -520,6 +543,8 @@ mod tests {
         assert!(lines[3].ends_with("other depth-only draws (1 passes)") && lines[3].contains("4.0 batched") && lines[3].contains("3.0 read"), "{}", lines[3]);
         // the same key twice is one pass
         assert_eq!(pass_key("a test pass".to_owned()), pass_key("a test pass".to_owned()));
+        let named = with_groups(&["dispatches | a".to_owned(), "draws | b".to_owned()], &[[0, 0, 0, 2, 0, 0, 0], [0; 7]], &[[300, 200], [0; 2]]);
+        assert_eq!(named, ["dispatches | a  groups 150 a dispatch, most 200", "draws | b"]);
     }
 
     #[test]

@@ -2779,6 +2779,9 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        if crate::cardmeter::passes() {
+            crate::cardmeter::pass_groups(self.pass_id, u64::from(x) * u64::from(y) * u64::from(z));
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
