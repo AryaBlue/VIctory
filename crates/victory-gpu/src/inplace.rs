@@ -278,6 +278,21 @@ fn class_of(protect: Option<u32>) -> usize {
     }
 }
 
+// VICTORY_INPLACE_WRITTEN=1: carded title buffers shaders write most frames are swapped for title memory in place
+// (needs VICTORY_INPLACE>=2, and 3 under late wait so in-place writes are declared)
+pub(crate) fn written_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_WRITTEN").is_ok_and(|v| v == "1") && level() >= 2 && (level() >= 3 || !crate::host::late())
+    })
+}
+
+// the biggest written buffer swapped in place, VICTORY_INPLACE_WRITTEN_MAX_MB (32): the 174 MB heap stays carded
+pub(crate) fn written_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_WRITTEN_MAX_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(32) << 20)
+}
+
 // a big buffer goes in place instead of to the card
 pub(crate) fn upload_in_place(start: u64, len: u64) -> bool {
     let want = upload_level();
@@ -330,6 +345,16 @@ fn say() {
         s[6],
         s[7]
     );
+    if written_on() {
+        let p = crate::shadow::promoted_stats();
+        tracing::info!(
+            "written title buffers swapped in place: {}, refused {}, put off while busy {}; copies taken out of the tables {}",
+            p[0],
+            p[1],
+            p[2],
+            crate::shadow::superseded_count()
+        );
+    }
 }
 
 /// What a heap is opened on.
@@ -1203,6 +1228,9 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 pub(crate) fn tick() {
     if level() > 0 {
         say();
+    }
+    if written_on() {
+        crate::shadow::promote_written();
     }
     if probe_level() == 0 {
         return;

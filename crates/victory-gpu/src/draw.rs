@@ -443,7 +443,7 @@ fn walk_slot(
         return None;
     };
     let t = std::time::Instant::now();
-    let found = match caching.then(|| cached_range(cache, index, key)).flatten() {
+    let found = match caching.then(|| cached_range(cache, index, key)).flatten().filter(|c| !c.0.superseded()) {
         Some((shadow, from, to)) => {
             split(HeapSplit::CacheHits, 1);
             Some((shadow, from, to - from))
@@ -472,6 +472,7 @@ struct HeapSource {
     start: u64,
     caching: bool,
     cache: std::collections::HashMap<u32, Cached>,
+    seen: u64,
 }
 
 impl HeapSource {
@@ -480,9 +481,34 @@ impl HeapSource {
     }
 }
 
+// slots whose copy was taken out of the tables: their host descriptors are made again
+fn stale_slots(
+    host: &crate::descriptor::host::HostHeap,
+    ranges: &std::collections::HashMap<u32, crate::heap_walk::Range<crate::shadow::Shadow>>,
+    seen: &mut u64,
+) -> Vec<u32> {
+    let now = crate::shadow::superseded_count();
+    if now == *seen {
+        return Vec::new();
+    }
+    *seen = now;
+    let stale: Vec<u32> = ranges.iter().filter(|(_, r)| r.0.superseded()).map(|(&i, _)| i).collect();
+    for &index in &stale {
+        host.forget_made(index);
+    }
+    stale
+}
+
 impl crate::heap_walk::Source<crate::shadow::Shadow> for HeapSource {
     fn changes(&mut self) -> Option<Vec<u32>> {
         self.host(|host| host.buffer_changes())
+    }
+
+    fn stale(&mut self, ranges: &std::collections::HashMap<u32, crate::heap_walk::Range<crate::shadow::Shadow>>) -> Vec<u32> {
+        let mut seen = self.seen;
+        let stale = self.host(|host| stale_slots(host, ranges, &mut seen)).unwrap_or_default();
+        self.seen = seen;
+        stale
     }
 
     fn slots(&mut self) -> Option<Vec<u32>> {
@@ -531,7 +557,7 @@ fn walk_worker(
         return Some(shared.clone());
     }
     let shared = crate::heap_walk::Shared::new();
-    let source = HeapSource { at: key.0, start: key.1, caching: heap_range_cache(), cache: Default::default() };
+    let source = HeapSource { at: key.0, start: key.1, caching: heap_range_cache(), cache: Default::default(), seen: 0 };
     let handed = shared.clone();
     std::thread::Builder::new()
         .name("victory heap walk".into())
@@ -1610,11 +1636,19 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
+        static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+        let stale = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = seen.get_or_insert_with(Default::default).entry(std::ptr::from_ref(host) as usize).or_insert(0);
+            stale_slots(host, ranges, seen)
+        };
         let slots = if *passes % 16 == 0 {
             ranges.clear();
             split(HeapSplit::FullWalks, 1);
             host.buffer_slots()
         } else {
+            let mut changed = changed;
+            changed.extend(stale);
             changed
         };
         split(HeapSplit::Slots, slots.len() as u64);

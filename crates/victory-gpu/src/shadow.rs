@@ -77,6 +77,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    // replaced in the tables (promoted in place or let go on a remap): holders must find again
+    superseded: std::sync::atomic::AtomicBool,
+    // last frame shaders were declared writing it, and how many frames did
+    heat: [AtomicU64; 2],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2347,7 +2351,43 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            superseded: std::sync::atomic::AtomicBool::new(false),
+            heat: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
         }
+    }
+
+    // replaced in the tables: slots and caches holding it must find again
+    pub(crate) fn superseded(&self) -> bool {
+        self.superseded.load(Ordering::Relaxed)
+    }
+
+    // out of the tables: refreshed whole from now on (in-place writes are not write-watched)
+    fn supersede(&self) {
+        if !self.superseded.swap(true, Ordering::Relaxed) {
+            if self.place.is_none() {
+                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            }
+            SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // nothing of its own in flight: no declared writes waiting to come back, nothing unsent
+    fn idle(&self) -> bool {
+        {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.is_empty() || !self.flights.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty() {
+                return false;
+            }
+        }
+        let Some(c) = &self.card else {
+            return true;
+        };
+        let unsent = {
+            let dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            !dirty.is_empty() || !c.sent.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        };
+        let masked = !c.masked.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        !unsent && !masked
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2392,6 +2432,10 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        let frame = crate::frame::current();
+        if self.heat[0].swap(frame, Ordering::Relaxed) != frame {
+            self.heat[1].fetch_add(1, Ordering::Relaxed);
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3536,9 +3580,103 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     for shadow in gone {
+        shadow.supersede();
         crate::host::retire(shadow);
     }
     n
+}
+
+// copies taken out of the tables so far: a heap pass that saw another count looks for slots showing one
+static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn superseded_count() -> u64 {
+    SUPERSEDED.load(Ordering::Relaxed)
+}
+
+// promotions so far: in place, refused by the host, waited for (not idle)
+static PROMOTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub(crate) fn promoted_stats() -> [u64; 3] {
+    std::array::from_fn(|i| PROMOTED[i].load(Ordering::Relaxed))
+}
+
+// shaders write it in at least half the frames since it was last looked at (8 frames at least)
+pub(crate) fn written_hot(frames: u64, written: u64) -> bool {
+    frames >= 8 && written * 2 >= frames
+}
+
+// the copy in the tables for title buffer `old` is swapped for `placed`; false if it is not there any more
+pub(crate) fn swap_in_place(old: &Arc<Shadow>, placed: crate::inplace::Placed) -> bool {
+    let (start, len) = (old.start, old.len);
+    let new = Arc::new(Shadow::placed(placed, start, len, false));
+    let swapped = {
+        let mut map = buffers();
+        let entry = map
+            .range_mut(..=(start, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, old)))
+            .map(|(_, e)| e);
+        match entry {
+            Some(entry) => entry.shadow.replace(new),
+            None => None,
+        }
+    };
+    match swapped {
+        Some(was) => {
+            was.supersede();
+            crate::host::retire(was);
+            true
+        }
+        None => false,
+    }
+}
+
+// VICTORY_INPLACE_WRITTEN: big carded title buffers shaders write most frames are swapped for title memory in place
+pub(crate) fn promote_written() {
+    let cap = crate::inplace::written_most();
+    let frame = crate::frame::current();
+    static SEEN: Mutex<Option<std::collections::HashMap<u64, (u64, u64)>>> = Mutex::new(None);
+    static REFUSED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    let carded: Vec<Arc<Shadow>> = {
+        let mut list = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|w| w.strong_count() > 0);
+        list.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    let refused = refused.get_or_insert_with(Default::default);
+    let live: std::collections::HashSet<u64> = carded.iter().map(|s| s.id).collect();
+    seen.retain(|id, _| live.contains(id));
+    for shadow in carded {
+        if shadow.window || shadow.superseded() || shadow.len > cap || refused.contains(&shadow.id) {
+            continue;
+        }
+        let written = shadow.heat[1].load(Ordering::Relaxed);
+        let (at, was) = *seen.entry(shadow.id).or_insert((frame, written));
+        if !written_hot(frame.saturating_sub(at), written - was) {
+            if frame.saturating_sub(at) >= 64 {
+                seen.insert(shadow.id, (frame, written));
+            }
+            continue;
+        }
+        if !shadow.idle() {
+            PROMOTED[2].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let Some(placed) = crate::inplace::place_for(shadow.start, shadow.len, false) else {
+            refused.insert(shadow.id);
+            PROMOTED[1].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        // a placed copy that found no entry drops here and uncounts itself
+        if swap_in_place(&shadow, placed) {
+            PROMOTED[0].fetch_add(1, Ordering::Relaxed);
+            tracing::info!(start = format_args!("{:#x}", shadow.start), len = shadow.len, "a written title buffer is in place now (VICTORY_INPLACE_WRITTEN)");
+        }
+        seen.remove(&shadow.id);
+    }
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -4050,6 +4188,113 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod promote_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory as mem;
+
+    fn warp() -> Option<ID3D12Device> {
+        // SAFETY: plain creation on the software adapter
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            device.filter(|d| d.cast::<ID3D12Device13>().is_ok())
+        }
+    }
+
+    // hot means written in half the frames looked at, over 8 frames at least
+    #[test]
+    fn written_most_frames_is_hot() {
+        assert!(!written_hot(4, 4));
+        assert!(written_hot(8, 4));
+        assert!(!written_hot(16, 7));
+        assert!(written_hot(16, 16));
+    }
+
+    // declared writes count once per frame
+    #[test]
+    fn heat_counts_frames_not_declarations() {
+        let mut side = vec![0u8; 4096];
+        let Some(device) = warp() else { return };
+        let placed = {
+            // SAFETY: the test's own allocation
+            let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) };
+            crate::inplace::place_part(&device, base as u64, 4096).ok()
+        };
+        let Some(placed) = placed else { return };
+        let mut shadow = Shadow::new(placed.buffer.clone(), side.as_mut_ptr(), 0, 0x10_0000, 4096);
+        // carded: writing only notes the range (size 0: no card bytes counted)
+        shadow.card = Some(Card {
+            staging: placed.buffer.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            masked: Mutex::default(),
+            size: 0,
+        });
+        shadow.writing(0x10_0000, 64);
+        shadow.writing(0x10_0040, 64);
+        assert_eq!(shadow.heat[1].load(Ordering::Relaxed), 1);
+        drop(shadow);
+    }
+
+    // a written buffer's copy swapped for title memory in place: found in place from then on, the old one
+    // superseded, refreshed whole, and its slots told
+    #[test]
+    fn a_copy_swapped_in_place_is_superseded() {
+        let Some(device) = warp() else { return };
+        // SAFETY: the test's own allocation, released at the end
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 4 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            let (start, len) = (base as u64 + 0x100, 2 << 16);
+            let mut side = vec![0u8; len as usize];
+            let resource = base as usize ^ 0x5a5a;
+            register(resource, start, len);
+            let old = {
+                let placed = crate::inplace::place_part(&device, start, len).expect("placed");
+                let old = Arc::new(Shadow::new(placed.buffer.clone(), side.as_mut_ptr(), 0, start, len));
+                buffers().get_mut(&(start, resource)).unwrap().shadow = Some(old.clone());
+                old
+            };
+            assert!(old.idle());
+            let before = superseded_count();
+            let placed = crate::inplace::place_part(&device, start, len).expect("placed");
+            assert!(swap_in_place(&old, placed));
+            assert!(old.superseded() && old.unwatched());
+            assert!(superseded_count() > before);
+            let now = buffers().get(&(start, resource)).and_then(|e| e.shadow.clone()).expect("an entry");
+            assert!(now.in_place() && !Arc::ptr_eq(&now, &old));
+            assert_eq!(now.gpu(start) & 0xffff, 0x100, "the bias holds");
+            let placed = crate::inplace::place_part(&device, start, len).expect("placed");
+            assert!(!swap_in_place(&old, placed), "gone from the tables: nothing to swap");
+            unregister(resource, start);
+            drop((now, old));
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    // a copy with declared writes still waiting is not swapped
+    #[test]
+    fn a_busy_copy_is_not_idle() {
+        let mut side = vec![0u8; 4096];
+        let Some(device) = warp() else { return };
+        // SAFETY: the test's own allocation
+        let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) };
+        let Ok(placed) = crate::inplace::place_part(&device, base as u64, 4096) else { return };
+        let shadow = Shadow::new(placed.buffer.clone(), side.as_mut_ptr(), 0, 0x20_0000, 4096);
+        shadow.pending.lock().unwrap().push((0x20_0000, 0x20_0040));
+        assert!(!shadow.idle());
+        shadow.pending.lock().unwrap().clear();
+        assert!(shadow.idle());
     }
 }
 

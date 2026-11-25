@@ -1943,6 +1943,13 @@ impl HostHeap {
         Some(view)
     }
 
+    // the slot's host descriptor is made again at the next mirror (its copy left the tables)
+    pub(crate) fn forget_made(&self, index: u32) {
+        if let Some(key) = self.made.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *key = 0;
+        }
+    }
+
     /// Whether slot `index` is backed by a made host descriptor (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {

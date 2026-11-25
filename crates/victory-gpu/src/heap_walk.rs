@@ -19,6 +19,10 @@ pub(crate) trait Source<T>: Send + 'static {
     /// Walks `slots` into `ranges` (each slot dropped, then put back if it
     /// still reads a copy); false once the heap is gone.
     fn walk(&mut self, slots: &[u32], ranges: &mut HashMap<u32, Range<T>>) -> bool;
+    // slots whose copy went stale since the last round (walked again)
+    fn stale(&mut self, _ranges: &HashMap<u32, Range<T>>) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// What the worker hands the recording thread: per copy, the span its
@@ -102,7 +106,8 @@ pub(crate) fn run<T, S: Source<T>>(mut source: S, shared: Arc<Shared<T>>, chunk:
             full_at = Some(passes);
             changed = true;
         }
-        let Some(slots) = source.changes() else { break 'walk };
+        let Some(mut slots) = source.changes() else { break 'walk };
+        slots.extend(source.stale(&ranges));
         for part in slots.chunks(chunk.max(1)) {
             if !source.walk(part, &mut ranges) {
                 break 'walk;
@@ -169,6 +174,56 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         false
+    }
+
+    // a fake whose copy 0 goes stale once: slots holding it are walked again without a change
+    struct Stale(Fake, Arc<AtomicBool>);
+
+    impl Source<usize> for Stale {
+        fn changes(&mut self) -> Option<Vec<u32>> {
+            self.0.changes()
+        }
+        fn slots(&mut self) -> Option<Vec<u32>> {
+            self.0.slots()
+        }
+        fn walk(&mut self, slots: &[u32], ranges: &mut HashMap<u32, Range<usize>>) -> bool {
+            self.0.walk(slots, ranges)
+        }
+        fn stale(&mut self, ranges: &HashMap<u32, Range<usize>>) -> Vec<u32> {
+            if !self.1.swap(false, Ordering::Relaxed) {
+                return Vec::new();
+            }
+            ranges.iter().filter(|(_, r)| *r.0 == 0).map(|(&i, _)| i).collect()
+        }
+    }
+
+    #[test]
+    fn stale_slots_are_walked_again_without_a_change() {
+        let heap = Arc::new(Mutex::new((HashMap::new(), Vec::new(), false)));
+        heap.lock().unwrap().0.insert(1, (0, 0x100, 0x200));
+        let shared = Shared::new();
+        let stale = Arc::new(AtomicBool::new(false));
+        let fake = Stale(Fake { slots: heap.clone(), copies: vec![Arc::new(0), Arc::new(1)] }, stale.clone());
+        let worker = {
+            let shared = shared.clone();
+            std::thread::spawn(move || run(fake, shared, 2, Duration::from_millis(1)))
+        };
+        assert_eq!(sorted(&shared.pass(Duration::from_secs(5)).expect("first walk")), vec![(0, 0x100, 0x200)]);
+        // the slot now reads copy 1 (as a swapped copy would), with no change queued
+        heap.lock().unwrap().0.insert(1, (1, 0x100, 0x200));
+        stale.store(true, Ordering::Relaxed);
+        // under 16 passes, so no full walk can be what finds it
+        let mut found = false;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(30));
+            if shared.pass(Duration::ZERO).is_some_and(|s| sorted(&s) == [(1, 0x100, 0x200)]) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the stale slot was not walked again");
+        heap.lock().unwrap().2 = true;
+        worker.join().unwrap();
     }
 
     #[test]
