@@ -37,6 +37,8 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    // push: ranges the last refreshes found nothing to copy in
+    quiet: Mutex<crate::push::Quiet>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -2429,6 +2431,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            quiet: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3279,6 +3282,46 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if !crate::push::on() {
+            return self.update_old(from, to).0;
+        }
+        use crate::push::stat;
+        crate::push::tick();
+        let mut held = false;
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            let known = self.quiet.lock().unwrap_or_else(|e| e.into_inner()).holds(from, to);
+            match known {
+                Some(true) if crate::watch::standing(from, to) => {
+                    if !crate::push::check() {
+                        stat(0, 1);
+                        return 0;
+                    }
+                    held = true;
+                }
+                Some(true) => stat(3, 1),
+                Some(false) => stat(2, 1),
+                None => stat(1, 1),
+            }
+        }
+        let differing = if held { self.differs(from, to - from) } else { None };
+        // before the asking: a change it does not see moves the token
+        let at = crate::push::token(from, to);
+        let (bytes, free) = self.update_old(from, to);
+        if held {
+            stat(4, 1);
+            if bytes > 0 {
+                crate::push::missed(from, to - from, bytes, differing);
+            }
+        }
+        // nothing to copy and no shader writing: the range holds the title's bytes
+        if free && bytes == 0 {
+            self.quiet.lock().unwrap_or_else(|e| e.into_inner()).note(from, to, at);
+        }
+        bytes
+    }
+
+    // the refresh of `[from, to)` (inside the buffer) as it always was; and whether no shader writes in it
+    fn update_old(&self, from: usize, to: usize) -> (usize, bool) {
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3302,9 +3345,9 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
-            return bytes;
+            return (bytes, false);
         }
-        self.update_free(from, to)
+        (self.update_free(from, to), true)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

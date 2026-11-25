@@ -21,6 +21,8 @@ mod capture;
 #[cfg(windows)]
 mod burst;
 #[cfg(windows)]
+mod push;
+#[cfg(windows)]
 mod fasthash;
 #[cfg(windows)]
 mod ask_early;

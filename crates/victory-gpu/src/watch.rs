@@ -139,6 +139,7 @@ fn lean_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 
 // notes `page` written at `now` in the pieces of `mask`
 fn note(j: &mut Journal, page: usize, now: u64, mask: u16) {
+    crate::push::changed(page);
     let prev = j.written.insert(page, now);
     if !fine_pages() {
         return;
@@ -435,9 +436,11 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
         j.ahead_asked = now;
     }
     let before = j.written.insert(page, now).unwrap_or(0);
+    crate::push::changed(page);
     for &other in others {
         if other != page {
             j.written.insert(other, now);
+            crate::push::changed(other);
         }
     }
     (before, now)
@@ -511,6 +514,21 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
         .then(|| (j.ahead_asked, j.written.range(first, last)))
+}
+
+// push: whether writes() would answer `[start, end)` now with no question to the kernel or to Windows
+pub(crate) fn standing(start: usize, end: usize) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return true;
+    }
+    // absent blocks are asked about at every pass, or with commit notices on retry frames
+    let asks_absent = !crate::guard_log::commit_notice() || crate::guard_log::retry_frame(crate::frame::current());
+    let g = guards();
+    let known = g.protected.contains(&first)
+        || g.absent.contains(&first)
+        || ((seen_views() || view_known()) && g.views.contains(&first));
+    known && !(asks_absent && g.absent.range(first..last).next().is_some())
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -849,6 +867,7 @@ impl Guards {
 
     /// `block` is no longer clean (opened, or committed).
     fn set_unclean(&mut self, block: usize) {
+        crate::push::changed(block);
         self.clean.remove(&block);
         if self.covered.holds(block, block + 1) {
             self.unclean.insert(block);
@@ -1568,6 +1587,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    crate::push::changed_pages(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
