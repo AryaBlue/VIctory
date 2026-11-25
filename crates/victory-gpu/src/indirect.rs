@@ -72,6 +72,8 @@ static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
+// With VICTORY_CLAMP_STATS: the group's records the clamp changed.
+groupshared uint altered_n;
 groupshared uint all_asked;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -200,6 +202,37 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
     }
+    // Bit 7: count the records the clamp changes (outside a window), per list in the
+    // budget's words 3 (dispatches) and 4 (draws), and per clamp in its slot (bits 8 up,
+    // one more than the slot; group 0's records).
+    if ((has_count & 128u) != 0) {
+        if (gi == 0) {
+            altered_n = 0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (active && !ahead) {
+            bool cut = fits[gi] == 0;
+            bool changed;
+            if (kind <= 1) {
+                changed = any((cut ? uint2(0, 0) : draw_counts) != src_args.Load2(src_at));
+            } else {
+                changed = any((cut ? uint3(0, 0, 0) : groups) != src_args.Load3(src_at));
+            }
+            if (changed) {
+                uint was;
+                InterlockedAdd(altered_n, 1u, was);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (gi == 0 && altered_n > 0) {
+            uint was;
+            budget.InterlockedAdd(kind == 2 ? 12 : 16, altered_n, was);
+        }
+        uint slot = has_count >> 8;
+        if (gi == 0 && slot != 0 && first == 0) {
+            budget.Store(256 + (slot - 1) * 4, altered_n);
+        }
+    }
     if (!active) {
         return;
     }
@@ -223,6 +256,28 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
 }
 "#;
+
+/// Whether the clamp counts the records it changes (`VICTORY_CLAMP_STATS=1`; diagnostics):
+/// per list, and per indirect dispatch by pipeline and argument buffer
+/// (`crate::host::clamp_stats_line`).
+pub(crate) fn clamp_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_STATS").is_some_and(|v| v == "1"))
+}
+
+/// The stats slots of a list's budget buffer: one word each, after its first 256 bytes.
+pub(crate) const CLAMP_SLOTS: u32 = 2048;
+
+thread_local! {
+    /// One more than the stats slot the next clamp alone writes, or 0.
+    static CLAMP_SLOT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The next clamp of one record set on this thread writes its stats to `slot` (one more
+/// than its index; 0 for none).
+pub(crate) fn clamp_slot(slot: u32) {
+    CLAMP_SLOT.with(|s| s.set(slot));
+}
 
 /// Whether an indirect dispatch whose arguments no shader was ever declared to write is
 /// clamped on the CPU when its list is submitted, into the list's upload memory, with no
@@ -507,13 +562,15 @@ fn record_clamp_at(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamps_at(c, l, (dst, before), budget, &[ClampJob { dst_offset, src, count, spec, ahead }])
+    record_clamps_at(c, l, (dst, before), budget, &[ClampJob { slot: CLAMP_SLOT.with(|s| s.replace(0)), dst_offset, src, count, spec, ahead }])
 }
 
 /// One clamp of [`record_clamps_at`]: where it writes in the scratch buffer, its records'
 /// source, count buffer, layout (kind, stride, records), and whether they are a window
 /// clamped ahead.
 pub(crate) struct ClampJob<'a> {
+    /// One more than its stats slot ([`clamp_slot`]), or 0.
+    pub(crate) slot: u32,
     pub(crate) dst_offset: u64,
     pub(crate) src: (&'a ID3D12Resource, u64),
     pub(crate) count: Option<(&'a ID3D12Resource, u64)>,
@@ -553,7 +610,8 @@ fn job_roots(dst: &ID3D12Resource, job: &ClampJob) -> Option<([u32; 6], u64, u64
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(job.ahead) << 1), count_offset];
+    let stats = if clamp_stats() || job.slot != 0 { 128 | (job.slot << 8) } else { 0 };
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(job.ahead) << 1) | stats, count_offset];
     Some((constants, src_gpu, count_gpu, dst_gpu))
 }
 
@@ -657,7 +715,7 @@ pub(crate) fn bound_batch_in_ring(
     let made: Vec<ClampJob> = jobs
         .iter()
         .zip(&offsets)
-        .map(|(&(src, spec, ahead), &dst_offset)| ClampJob { dst_offset, src, count: None, spec, ahead })
+        .map(|(&(src, spec, ahead), &dst_offset)| ClampJob { slot: 0, dst_offset, src, count: None, spec, ahead })
         .collect();
     let before = list.indirect_state(&dst);
     if !record_clamps_at(c, &list.list, (&dst, before), budget, &made) {
@@ -1775,7 +1833,7 @@ void main() {
         }
         let jobs: Vec<ClampJob> = windows
             .iter()
-            .map(|&(from, to)| ClampJob { dst_offset: to, src: (&src_buf, from), count: None, spec: (KIND_MESH, STRIDE, RECORDS), ahead: true })
+            .map(|&(from, to)| ClampJob { slot: 0, dst_offset: to, src: (&src_buf, from), count: None, spec: (KIND_MESH, STRIDE, RECORDS), ahead: true })
             .collect();
         assert!(record_clamps_at(&warp.clamp, &warp.list, (&dst_buf, D3D12_RESOURCE_STATE_COMMON), budget_gpu, &jobs));
         // SAFETY: an open list; the scratch buffer is left readable as arguments.
@@ -1981,6 +2039,44 @@ void main() {
                 assert_eq!(largest, u32::MAX);
             }
         }
+    }
+
+    #[test]
+    fn warp_a_clamp_with_a_stats_slot_counts_the_records_it_changed() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let records: [[u32; 3]; 3] = [[70_000, 1, 1], [4, 2, 1], [8, 8, 1]];
+        let bytes = STRIDE as usize * records.len();
+        let (src_buf, src_ptr, _) = warp.shared_buffer(bytes as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256 + 64);
+        let dst_buf = warp.default_uav(bytes as u64);
+        // SAFETY: mapped buffers have sufficient capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), src_ptr, bytes);
+            std::ptr::write_bytes(budget_ptr, 0, 256 + 64);
+        }
+        clamp_slot(3);
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DISPATCH, STRIDE, records.len() as u32),
+            false,
+        ));
+        warp.submit_and_wait();
+        // SAFETY: GPU work completed.
+        let words = unsafe { std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 64 + 16).to_vec() };
+        // one record cut to 65,535 groups in x; the others as they were
+        assert_eq!(words[3], 1, "dispatch records changed");
+        assert_eq!(words[4], 0, "draw records changed");
+        assert_eq!(words[64 + 2], 1, "the clamp's slot");
+        assert_eq!(words[64], 0, "other slots untouched");
     }
 
     #[test]

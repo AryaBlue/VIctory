@@ -890,6 +890,8 @@ pub(crate) struct HostList {
     /// With `crate::indirect::cpu_dispatch_clamp`: the work the dispatches clamped on the
     /// CPU charged since the list's submission began.
     cpu_budget: std::sync::Arc<AtomicU32>,
+    /// The stats slots' tags of the list's last recording, read with its budget's words.
+    last_tags: std::sync::Arc<Mutex<Vec<u32>>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1381,6 +1383,56 @@ pub(crate) fn dred_on() -> bool {
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The bytes of a list's budget buffer: the budget's words, then the clamp's stats slots.
+const BUDGET_BYTES: u64 = 256 + 4 * crate::indirect::CLAMP_SLOTS as u64;
+
+/// With `crate::indirect::clamp_stats`, since the frame line: records the clamp changed
+/// (dispatches, draws outside windows), and per indirect dispatch tag (pipeline, argument
+/// buffer) the clamps read back and those that changed their record.
+static CLAMP_ALTERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static CLAMP_TAGS: std::sync::Mutex<Option<(std::collections::HashMap<(String, u64), u32>, Vec<(String, u64, u64, u64)>)>> =
+    std::sync::Mutex::new(None);
+
+/// The tag of indirect dispatches of `pipeline` from the argument copy `args`.
+pub(crate) fn clamp_tag(pipeline: &str, args: u64) -> u32 {
+    let mut tags = CLAMP_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let (ids, all) = tags.get_or_insert_with(Default::default);
+    if let Some(&id) = ids.get(&(pipeline.to_owned(), args)) {
+        return id;
+    }
+    let id = all.len() as u32;
+    ids.insert((pipeline.to_owned(), args), id);
+    all.push((pipeline.to_owned(), args, 0, 0));
+    id
+}
+
+/// The clamp stats since the last call, as lines: totals, then the tags whose clamps
+/// changed a record, most first.
+pub(crate) fn clamp_stats_lines(frames: f64) -> Vec<String> {
+    let [dispatches, draws] = [0, 1].map(|i| CLAMP_ALTERED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let mut tags = CLAMP_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, all)) = tags.as_mut() else {
+        return vec![format!("clamp stats per frame: {dispatches:.1} dispatch records changed, {draws:.1} draw records changed")];
+    };
+    let runs: u64 = all.iter().map(|t| t.2).sum();
+    let mut changed: Vec<(String, u64, u64, u64)> = all.iter().filter(|t| t.3 > 0).cloned().collect();
+    changed.sort_by_key(|t| std::cmp::Reverse(t.3));
+    let mut lines = vec![format!(
+        "clamp stats per frame: dispatch clamps {:.1} run (read back by slot), {dispatches:.1} dispatch records changed, {draws:.1} draw records changed outside windows; {} pipeline and buffer pairs, {} of them ever changed",
+        runs as f64 / frames,
+        all.len(),
+        changed.len()
+    )];
+    for (pipeline, args, run, alt) in changed.iter().take(8) {
+        lines.push(format!("  changed {alt} of {run} clamps: {pipeline}, argument copy {args}"));
+    }
+    for t in all.iter_mut() {
+        t.2 = 0;
+        t.3 = 0;
+    }
+    lines
+}
 
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
@@ -2056,6 +2108,9 @@ struct Deferred {
     budget_zeroed: bool,
     /// Whether the CPU's clamp budget is zeroed for this recording.
     cpu_budget_zeroed: bool,
+    /// With `crate::indirect::clamp_stats`: the tags of the clamps given stats slots, in
+    /// slot order.
+    clamp_tags: Vec<u32>,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -3998,6 +4053,7 @@ impl Host {
                 gather: Mutex::default(),
                 title_waited: std::sync::atomic::AtomicBool::new(false),
                 cpu_budget: std::sync::Arc::default(),
+                last_tags: std::sync::Arc::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6204,7 +6260,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        {
+            let mut deferred = self.deferred();
+            *self.last_tags.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut deferred.clamp_tags);
+            *deferred = Deferred::default();
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6273,6 +6333,17 @@ impl HostList {
             deferred.copies.push(Step::Host(Box::new(move || budget.store(0, Ordering::Relaxed))));
         }
         self.cpu_budget.clone()
+    }
+
+    /// A stats slot for the next clamp, of dispatches tagged `tag`: one more than its
+    /// index, or 0 if the list has none left.
+    pub(crate) fn clamp_slot(&self, tag: u32) -> u32 {
+        let mut deferred = self.deferred();
+        if deferred.clamp_tags.len() >= crate::indirect::CLAMP_SLOTS as usize {
+            return 0;
+        }
+        deferred.clamp_tags.push(tag);
+        deferred.clamp_tags.len() as u32
     }
 
     /// The pass being recorded ends here.
@@ -6917,7 +6988,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer(BUDGET_BYTES)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -6926,6 +6997,7 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
+            let last_tags = self.last_tags.clone();
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -6936,7 +7008,22 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                if crate::indirect::clamp_stats() {
+                    CLAMP_ALTERED[0].fetch_add(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
+                    CLAMP_ALTERED[1].fetch_add(u64::from(words.add(4).read_volatile()), Ordering::Relaxed);
+                    let last = last_tags.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut tags = CLAMP_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((_, all)) = tags.as_mut() {
+                        for (slot, &tag) in last.iter().enumerate() {
+                            let n = words.add(64 + slot).read_volatile();
+                            if let Some(t) = all.get_mut(tag as usize) {
+                                t.2 += 1;
+                                t.3 += u64::from(n.min(1));
+                            }
+                        }
+                    }
+                }
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6956,7 +7043,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer(BUDGET_BYTES)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -6970,7 +7057,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7011,7 +7098,8 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            let bytes = if crate::indirect::clamp_stats() { BUDGET_BYTES - 4 } else { 8 };
+            self.list.CopyBufferRegion(mapped, 4, card, 4, bytes);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8025,6 +8113,11 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        if crate::indirect::clamp_stats() {
+            for line in clamp_stats_lines(frames) {
+                tracing::info!("{line}");
+            }
+        }
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
         // dispatch runs; the counter went when the clamp's budget moved to

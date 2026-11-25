@@ -3909,6 +3909,9 @@ impl State {
                     }
                 }
                 crate::indirect::share_wait(crate::indirect::wait_share() & 1 != 0 && list.title_waited());
+                if crate::indirect::clamp_stats() && kind == DISPATCH {
+                    crate::indirect::clamp_slot(list.clamp_slot(crate::host::clamp_tag(&p.name, args.id())));
+                }
                 let bounded = if let Some((buffer, ats, epoch, fits)) = batched {
                     // the plan's windows go in before the head's, which is looked up first
                     for (p, &at) in fits.iter().zip(&ats[1..]) {
@@ -3935,6 +3938,7 @@ impl State {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)).map(|b| (b, 0, 0))
                 };
                 crate::indirect::share_wait(false);
+                crate::indirect::clamp_slot(0);
                 let Some((bounded, at, epoch)) = bounded else {
                     self.end_windows();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
