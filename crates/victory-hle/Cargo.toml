@@ -52,7 +52,9 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
-diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]
+diagnostics = ["keys", "victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]
+# scripted keys (VICTORY_KEYS) alone, for lean timing runs
+keys = []
 # dlss as an upscaler backend (VICTORY_UPSCALER=dlss); needs VICTORY_DLSS_SDK to build
 dlss = ["victory-gpu/dlss"]
 
