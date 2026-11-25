@@ -928,7 +928,17 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    // blocks the handler opened without the lock: opened here first (VICTORY_ONWRITE_LOCKFREE)
+    crate::guard_free::drain(|block, frame| opened_free(&mut g, block, frame));
+    g
+}
+
+// as the locked handler opens a block, for one the handler took (`crate::guard_free`)
+fn opened_free(g: &mut Guards, block: usize, frame: u64) {
+    if open(g, block * BLOCK, block * BLOCK + 1) && crate::guard_log::hot_count() {
+        g.faults.note(block, frame);
+    }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1254,6 +1264,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        crate::guard_free::mark(block);
         if seen_views() || view_known() {
             g.views.insert(block);
         }
@@ -1286,6 +1297,7 @@ pub(crate) fn set_read_only(from: usize, to: usize) -> bool {
 fn protect_noted(g: &mut Guards, from: usize, to: usize, done: bool) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
+        crate::guard_free::mark_range(from, to);
         g.set_clean_range(from, to);
         if seen_views() || view_known() {
             g.views.extend(from..to);
@@ -1393,6 +1405,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        crate::guard_free::unmark(block);
         g.set_unclean(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
@@ -1606,6 +1619,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        crate::guard_free::unmark(block);
         g.clean.remove(&block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
@@ -1663,6 +1677,14 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        // marked ours and read-only: opened without the lock, noted at the next drain
+        if crate::guard_free::take(at / BLOCK) {
+            open_taken(at / BLOCK);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1685,8 +1707,23 @@ fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
+        crate::guard_free::init();
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// In the handler, for a block [`crate::guard_free::take`] gave it: read-write
+/// now, and queued for the guards' next holder; under the lock if the queue
+/// is full.
+fn open_taken(block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a block we made read-only.
+    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    let frame = crate::frame::current();
+    if !crate::guard_free::push(block, frame) {
+        opened_free(&mut guards(), block, frame);
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -2476,6 +2513,75 @@ mod tests {
         let memory = unsafe { std::slice::from_raw_parts(one as *const u8, SIZE) };
         assert!(copy == memory, "a write was missed");
         drop_views(section, &[one, two], SIZE);
+    }
+
+    // VICTORY_ONWRITE_LOCKFREE: eight writers over two views of guarded blocks, faulting the
+    // lock-free way or the locked way; every write is in the copy taken from the checks
+    fn writers_against_checks(locked: bool) -> u64 {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const BLOCKS: usize = 16;
+        const SIZE: usize = BLOCKS * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let mut copy = vec![0u8; SIZE];
+        let take = |copy: &mut Vec<u8>| {
+            let pages = guard(one, one + SIZE).expect("a view");
+            for page in pages {
+                let at = page * PAGE - one;
+                // SAFETY: inside the first view.
+                let bytes = unsafe { std::slice::from_raw_parts((one + at) as *const u8, PAGE) };
+                copy[at..at + PAGE].copy_from_slice(bytes);
+            }
+        };
+        take(&mut copy);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writes = std::sync::Arc::new(AtomicU64::new(0));
+        let writers: Vec<_> = (0..8)
+            .map(|t| {
+                let (stop, writes) = (stop.clone(), writes.clone());
+                std::thread::spawn(move || {
+                    crate::guard_free::LOCKED.with(|l| l.set(locked));
+                    let mut x = 0x2545_f491_4f6c_dd1du64 ^ (t << 8) ^ u64::from(locked);
+                    let mut n = 0u64;
+                    while (!stop.load(Ordering::Relaxed) || n < 2_000) && n < 300_000 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let view = if x & 1 == 0 { one } else { two };
+                        let at = (x as usize >> 8) % SIZE;
+                        // SAFETY: inside a view; the handler opens a guarded block.
+                        unsafe { ((view + at) as *mut u8).write_volatile((x >> 40) as u8) };
+                        n += 1;
+                    }
+                    writes.fetch_add(n, Ordering::Relaxed);
+                })
+            })
+            .collect();
+        for _ in 0..300 {
+            take(&mut copy);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        take(&mut copy);
+        // SAFETY: the whole first view.
+        let memory = unsafe { std::slice::from_raw_parts(one as *const u8, SIZE) };
+        assert!(copy == memory, "a write was missed (locked: {locked})");
+        drop_views(section, &[one, two], SIZE);
+        writes.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn lock_free_opens_miss_no_write_under_eight_writers() {
+        let taken = crate::guard_free::TAKEN[0].load(std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let n = writers_against_checks(false);
+        let free = t.elapsed();
+        assert!(crate::guard_free::TAKEN[0].load(std::sync::atomic::Ordering::Relaxed) > taken, "the lock-free way was taken");
+        let t = std::time::Instant::now();
+        let m = writers_against_checks(true);
+        let locked = t.elapsed();
+        println!("eight writers against 301 checks: lock-free {n} writes in {free:?}, locked {m} writes in {locked:?}");
     }
 
     /// A write or mapping that runs past the end of the address space (a

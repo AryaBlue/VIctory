@@ -108,6 +108,7 @@ mod wide_copy;
 mod wide_guard;
 #[cfg(windows)]
 mod guard_log;
+mod guard_free;
 
 #[cfg(windows)]
 pub use host::on_failure;
