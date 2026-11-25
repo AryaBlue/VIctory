@@ -3578,7 +3578,7 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             // title bytes the masked pass still has to put up are the title's too
-            let notes = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+            let mut notes = card.masked.lock().unwrap_or_else(|e| e.into_inner());
             let mut masked = Vec::new();
             if crate::card_mask::indexed() {
                 notes.skip(at, at + n, fetched_after, &mut masked);
