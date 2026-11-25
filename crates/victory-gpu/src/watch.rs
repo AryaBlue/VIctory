@@ -897,14 +897,32 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+
+/// remappings since the frame line: count, us waiting for the lock, us held, longest hold, bytes remapped
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let held = self.1.elapsed().as_micros() as u64;
+        REMAPS[2].fetch_add(held, Relaxed);
+        REMAPS[3].fetch_max(held, Relaxed);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    use std::sync::atomic::Ordering::Relaxed;
+    let asked = std::time::Instant::now();
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let got = std::time::Instant::now();
+    REMAPS[0].fetch_add(1, Relaxed);
+    REMAPS[1].fetch_add((got - asked).as_micros() as u64, Relaxed);
+    Remapping(guard, got)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -933,6 +951,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    REMAPS[4].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1509,6 +1528,20 @@ mod mapping_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    #[test]
+    fn a_change_of_mapping_counts_its_hold() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = [0, 2, 3].map(|i| super::REMAPS[i].load(Relaxed));
+        {
+            let _changing = title_memory_remapping();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let after = [0, 2, 3].map(|i| super::REMAPS[i].load(Relaxed));
+        assert!(after[0] > before[0], "the change was not counted");
+        assert!(after[1] - before[1] >= 20_000, "the hold was not counted");
+        assert!(after[2] >= 20_000, "the longest hold was not kept");
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.

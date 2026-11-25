@@ -556,6 +556,17 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// picked-texture passes since the frame line: count, loop us, slots, ends (time, bytes, ran out), us in rechecks, mapped asks, views, uploads
+pub(crate) static HEAP_TEXTURE_PASSES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// `f`, its microseconds added to [`HEAP_TEXTURE_PASSES`]`[slot]`
+fn pass_timed<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    HEAP_TEXTURE_PASSES[slot].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    out
+}
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -1958,7 +1969,8 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            let worker = crate::texture_worker::on();
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if worker { 20 } else { 250 })
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
@@ -1976,10 +1988,18 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let mut ended = 5;
+        let mut looked = 0u64;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most {
+                ended = 4;
                 break;
             }
+            if began.elapsed() > span {
+                ended = 3;
+                break;
+            }
+            looked += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2000,7 +2020,7 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if pass_timed(6, || crate::texture::fingerprint(at, len)) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2027,7 +2047,7 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let mapped = pass_timed(7, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -2098,7 +2118,7 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = pass_timed(8, || heap.handle(index).and_then(|handle| host.mirror(index, handle, true)));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -2116,9 +2136,17 @@ impl State {
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
-            let tabled = crate::texture::is_staged(resource);
+            let tabled = crate::texture::is_staged(resource) && !crate::texture::prepared(resource);
+            // with the worker: recorded once it has staged and detiled the texture, the slot stays due till then
+            if !tabled
+                && crate::texture_worker::on()
+                && let Some(texture) = crate::resource::host_resource(resource)
+                && !crate::texture_worker::ready(resource, texture)
+            {
+                continue;
+            }
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                pass_timed(9, || readable(list, sampled.kind, view));
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2180,6 +2208,11 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        let p = &HEAP_TEXTURE_PASSES;
+        p[0].fetch_add(1, Ordering::Relaxed);
+        p[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        p[2].fetch_add(looked, Ordering::Relaxed);
+        p[ended].fetch_add(1, Ordering::Relaxed);
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

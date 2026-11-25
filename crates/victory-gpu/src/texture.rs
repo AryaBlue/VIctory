@@ -73,6 +73,8 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// made and detiled by the texture worker (`crate::texture_worker`)
+    prepared: std::sync::atomic::AtomicBool,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -374,6 +376,22 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// VICTORY_TEXTURE_SHORT_HOLD=1: hold title memory still only for the copy, not the hash and detile.
+fn short_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SHORT_HOLD").is_some_and(|v| v == "1"))
+}
+
+/// `f` of a copy of `size` bytes at `memory`, read while `held`, which is let go before `f`.
+fn copied_then_let_go<R>(memory: *const u8, size: usize, held: crate::watch::Reading, f: impl FnOnce(&[u8]) -> R) -> R {
+    with_read(size, |read| {
+        // SAFETY: committed memory of `size` bytes, kept so while `held` lives.
+        unsafe { std::ptr::copy_nonoverlapping(memory, read.as_mut_ptr(), size) };
+        drop(held);
+        f(read)
+    })
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -1027,7 +1045,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1055,6 +1073,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if short_hold() {
+                    drop(mapped);
+                }
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1088,8 +1109,23 @@ impl Staging {
                 size
             });
         }
+        if short_hold() {
+            return copied_then_let_go(self.memory, size, mapped, |read| {
+                let hash = blake3::hash(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -1243,6 +1279,27 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
+}
+
+/// On the texture worker: makes `resource`'s staging buffer and detiles into it, unless a list
+/// staged it already (that one is a table's, brought up to date at its submissions).
+pub(crate) fn prestage(resource: This, texture: &ID3D12Resource) {
+    if is_staged(resource) {
+        return;
+    }
+    let Some(s) = staging(resource, texture) else {
+        return;
+    };
+    s.refresh_now();
+    s.prepared.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the texture worker has made `resource`'s staging ready ([`prestage`]).
+pub(crate) fn prepared(resource: This) -> bool {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(|s| s.prepared.load(std::sync::atomic::Ordering::Acquire))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
@@ -1490,9 +1547,33 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        prepared: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod short_hold_tests {
+    use super::copied_then_let_go;
+
+    #[test]
+    fn a_remapping_begins_while_a_copied_texture_is_hashed() {
+        let memory: Vec<u8> = (0..1 << 16).map(|i| i as u8).collect();
+        let held = crate::watch::title_memory_reading();
+        let remapped = copied_then_let_go(memory.as_ptr(), memory.len(), held, |read| {
+            let (done, wait) = std::sync::mpsc::channel();
+            let changer = std::thread::spawn(move || {
+                let _changing = crate::watch::title_memory_remapping();
+                let _ = done.send(());
+            });
+            let began = wait.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+            assert_eq!(read, &memory[..], "the copy is not the memory");
+            (began, changer)
+        });
+        remapped.1.join().unwrap();
+        assert!(remapped.0, "the remapping waited for the hash");
+    }
 }
 
 #[cfg(test)]

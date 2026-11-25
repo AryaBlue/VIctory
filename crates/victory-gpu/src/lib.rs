@@ -64,6 +64,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texture_worker;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

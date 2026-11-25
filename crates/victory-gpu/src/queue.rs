@@ -1018,6 +1018,9 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// page-mapping batches since the frame line: count, pages, microseconds
+pub(crate) static PAGE_MAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
@@ -1042,6 +1045,8 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    let started = std::time::Instant::now();
+    let mut pages = 0u64;
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1051,6 +1056,7 @@ extern "system" fn copy_page_mappings(
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
         for r in ranges {
+            pages += u64::from(r.count);
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
@@ -1064,6 +1070,9 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
+    PAGE_MAPS[0].fetch_add(1, Ordering::Relaxed);
+    PAGE_MAPS[1].fetch_add(pages, Ordering::Relaxed);
+    PAGE_MAPS[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));

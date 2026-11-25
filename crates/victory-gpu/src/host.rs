@@ -7278,6 +7278,42 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            let [takes, wait, held, longest, bytes] = [0, 1, 2, 3, 4].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed));
+            let [maps, pages, spent] = [0, 1, 2].map(|i| crate::queue::PAGE_MAPS[i].swap(0, Ordering::Relaxed));
+            if takes > 0 {
+                tracing::info!(
+                    "title memory remapping per frame: {:.0} changes, {:.1} ms waiting for reads in place, {:.1} ms held (longest {:.1} ms), {:.1} MB remapped; page-mapping batches {:.1}, {:.0} pages, {:.1} ms",
+                    takes as f64 / frames,
+                    wait as f64 / 1000.0 / frames,
+                    held as f64 / 1000.0 / frames,
+                    longest as f64 / 1000.0,
+                    bytes as f64 / 1048576.0 / frames,
+                    maps as f64 / frames,
+                    pages as f64 / frames,
+                    spent as f64 / 1000.0 / frames
+                );
+            }
+            let [passes, spent, looked, on_time, on_bytes, ran_out, recheck, asking, views, uploads] =
+                std::array::from_fn(|i| crate::draw::HEAP_TEXTURE_PASSES[i].swap(0, Ordering::Relaxed));
+            if passes > 0 {
+                let each = |us: u64| us as f64 / 1000.0 / passes as f64;
+                tracing::info!(
+                    "passes over textures picked by index since the last line: {passes}, {:.1} ms each, {:.0} slots looked at each; stopped by the time budget {on_time}, by the byte budget {on_bytes}, ran out of due slots or room {ran_out}; ms each in rechecks {:.1}, asking what is mapped {:.1}, making host views {:.1}, recording uploads {:.1}",
+                    each(spent),
+                    looked as f64 / passes as f64,
+                    each(recheck),
+                    each(asking),
+                    each(views),
+                    each(uploads)
+                );
+            }
+            let [handed, made, refused, worked] = [0, 1, 2, 3].map(|i| crate::texture_worker::STATS[i].swap(0, Ordering::Relaxed));
+            if handed + refused > 0 {
+                tracing::info!(
+                    "texture worker since the last line (VICTORY_TEXTURE_WORKER=1): {handed} textures handed over, {made} done by it, {refused} not handed (with it already or its queue full), {:.1} ms of its time",
+                    worked as f64 / 1000.0
+                );
+            }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
