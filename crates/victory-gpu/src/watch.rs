@@ -1441,8 +1441,7 @@ mod tests {
         ask_ahead_done();
         // and only once
         assert!(copy.take(p, p + 3 * PAGE).is_empty());
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // kept: the journal outlives this test, and the address must not come back to the next one
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
