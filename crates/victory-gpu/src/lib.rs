@@ -19,6 +19,10 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod burst;
+#[cfg(windows)]
+mod ask_early;
+#[cfg(windows)]
 mod card_mask;
 #[cfg(windows)]
 mod present_later;
@@ -59,6 +63,8 @@ mod indirect;
 mod unmapped;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod land;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -94,11 +100,19 @@ mod texture_worker;
 #[cfg(windows)]
 pub mod upscale;
 #[cfg(windows)]
+mod readtrace;
+#[cfg(windows)]
+mod tablereuse;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod titleprobe;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod wide_copy;
 #[cfg(windows)]
 mod wide_guard;
+#[cfg(windows)]
+mod guard_log;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -106,6 +120,7 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_protection, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    title_memory_written,
     writing as kernel_will_write,
 };

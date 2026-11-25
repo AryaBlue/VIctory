@@ -377,8 +377,11 @@ fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
     now
 }
 
-fn step_part(kind: usize, since: std::time::Instant) {
-    STEP_PARTS[kind].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+// time only for the steps that were timed (all of them with VICTORY_STEP_TIMERS=1)
+fn step_part(kind: usize, since: Option<std::time::Instant>) {
+    if let Some(since) = since {
+        STEP_PARTS[kind].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
     STEP_PARTS[7 + kind].fetch_add(1, Ordering::Relaxed);
 }
 
@@ -2184,7 +2187,27 @@ fn late_exact() -> bool {
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
 pub(crate) fn late_free_present() -> bool {
-    late_stage() > 2
+    free_present_at(late_stage(), present_flight())
+}
+
+/// Stage 3's present at stages 1 and 2 too (`VICTORY_PRESENT_FLIGHT=1`, or
+/// `VICTORY_PRESENT_EARLY=1` which needs it): the present's copy is a
+/// flight and the present settles nothing, so the card and the copy-back
+/// finish one frame while the next is prepared. Off by default.
+fn present_flight() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRESENT_FLIGHT").is_some_and(|v| v == "1") || crate::present_later::early();
+        if on && (1..=2).contains(&late_stage()) {
+            tracing::info!("the present is sent as a flight and settles nothing (VICTORY_PRESENT_FLIGHT=1)");
+        }
+        on
+    })
+}
+
+/// Whether presents settle nothing at late stage `stage`.
+pub(crate) fn free_present_at(stage: u8, flight: bool) -> bool {
+    stage > 2 || (stage > 0 && flight)
 }
 
 /// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
@@ -3509,11 +3532,21 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    // wide: each piece's bytes, in the order of the pieces
+    let mut wide = if crate::land::on() {
+        let pieces: Vec<_> = work.iter().zip(&found).flat_map(|((s, _, _), f)| f.iter().map(move |&(at, n)| (s, at, n))).collect();
+        crate::land::pc(&pieces).into_iter()
+    } else {
+        Vec::new().into_iter()
+    };
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
         for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+            written += match wide.next() {
+                Some(w) => w,
+                None => shadow.relay_merge(at, n, &mut now, &mut title),
+            };
         }
         copy_back(1, written as u64);
         #[cfg(feature = "diagnostics")]
@@ -4814,13 +4847,17 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
+        if crate::land::on() {
+            written = crate::land::card(&pieces, data, after);
+        } else {
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
         }
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
@@ -5541,7 +5578,10 @@ impl Host {
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         let stage = prep_part(0, stage);
-        crate::descriptor::sync_heaps();
+        // burst refresh: not again for a submission enqueued before the last sync began
+        if crate::burst::heap_due() {
+            crate::descriptor::sync_heaps();
+        }
         let stage = prep_part(1, stage);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -5577,6 +5617,17 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        batch.burst = crate::burst::begin(&mut batch.current);
+        // burst group: this submission's refreshes and those of the submissions waiting, per copy
+        let mut early: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            std::collections::HashMap::new();
+        if let Some((after, up_to)) = batch.burst.as_ref().and_then(|pass| pass.group()) {
+            for list in runs {
+                refreshes_into(list, &mut early);
+            }
+            crate::queue::held_runs(after, up_to, |list| refreshes_into(list, &mut early));
+            early.retain(|_, (shadow, from, to)| !batch.covered(shadow, *from, *to - *from));
+        }
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -5590,12 +5641,19 @@ impl Host {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
+                        && !batch.covered(shadow, *address, *len)
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
                         *span = (span.0.min(*address), span.1.max(*address + *len));
                     }
+                }
+            }
+            for (&key, (shadow, from, to)) in &early {
+                if !shadow.unwatched() {
+                    let span = spans.entry(key).or_insert((*from, *to));
+                    *span = (span.0.min(*from), span.1.max(*to));
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
@@ -5616,6 +5674,15 @@ impl Host {
             settled += settling.elapsed();
         }
         let stage = prep_part(4, stage);
+        if !early.is_empty() {
+            if let Some(pass) = &batch.burst {
+                pass.grouped(early.len());
+            }
+            for (shadow, from, to) in early.into_values() {
+                batch.add(&shadow, from, to - from);
+            }
+            batch.flush();
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -5628,6 +5695,9 @@ impl Host {
         batch.flush();
         let stage = prep_part(6, stage);
         crate::watch::ask_once_end();
+        if let Some(pass) = batch.burst.take() {
+            pass.end(&batch.current);
+        }
         let stage = prep_part(7, stage);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -7131,8 +7201,11 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let exact = step_timers();
+        let mut nth = 0u32;
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            // every step with the switch; else one copy in STEP_SAMPLE, counted for all of them
+            let mut started = exact.then(std::time::Instant::now);
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7141,6 +7214,10 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_wrote(dst, len);
+                    nth += 1;
+                    if !exact && nth % STEP_SAMPLE == 1 {
+                        started = Some(std::time::Instant::now());
+                    }
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -7155,6 +7232,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
+                    }
+                    nth += 1;
+                    if !exact && nth % STEP_SAMPLE == 1 {
+                        started = Some(std::time::Instant::now());
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     step_part(1, started);
@@ -7183,7 +7264,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, started.map_or(0, |s| s.elapsed().as_micros() as u64));
                     }
                     step_part(if matches!(step, Step::Run(_)) { 3 } else { 4 }, started);
                     continue;
@@ -7196,12 +7277,12 @@ impl HostList {
                     // askings a frame).
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
+                    let snapshot = exact.then(std::time::Instant::now);
                     shadow.writing(*address, *len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        add(C::SnapshotUs, snapshot.map_or(0, |s| s.elapsed().as_micros() as u64));
                     }
                     step_part(5, started);
                     continue;
@@ -7214,11 +7295,37 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
+            if let Some(started) = started {
+                let us = started.elapsed().as_micros() as u64;
+                preparing(0, if exact { us } else { us * u64::from(STEP_SAMPLE) });
+            }
             preparing(1, copied as u64);
         }
     }
 }
+
+// burst group: per copy (by address), the span of the refreshes `list` asks for
+fn refreshes_into(
+    list: &HostList,
+    spans: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) {
+    for step in &list.deferred().copies {
+        if let Step::Refresh(shadow, address, len) = step {
+            let span = spans
+                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .or_insert_with(|| (shadow.clone(), *address, *address + *len));
+            (span.1, span.2) = (span.1.min(*address), span.2.max(*address + *len));
+        }
+    }
+}
+
+// every deferred step is timed, as before (VICTORY_STEP_TIMERS=1); else one title copy or fill in STEP_SAMPLE
+fn step_timers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STEP_TIMERS").is_some_and(|v| v == "1"))
+}
+
+const STEP_SAMPLE: u32 = 16;
 
 /// Whether a submission's refreshes of host copies run on several threads,
 /// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
@@ -7300,6 +7407,26 @@ fn refresh_once() -> bool {
     }
 }
 
+// a title buffer copy flushes only the pending refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)
+fn copy_flush_overlap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COPY_FLUSH_OVERLAP").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("a title buffer copy flushes only the refreshes over its bytes (VICTORY_COPY_FLUSH_OVERLAP=1)");
+        }
+        on
+    })
+}
+
+// past this many pending refreshes a title copy flushes them all: the search would cost more
+const FLUSH_OVER_MOST: usize = 256;
+
+// the copies whose pending range touches `[at, end)`
+fn pending_over<T: Clone>(refreshes: &[(T, usize, usize)], at: usize, end: usize) -> Vec<T> {
+    refreshes.iter().filter(|r| r.1 < end && at < r.2).map(|r| r.0.clone()).collect()
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -7323,18 +7450,26 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    // burst refresh: `current` came from the submissions before and goes on to the next
+    burst: Option<crate::burst::Pass>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if let Some(pass) = &mut self.burst {
+            pass.written(&mut self.current);
+        }
         // Brought up to date in this submission already ([`refresh_once`];
         // nothing is in `current` without the switch).
         if let Some(&(_, from, to)) = self.current.get(&key)
             && from <= address
             && end <= to
         {
+            if let Some(pass) = &self.burst {
+                pass.skipped(shadow, address, len);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(crate::copystat::C::Skipped, 1);
@@ -7352,6 +7487,16 @@ impl Batch {
                 self.refreshes.push((shadow.clone(), address, end));
             }
         }
+    }
+
+    // burst refresh: the range needs no asking ahead; with the check everything is asked as before
+    fn covered(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) -> bool {
+        self.burst.is_some()
+            && !crate::burst::check()
+            && self
+                .current
+                .get(&(std::sync::Arc::as_ptr(shadow) as usize))
+                .is_some_and(|&(_, from, to)| from <= address && address + len <= to)
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
@@ -7378,7 +7523,7 @@ impl Batch {
         from: usize,
         to: usize,
     ) {
-        if !refresh_once() || from >= to {
+        if !(refresh_once() || crate::burst::on()) || from >= to {
             return;
         }
         let entry = current
@@ -7422,7 +7567,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
-        self.flush();
+        self.flush_for(at, at + len);
         self.textures.clear();
         let end = at + len;
         self.current.retain(|_, entry| {
@@ -7438,6 +7583,16 @@ impl Batch {
             }
             entry.1 < entry.2
         });
+    }
+
+    // before a title buffer copy into `[at, end)`: only the pending refreshes over it, if asked
+    fn flush_for(&mut self, at: usize, end: usize) {
+        if !copy_flush_overlap() || self.refreshes.len() > FLUSH_OVER_MOST {
+            return self.flush();
+        }
+        for shadow in pending_over(&self.refreshes, at, end) {
+            self.flush_one(&shadow);
+        }
     }
 
     fn flush(&mut self) {
@@ -7673,13 +7828,19 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if crate::safecopy::on() {
-        return crate::safecopy::copy(dst, src, len);
-    }
-    let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    // readback trace: no guards under our own copy
+    let held = crate::readtrace::hold(src as usize, len);
+    crate::readtrace::hold(dst as usize, len);
+    let ok = if crate::safecopy::on() {
+        crate::safecopy::copy(dst, src, len)
+    } else {
+        let mut done = 0;
+        // SAFETY: the destination is mapped writable memory of `len` bytes; the
+        // kernel checks the source.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    };
+    crate::readtrace::rearm(held);
+    ok
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -7728,7 +7889,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
+    crate::readtrace::hold(dst as usize, len);
     if len == 0 || write(dst as usize, len) {
+        crate::readtrace::arm(dst as usize, len);
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -7738,6 +7901,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
+    crate::readtrace::arm(dst as usize, len);
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -8023,6 +8187,7 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::descriptor::host::made_fast_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
@@ -8958,7 +9123,7 @@ mod spare {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, pending_over};
     use std::sync::Arc;
 
     #[test]
@@ -8972,6 +9137,14 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    #[test]
+    fn a_title_copy_finds_only_the_refreshes_over_it() {
+        let pending = [(1u8, 0x1000, 0x2000), (2, 0x2000, 0x3000), (3, 0x8000, 0x9000), (4, 0, 0x10000)];
+        assert_eq!(pending_over(&pending, 0x1ff0, 0x2010), [1, 2, 4]);
+        assert_eq!(pending_over(&pending, 0x3000, 0x8000), [4]);
+        assert_eq!(pending_over(&pending, 0x10000, 0x10100), [0u8; 0]);
     }
 
     #[test]
