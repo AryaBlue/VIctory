@@ -1325,6 +1325,27 @@ impl Scatter {
     }
 }
 
+// a range's pages as runs of one section: "section:offset KiB+pages", a '*' where a run's first page shows elsewhere too
+fn layout(v: &Views, at: usize, len: usize) -> String {
+    let mut runs: Vec<(usize, u64, u64, bool)> = Vec::new();
+    let mut page = at - at % K64;
+    while page < at + len {
+        let slot = v.views.range(..=page).next_back().filter(|(base, view)| *base + view.0 > page).map(|(&base, &(_, s, o))| (s, o + (page - base) as u64));
+        match (slot, runs.last_mut()) {
+            (Some((s, o)), Some(run)) if run.0 == s && run.1 + run.2 * K64 as u64 == o => run.2 += 1,
+            (Some((s, o)), _) => runs.push((s, o, 1, v.pages.get(&(s, o)).is_some_and(|all| all.len() > 1))),
+            (None, _) => runs.push((0, 0, 1, false)),
+        }
+        page += K64;
+    }
+    let shown: Vec<String> = runs
+        .iter()
+        .take(12)
+        .map(|r| if r.0 == 0 { format!("hole+{}", r.2) } else { format!("{:x}:{}+{}{}", r.0 & 0xffff, r.1 >> 10, r.2, if r.3 { "*" } else { "" }) })
+        .collect();
+    format!("{} runs: {}{}", runs.len(), shown.join(" "), if runs.len() > 12 { " ..." } else { "" })
+}
+
 /// The census lines for `spans` (start, bytes, whether a window outside
 /// buffers).
 fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
@@ -1374,10 +1395,16 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         big >> 20
     ));
     let mut why = Scatter::default();
+    let mut biggest: Vec<(usize, usize)> = Vec::new();
     for &(start, len, window) in spans {
         if !window && cover_in(&v.views, start as usize, len as usize) == Cover::Scattered {
             why.add(&v, start as usize, len as usize);
+            biggest.push((start as usize, len as usize));
         }
+    }
+    biggest.sort_by_key(|b| std::cmp::Reverse(b.1));
+    for &(at, len) in biggest.iter().take(5) {
+        lines.push(format!("census, a scattered buffer at {at:#x}, {} KiB: {}", len >> 10, layout(&v, at, len)));
     }
     if why.pages > 0 {
         lines.push(format!(
@@ -1553,6 +1580,7 @@ mod tests {
         let mut s = Scatter::default();
         s.add(&v, at, 4 * K64);
         assert_eq!(s, Scatter { pages: 4, next: 1, same: 1, other: 1, aliased: 3, in_big: 3 });
+        assert_eq!(layout(&v, at, 4 * K64), "3 runs: 5:448+2* 5:192+1* 6:0+1");
     }
 
     /// What the runtime forgets when memory is mapped anew.
