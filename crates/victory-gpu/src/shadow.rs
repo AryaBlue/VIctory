@@ -3285,16 +3285,21 @@ impl Shadow {
         if !crate::push::on() {
             return self.update_old(from, to).0;
         }
+        self.update_pushed(from, to, crate::push::check(), &crate::watch::standing).0
+    }
+
+    // push: the refresh of `[from, to)` (inside the buffer); the bytes copied and whether it was over at once
+    fn update_pushed(&self, from: usize, to: usize, check: bool, standing: &dyn Fn(usize, usize) -> bool) -> (usize, bool) {
         use crate::push::stat;
         crate::push::tick();
         let mut held = false;
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let known = self.quiet.lock().unwrap_or_else(|e| e.into_inner()).holds(from, to);
             match known {
-                Some(true) if crate::watch::standing(from, to) => {
-                    if !crate::push::check() {
+                Some(true) if standing(from, to) => {
+                    if !check {
                         stat(0, 1);
-                        return 0;
+                        return (0, true);
                     }
                     held = true;
                 }
@@ -3317,7 +3322,7 @@ impl Shadow {
         if free && bytes == 0 {
             self.quiet.lock().unwrap_or_else(|e| e.into_inner()).note(from, to, at);
         }
-        bytes
+        (bytes, false)
     }
 
     // the refresh of `[from, to)` (inside the buffer) as it always was; and whether no shader writes in it
@@ -4936,6 +4941,96 @@ mod promote_tests {
         assert_eq!(CARD_TO_SEND.lock().unwrap().iter().filter(|w| w.as_ptr() == Arc::as_ptr(&shadow)).count(), 1);
         assert_eq!(mine(card_dirty_as(5, true)).len(), 1);
         CARDED.lock().unwrap().retain(|w| w.as_ptr() != Arc::as_ptr(&shadow));
+    }
+
+    // push: a refresh is over at once only while nothing changed, and then the old way would copy nothing
+    #[test]
+    fn a_quiet_range_is_over_at_once_until_a_write_is_found() {
+        const MB: usize = 1 << 20;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(device) = warp() else { return };
+        // an address no other test had: the journal and the guards are shared and remember freed ranges
+        const AT: usize = 0x5a00_0000_0000;
+        // SAFETY: the test's own allocations
+        let (base, placed) = unsafe {
+            let base = mem::VirtualAlloc(AT as *const _, 3 * MB, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE) as usize;
+            let other = mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            (base, crate::inplace::place_part(&device, other as u64, 4096).ok())
+        };
+        if base == 0 {
+            return;
+        }
+        let Some(placed) = placed else { return };
+        let start = base.next_multiple_of(MB);
+        let len = 4 * PAGE;
+        let mut side = vec![0u8; len];
+        let shadow = Shadow::new(placed.buffer.clone(), side.as_mut_ptr(), 0, start as u64, len as u64);
+        let title = |at: usize| (start + at) as *mut u8;
+        // SAFETY: committed pages of the test's
+        let write = |at: usize, byte: u8| unsafe { title(at).write(byte) };
+        // SAFETY: both are `len` bytes and live
+        let same = |shadow: &Shadow| unsafe { std::slice::from_raw_parts(title(0), len) == std::slice::from_raw_parts(shadow.data.cast_const(), len) };
+        // the submission's asking, as ask_once makes it: the kernel is asked and the journal notes what it found
+        let asking = || assert!(crate::watch::writes(start, start + len, true).is_some());
+        let stands = |_: usize, _: usize| true;
+        let update = |shadow: &Shadow| shadow.update_pushed(start, start + len, false, &stands);
+
+        // every 4 KiB page touched first: the kernel's read of one never touched counts as a write to it
+        for at in (0..len).step_by(4096) {
+            write(at, 0x11);
+        }
+        write(PAGE + 5, 1);
+        asking();
+        // never taken: copied whole, and not noted
+        let (bytes, over) = update(&shadow);
+        assert!(bytes > 0 && !over && same(&shadow));
+        assert_eq!(shadow.watched.load(Ordering::Relaxed), 1, "not taken as write-watched memory");
+        // nothing to copy: noted, by the old way
+        assert_eq!(update(&shadow), (0, false));
+        // and from now on over at once
+        assert_eq!(update(&shadow), (0, true));
+        assert_eq!(shadow.update_pushed(start + PAGE, start + 2 * PAGE, false, &stands), (0, true), "a part of the range");
+
+        // the title writes; until an asking finds it the old way would not see it either
+        write(2 * PAGE + 9, 2);
+        assert_eq!(update(&shadow), (0, true));
+        asking();
+        let (bytes, over) = update(&shadow);
+        assert!(!over, "a write the asking found left the range over");
+        assert_eq!(bytes, PAGE);
+        assert!(same(&shadow));
+        assert_eq!(update(&shadow), (0, false));
+        assert_eq!(update(&shadow), (0, true));
+
+        // the old way would have to ask: not over, whatever is noted
+        let asks = |_: usize, _: usize| false;
+        assert_eq!(shadow.update_pushed(start, start + len, false, &asks), (0, false));
+
+        // checked: decided the old way, which stands
+        write(7, 3);
+        asking();
+        let (bytes, over) = shadow.update_pushed(start, start + len, true, &stands);
+        assert!(bytes > 0 && !over && same(&shadow));
+        assert_eq!(shadow.update_pushed(start, start + len, true, &stands), (0, false));
+
+        // a shader write pending: the old way, and nothing noted from it
+        assert_eq!(update(&shadow), (0, true));
+        shadow.pending.lock().unwrap().push((start, start + 64));
+        write(3 * PAGE + 1, 4);
+        asking();
+        let (bytes, over) = update(&shadow);
+        assert!(bytes > 0 && !over);
+        assert_eq!(update(&shadow), (0, false));
+        assert_eq!(update(&shadow), (0, false), "noted with a shader write pending");
+        shadow.pending.lock().unwrap().clear();
+        assert_eq!(update(&shadow), (0, false));
+        assert_eq!(update(&shadow), (0, true));
+
+        // no longer watched: every refresh copies the whole range, as before
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        assert_eq!(update(&shadow), (len, false));
+        drop(shadow);
+        // the write-watched pages are kept: the journal remembers them
     }
 
     // declared writes count once per frame
