@@ -790,6 +790,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
+    // counted before it is listed: most ranges are clean through (VICTORY_GUARD_COUNT)
+    if guard_count() && g.clean.range(first..last).count() == last - first {
+        return Some(written);
+    }
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
@@ -832,6 +836,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether [`guard`] counts a range's clean blocks before it lists them
+/// (`VICTORY_GUARD_COUNT=1`; off by default): a range clean through, as
+/// nearly all are, then costs no list (the count still walks the set). In
+/// the s2-prep-1 profile those lists, walk and memory, were some 4 of the
+/// 7 ms a frame of set and list work in `writes`. The answers are the same.
+fn guard_count() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_COUNT").is_some_and(|v| v == "1"))
 }
 
 /// skip is_view's query for blocks opened since we guarded them (VICTORY_GUARD_SEEN=1; off by default)
