@@ -462,8 +462,17 @@ fn release_held_now(all: bool) {
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
             let line = unsafe { &(*(q as *const Queue)).held };
+            // (read before the line's lock: a present is given under its
+            // own lock, then the lines')
+            let due = crate::present_later::due().is_some();
             let mut held = lock(line);
-            let all = all || (forcing && held.iter().any(|h| matches!(h, Held::Present)));
+            let marked = held.iter().any(|h| matches!(h, Held::Present));
+            // a line with no mark while a present is due holds only what
+            // came after the present: it waits until the present is shown
+            if due && !marked {
+                continue;
+            }
+            let all = all || (forcing && marked);
             loop {
                 match held.first() {
                     None | Some(Held::Running | Held::Present) => break,
@@ -1436,6 +1445,52 @@ mod tests {
         assert_eq!(crate::present_later::due(), None, "the present was held by a line without a mark");
         assert_eq!(lock(&queue(b).held).len(), 1, "what came after the present ran with it");
         release_held_now(true);
+        assert!(lock(&queue(b).held).is_empty());
+    }
+
+    /// VICTORY_PRESENT_LATER: what a line without a mark holds came after
+    /// the present, so it does not go to the card before the present does.
+    #[cfg(windows)]
+    #[test]
+    fn a_line_without_a_mark_runs_after_the_present() {
+        let _one = crate::present_later::TEST_ONE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut a, mut b) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut a), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut b), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut told = null;
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut told), S_OK);
+        // a's head is being sent by another releaser: the present waits
+        lock(&queue(a).held).push(Held::Running);
+        lock(&WAITING).push(a as usize);
+        present_later(crate::present_later::Due {
+            resource: 0,
+            frame: 1,
+        });
+        lock(&queue(b).held).push(Held::Signal(told as usize, 1));
+        lock(&WAITING).push(b as usize);
+        release_held_now(false);
+        assert!(crate::present_later::due().is_some());
+        assert_eq!(
+            crate::fence::completed(told),
+            0,
+            "what came after the present ran before it"
+        );
+        // the other releaser is done: the present, then b
+        lock(&queue(a).held).remove(0);
+        release_held_now(false);
+        assert_eq!(crate::present_later::due(), None);
+        assert_eq!(crate::fence::completed(told), 1);
+        assert!(lock(&queue(a).held).is_empty());
         assert!(lock(&queue(b).held).is_empty());
     }
 
