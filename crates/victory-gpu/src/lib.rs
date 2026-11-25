@@ -44,6 +44,7 @@ pub mod framelog;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod clamp_batch;
 mod indirect;
 #[cfg(windows)]
 mod unmapped;

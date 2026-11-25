@@ -7754,6 +7754,12 @@ impl Meter {
                     each(uploads)
                 );
             }
+            let [batches, planned, plans, unread] = [0, 1, 2, 3].map(|i| crate::clamp_batch::STATS[i].swap(0, Ordering::Relaxed));
+            if batches + plans > 0 {
+                tracing::info!(
+                    "indirect clamps batched since the last line (VICTORY_CLAMP_BATCH=1): {batches} batches with {planned} windows clamped ahead,                      {plans} plans kept, {unread} planned windows no draw read"
+                );
+            }
             let [handed, made, refused, worked] = [0, 1, 2, 3].map(|i| crate::texture_worker::STATS[i].swap(0, Ordering::Relaxed));
             if handed + refused > 0 {
                 tracing::info!(

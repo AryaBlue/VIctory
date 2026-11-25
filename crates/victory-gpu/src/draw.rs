@@ -153,6 +153,9 @@ fn windows_many() -> bool {
 /// The most windows a list keeps open with [`windows_many`].
 const WINDOWS_KEPT: usize = 8;
 
+/// The most with `VICTORY_CLAMP_BATCH` too: a batch opens a segment's windows at once.
+const WINDOWS_KEPT_BATCHED: usize = 64;
+
 /// Where record `offset` is in the scratch buffer if one of `windows`
 /// (oldest first) holds it: the window's index and the record's offset there.
 /// Windows of another epoch than `epoch` hold nothing any more.
@@ -271,6 +274,8 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]); several with [`windows_many`], oldest first.
     window: Vec<Window>,
+    /// The segment of windows the list is in (`crate::clamp_batch`).
+    segment: crate::clamp_batch::Segment,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -2353,14 +2358,27 @@ impl State {
                 .map(|p| p.stages.iter().any(|stage| stage.translated().stores))
         };
         if draw_ends_window(keep_windows(), if keep_windows() { stores() } else { None }) {
-            self.window.clear();
+            self.end_windows();
+        }
+    }
+
+    /// The windows end (they may be written, or another list began): the segment's plan
+    /// is kept for its head (`crate::clamp_batch`).
+    fn end_windows(&mut self) {
+        self.window.clear();
+        if let Some((key, plan, unread)) = self.segment.end() {
+            crate::clamp_batch::STATS[3].fetch_add(unread as u64, Ordering::Relaxed);
+            if !plan.is_empty() {
+                crate::clamp_batch::STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            crate::clamp_batch::keep(key, plan);
         }
     }
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window.clear();
+        self.end_windows();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3311,8 +3329,12 @@ impl State {
         // With many windows a call clamped alone takes a region of its own and
         // ends no window, unless it may write the arguments.
         let ends = !windowed && (!many || kind == DISPATCH || stores);
-        if list.first_use(WINDOW_USE) || ends {
-            self.window.clear();
+        let fresh = list.first_use(WINDOW_USE);
+        if fresh || ends {
+            self.end_windows();
+        }
+        if fresh {
+            self.segment.new_list();
         }
         let epoch = if many { list.ring_epoch() } else { 0 };
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride && w.epoch == epoch;
@@ -3322,6 +3344,7 @@ impl State {
             Some((scratch, at, step)) => {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::WindowHits, 1);
+                self.segment.read(args.id(), offset);
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3384,7 +3407,63 @@ impl State {
                     1,
                 );
                 let ahead = windowed && records > 1;
-                let bounded = if many {
+                // with VICTORY_CLAMP_BATCH a segment's first clamp brings along the windows the
+                // same segment read last time, in one compute pass
+                let batch = crate::clamp_batch::on() && many && windowed;
+                let mut head_now = false;
+                let mut batched = None;
+                if batch && !self.segment.open() {
+                    head_now = true;
+                    let key = self.segment.begin((self.pipeline as usize, kind, stride), args.id(), offset);
+                    if let Some(plan) = crate::clamp_batch::plan(key) {
+                        let fits: Vec<crate::clamp_batch::Planned> = plan
+                            .into_iter()
+                            .filter(|p| {
+                                let at = offset as i64 + p.delta;
+                                let address = arguments as i64 + p.delta;
+                                let bytes = u64::from(p.step) * u64::from(p.records);
+                                at >= 0
+                                    && address > 0
+                                    && args.left(address as u64) >= bytes
+                                    && window_hit(&self.window, args.id(), kind, stride, at as u64, epoch).is_none()
+                            })
+                            .collect();
+                        if !fits.is_empty() {
+                            for p in &fits {
+                                let bytes = u64::from(p.step) * u64::from(p.records);
+                                args.refresh(list, (arguments as i64 + p.delta) as u64, bytes);
+                            }
+                            let mut jobs = vec![((&args.buffer, offset), (kind, step, records), ahead)];
+                            jobs.extend(fits.iter().map(|p| {
+                                ((&args.buffer, (offset as i64 + p.delta) as u64), (kind, p.step, p.records), p.records > 1)
+                            }));
+                            if let Some((buffer, epoch, ats)) = crate::indirect::bound_batch_in_ring(list, &jobs) {
+                                crate::clamp_batch::STATS[0].fetch_add(1, Ordering::Relaxed);
+                                crate::clamp_batch::STATS[1].fetch_add(fits.len() as u64, Ordering::Relaxed);
+                                batched = Some((buffer, ats, epoch, fits));
+                            }
+                        }
+                    }
+                }
+                let bounded = if let Some((buffer, ats, epoch, fits)) = batched {
+                    // the plan's windows go in before the head's, which is looked up first
+                    for (p, &at) in fits.iter().zip(&ats[1..]) {
+                        let base = (offset as i64 + p.delta) as u64;
+                        self.window.push(Window {
+                            copy: args.id(),
+                            kind,
+                            stride,
+                            step: p.step,
+                            base,
+                            records: p.records,
+                            scratch: buffer.clone(),
+                            at,
+                            epoch,
+                        });
+                        self.segment.note(args.id(), base, p.step, p.records, false);
+                    }
+                    Some((buffer, ats[0], epoch))
+                } else if many {
                     crate::indirect::bound_in_ring(list, (&args.buffer, offset), count_arg, (kind, step, records), ahead)
                 } else if ahead {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records)).map(|b| (b, 0, 0))
@@ -3392,14 +3471,17 @@ impl State {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)).map(|b| (b, 0, 0))
                 };
                 let Some((bounded, at, epoch)) = bounded else {
-                    self.window.clear();
+                    self.end_windows();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                if batch && !head_now {
+                    self.segment.note(args.id(), offset, step, records, true);
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
                 if !many {
-                    self.window.clear();
+                    self.end_windows();
                 }
                 if windowed {
                     self.window.push(Window {
@@ -3413,7 +3495,8 @@ impl State {
                         at,
                         epoch,
                     });
-                    if self.window.len() > WINDOWS_KEPT {
+                    let kept = if crate::clamp_batch::on() { WINDOWS_KEPT_BATCHED } else { WINDOWS_KEPT };
+                    while self.window.len() > kept {
                         self.window.remove(0);
                     }
                 }
