@@ -124,7 +124,7 @@ fn write_skip() -> bool {
 /// the first in that copy, how many, and the list's scratch buffer that
 /// holds them clamped, record `i` at `i * step`.
 #[derive(Clone)]
-struct Window {
+struct Window<S = ID3D12Resource> {
     copy: u64,
     kind: u32,
     stride: u32,
@@ -133,7 +133,40 @@ struct Window {
     step: u32,
     base: u64,
     records: u32,
-    scratch: ID3D12Resource,
+    scratch: S,
+    /// Where the window's first record is in the scratch buffer, and the
+    /// ring epoch it was clamped in (0 without [`windows_many`]).
+    at: u64,
+    epoch: u64,
+}
+
+/// `VICTORY_WINDOWS_MANY=1`: every clamp of a list takes a region of the
+/// scratch buffer of its own (`HostList::indirect_ring`), so a list keeps up
+/// to [`WINDOWS_KEPT`] windows open at once: draws that switch between
+/// argument buffers, and calls clamped alone (a count buffer, several
+/// records), no longer end the others. Off by default.
+fn windows_many() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_MANY").is_some_and(|v| v == "1"))
+}
+
+/// The most windows a list keeps open with [`windows_many`].
+const WINDOWS_KEPT: usize = 8;
+
+/// Where record `offset` is in the scratch buffer if one of `windows`
+/// (oldest first) holds it: the window's index and the record's offset there.
+/// Windows of another epoch than `epoch` hold nothing any more.
+fn window_hit<S>(windows: &[Window<S>], copy: u64, kind: u32, stride: u32, offset: u64, epoch: u64) -> Option<(usize, u64)> {
+    windows.iter().enumerate().rev().find_map(|(i, w)| {
+        let inside = w.copy == copy
+            && w.kind == kind
+            && w.stride == stride
+            && w.epoch == epoch
+            && offset >= w.base
+            && (offset - w.base) % u64::from(w.step) == 0
+            && (offset - w.base) / u64::from(w.step) < u64::from(w.records);
+        inside.then(|| (i, w.at + (offset - w.base)))
+    })
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -236,8 +269,8 @@ pub(crate) struct State {
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
-    /// them ([`windows`]).
-    window: Option<Window>,
+    /// them ([`windows`]); several with [`windows_many`], oldest first.
+    window: Vec<Window>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -2320,14 +2353,14 @@ impl State {
                 .map(|p| p.stages.iter().any(|stage| stage.translated().stores))
         };
         if draw_ends_window(keep_windows(), if keep_windows() { stores() } else { None }) {
-            self.window = None;
+            self.window.clear();
         }
     }
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.window.clear();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3273,16 +3306,18 @@ impl State {
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
-            self.window = None;
+        let many = windows_many();
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        // With many windows a call clamped alone takes a region of its own and
+        // ends no window, unless it may write the arguments.
+        let ends = !windowed && (!many || kind == DISPATCH || stores);
+        if list.first_use(WINDOW_USE) || ends {
+            self.window.clear();
         }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        let epoch = if many { list.ring_epoch() } else { 0 };
+        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride && w.epoch == epoch;
+        let hit = window_hit(&self.window, args.id(), kind, stride, offset, epoch)
+            .map(|(i, at)| (self.window[i].scratch.clone(), at, self.window[i].step));
         let (bounded, at) = match hit {
             Some((scratch, at, step)) => {
                 #[cfg(feature = "diagnostics")]
@@ -3308,8 +3343,8 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
+                let (step, records) = match self.window.iter().rev().find(|w| same(w)) {
+                    Some(w) if windowed => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = offset.saturating_sub(last);
                         let walks = step >= u64::from(stride)
@@ -3335,28 +3370,41 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                let ahead = windowed && records > 1;
+                let bounded = if many {
+                    crate::indirect::bound_in_ring(list, (&args.buffer, offset), count_arg, (kind, step, records), ahead)
+                } else if ahead {
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records)).map(|b| (b, 0, 0))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)).map(|b| (b, 0, 0))
                 };
-                let Some(bounded) = bounded else {
-                    self.window = None;
+                let Some((bounded, at, epoch)) = bounded else {
+                    self.window.clear();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
+                if !many {
+                    self.window.clear();
+                }
+                if windowed {
+                    self.window.push(Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                        at,
+                        epoch,
+                    });
+                    if self.window.len() > WINDOWS_KEPT {
+                        self.window.remove(0);
+                    }
+                }
+                (bounded, at)
             }
         };
         let ran = match kind {
@@ -3774,5 +3822,38 @@ mod window_tests {
         assert!(super::draw_ends_window(true, Some(true)));
         // a pipeline not known: it may store
         assert!(super::draw_ends_window(true, None));
+    }
+
+    #[test]
+    fn records_are_found_in_any_window_of_the_current_epoch() {
+        let w = |copy: u64, base: u64, at: u64, epoch: u64| super::Window {
+            copy,
+            kind: 10,
+            stride: 12,
+            step: 32,
+            base,
+            records: 16,
+            scratch: (),
+            at,
+            epoch,
+        };
+        let windows = [w(1, 0x100, 0, 5), w(2, 0x4000, 0x400, 5)];
+        // the third record of the first window, then the second window's first
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x140, 5), Some((0, 0x40)));
+        assert_eq!(super::window_hit(&windows, 2, 10, 12, 0x4000, 5), Some((1, 0x400)));
+        // not on the step, past the end, another kind, an old epoch
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x110, 5), None);
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x100 + 16 * 32, 5), None);
+        assert_eq!(super::window_hit(&windows, 1, 2, 12, 0x140, 5), None);
+        assert_eq!(super::window_hit(&windows, 1, 10, 12, 0x140, 6), None);
+    }
+
+    #[test]
+    fn the_scratch_ring_goes_round_into_a_new_epoch() {
+        let mut ring = (0, 1);
+        assert_eq!(crate::indirect::ring_take(&mut ring, 256, 1024, || 2), (0, 1));
+        assert_eq!(crate::indirect::ring_take(&mut ring, 512, 1024, || 2), (256, 1));
+        assert_eq!(crate::indirect::ring_take(&mut ring, 512, 1024, || 2), (0, 2));
+        assert_eq!(ring, (512, 2));
     }
 }

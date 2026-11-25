@@ -366,6 +366,39 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// [`bound`] or (`ahead`) [`bound_ahead`] into a region of the scratch
+/// buffer of its own (`HostList::indirect_ring`), so that what earlier
+/// clamps of the recording left stays readable: the buffer, the region's
+/// offset and its epoch.
+pub(crate) fn bound_in_ring(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64, u64)> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, at, epoch) = list.indirect_ring(bytes)?;
+    let before = list.indirect_state(&dst);
+    let recorded = record_clamp_at(c, &list.list, (&dst, at, before), budget, src, count, spec, ahead);
+    if recorded {
+        list.indirect_readable(&dst);
+    }
+    recorded.then_some((dst, at, epoch))
+}
+
+/// Takes `size` bytes from a ring cursor `(used, epoch)` over `cap` bytes:
+/// the offset and the epoch; going round starts a new epoch (`next`).
+pub(crate) fn ring_take(ring: &mut (u64, u64), size: u64, cap: u64, next: impl FnOnce() -> u64) -> (u64, u64) {
+    if ring.0 + size > cap {
+        *ring = (0, next());
+    }
+    let at = ring.0;
+    ring.0 += size;
+    (at, ring.1)
+}
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
@@ -399,6 +432,21 @@ fn record_clamp_as(
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_at(c, l, (dst, 0, before), budget, src, count, spec, ahead)
+}
+
+/// [`record_clamp_as`] into `dst` from byte `dst_offset` on.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_at(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, dst_offset, before): (&ID3D12Resource, u64, D3D12_RESOURCE_STATES),
+    budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -412,7 +460,7 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + dst_offset) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
