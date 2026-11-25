@@ -93,7 +93,30 @@ pub(crate) fn now_ms() -> u64 {
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let frame = crate::frame::current();
+    if !moment_frame() {
+        return (frame << 32) | ((now_ms() / 100) & 0xffff_ffff);
+    }
+    // the clock is read once a frame, and at every 256th asking of a thread (a frame may last long)
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    thread_local! {
+        static ASKED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+    let asked = ASKED.get().wrapping_add(1);
+    ASKED.set(asked);
+    let last = LAST.load(Ordering::Relaxed);
+    if last >> 32 == frame && asked != 0 {
+        return last;
+    }
+    let now = (frame << 32) | ((now_ms() / 100) & 0xffff_ffff);
+    LAST.store(now, Ordering::Relaxed);
+    now
+}
+
+// moment reads the clock once a frame, not at every call (VICTORY_MOMENT_FRAME=1)
+fn moment_frame() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MOMENT_FRAME").is_some_and(|v| v == "1"))
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
