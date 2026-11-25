@@ -7237,7 +7237,7 @@ impl Batch {
         from: usize,
         to: usize,
     ) {
-        if !(refresh_once() || crate::burst::on()) || from >= to {
+        if !(refresh_once() || crate::burst::active()) || from >= to {
             return;
         }
         let entry = current

@@ -9,19 +9,47 @@ use crate::shadow::Shadow;
 // by copy (its address): the copy and the title range that is up to date
 pub(crate) type Current<T> = HashMap<usize, (Arc<T>, usize, usize)>;
 
-pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_BURST_REFRESH").is_some_and(|v| v == "1") || group_asked();
-        if on {
+// 0 off, 1 on, 2 in turn (VICTORY_BURST_REFRESH=alt: twenty seconds with, twenty without, each change said)
+fn mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_BURST_REFRESH").as_deref() {
+            Ok("alt") => 2,
+            Ok("1") => 1,
+            _ => u8::from(group_asked()),
+        };
+        if mode != 0 {
             tracing::info!(
                 check = check_asked(),
                 group = group_asked(),
-                "copies stay up to date across the submissions of a burst (VICTORY_BURST_REFRESH=1)"
+                alt = mode == 2,
+                "copies stay up to date across the submissions of a burst (VICTORY_BURST_REFRESH=1; alt: in turn)"
             );
         }
-        on
+        mode
     })
+}
+
+// the switch is set: writes are noted and submissions stamped
+pub(crate) fn on() -> bool {
+    mode() != 0
+}
+
+// refreshes are left out now
+pub(crate) fn active() -> bool {
+    match mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), SeqCst) != u8::from(on) {
+                tracing::info!("burst refresh from now (VICTORY_BURST_REFRESH=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
 }
 
 fn check_asked() -> bool {
@@ -52,12 +80,25 @@ pub(crate) fn check() -> bool {
     on() && check_asked()
 }
 
+// the check: the frame each of the last stamps was given in
+static FRAMES: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+
+// the check: frames the title began since the submission stamped `stamp` was put in its line
+fn frames_on(stamp: u64) -> u64 {
+    if stamp == u64::MAX {
+        return 0;
+    }
+    crate::frame::current().saturating_sub(FRAMES[stamp as usize % FRAMES.len()].load(std::sync::atomic::Ordering::Relaxed))
+}
+
 // submissions put in a line so far
 static ENQUEUED: AtomicU64 = AtomicU64::new(0);
 
 // at the title's submit call: the submission's place in the order of enqueues
 pub(crate) fn stamp() -> u64 {
-    ENQUEUED.fetch_add(1, SeqCst) + 1
+    let stamp = ENQUEUED.fetch_add(1, SeqCst) + 1;
+    FRAMES[stamp as usize % FRAMES.len()].store(crate::frame::current(), std::sync::atomic::Ordering::Relaxed);
+    stamp
 }
 
 thread_local! {
@@ -197,8 +238,9 @@ pub(crate) fn trim<T>(current: &mut Current<T>, at: usize, end: usize) {
     });
 }
 
-// skips, their bytes, skips across submissions, heap syncs left out, missed ranges, their bytes, submissions, ranges refreshed early
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+// skips, their bytes, skips across submissions, heap syncs left out, missed ranges, their bytes, submissions, ranges refreshed early;
+// of the missed ranges: same bytes as title memory, other bytes after a later frame began, other bytes in the same frame, those bytes
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 fn count(i: usize, n: u64) {
     STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -216,7 +258,7 @@ pub(crate) struct Pass {
 
 // when a submission's preparing begins: what is still good for it goes into `current`
 pub(crate) fn begin(current: &mut Current<Shadow>) -> Option<Pass> {
-    if !on() {
+    if !active() {
         return None;
     }
     let stamp = stamp_here();
@@ -257,16 +299,30 @@ impl Pass {
         if !check() {
             return;
         }
+        // before the old update: the bytes of the range that are not the title's now
+        let differ = copy.differs(address, len);
         let bytes = copy.update(address, len);
         if bytes == 0 {
             return;
         }
         count(4, 1);
         count(5, bytes as u64);
-        let said = STATS[4].load(std::sync::atomic::Ordering::Relaxed);
-        if said <= 256 || said.is_power_of_two() {
+        // written pages hold other bytes too: only a range whose own bytes changed was left stale
+        let frames_on = frames_on(self.stamp);
+        let class = match differ {
+            Some(0) => 8,
+            _ if frames_on > 0 => 9,
+            _ => 10,
+        };
+        count(class, 1);
+        count(11, differ.unwrap_or(0) as u64);
+        let said = STATS[class].load(std::sync::atomic::Ordering::Relaxed);
+        if (class == 10 && said <= 512) || said <= 64 || said.is_power_of_two() {
             tracing::warn!(
                 said,
+                what = ["same bytes", "other bytes or not compared, a later frame began", "other bytes or not compared, same frame"][class - 8],
+                differ = ?differ,
+                frames_on,
                 copy = copy.id(),
                 range = format_args!("{address:#x}+{len:#x}"),
                 bytes,
@@ -288,7 +344,7 @@ impl Pass {
 
 // whether the submission this thread prepares needs the heaps synced
 pub(crate) fn heap_due() -> bool {
-    if !on() {
+    if !active() {
         return true;
     }
     let now = ENQUEUED.load(SeqCst);
@@ -305,11 +361,12 @@ fn line() {
     if STATS[6].load(Relaxed) < EVERY {
         return;
     }
-    let [skips, bytes, across, heaps, missed, missed_bytes, submissions, early] = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| STATS[i].swap(0, Relaxed));
+    let [skips, bytes, across, heaps, missed, missed_bytes, submissions, early, same, later, stale, stale_bytes] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|i| STATS[i].swap(0, Relaxed));
     let per = submissions.max(1) as f64;
     tracing::info!(
         "burst refresh per submission (VICTORY_BURST_REFRESH=1): {:.1} refreshes left out ({:.1} of them from an earlier \
-         submission), {:.1} MB; {:.2} heap syncs left out; {:.1} copies refreshed early (VICTORY_BURST_GROUP=1); the check found {missed} skips over written pages, {:.2} MB, in {submissions} submissions",
+         submission), {:.1} MB; {:.2} heap syncs left out; {:.1} copies refreshed early (VICTORY_BURST_GROUP=1); the check found {missed} skips over written pages, {:.2} MB, in {submissions} submissions: \n         {same} whose own bytes were the title's still, {later} with other bytes after the title began a later frame, \n         {stale} with other bytes in the same frame ({stale_bytes} bytes differed in all)",
         skips as f64 / per,
         across as f64 / per,
         bytes as f64 / per / 1048576.0,
