@@ -157,6 +157,10 @@ pub extern "system" fn XMemVirtualAlloc(
     // the console's gpu and caching bits, for VICTORY_INPLACE_UPLOAD
     if !at.is_null() {
         victory_gpu::title_memory_protection(at as usize, size, console_protect);
+        // absent blocks of the gpu side's guards there are no longer
+        if kind & MEM_COMMIT != 0 {
+            victory_gpu::title_memory_committed(at as usize, size);
+        }
     }
     if base.is_null() {
         tracing::debug!(
