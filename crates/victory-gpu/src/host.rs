@@ -850,6 +850,9 @@ pub(crate) struct HostList {
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
+    /// With `crate::cardmeter::passes`: the pair timing the pass being
+    /// recorded, or none.
+    pass_span: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2001,6 +2004,10 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// With `VICTORY_WINDOWS_MANY`: the bytes of the scratch buffer handed out
+    /// to clamps in this recording, and the epoch of what they hold (a new one
+    /// whenever the buffer is replaced or the cursor goes round).
+    ring: (u64, u64),
 }
 
 impl Deferred {
@@ -3934,6 +3941,7 @@ impl Host {
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
+                pass_span: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6087,6 +6095,7 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
+        self.pass_end();
         crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)));
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -6135,10 +6144,25 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.pass_span.store(u32::MAX, Ordering::Relaxed);
         self.meter
             .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// A pass of key `key` begins here (`crate::cardmeter::passes`): the
+    /// pass before it ends.
+    pub(crate) fn pass_begin(&self, key: u32) {
+        self.pass_end();
+        let span = crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Pass(key));
+        self.pass_span.store(span.raw(), Ordering::Relaxed);
+    }
+
+    /// The pass being recorded ends here.
+    pub(crate) fn pass_end(&self) {
+        let span = self.pass_span.swap(u32::MAX, Ordering::Relaxed);
+        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(span));
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -6161,6 +6185,10 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                #[cfg(feature = "diagnostics")]
+                if before != wanted {
+                    crate::copystat::add(crate::copystat::C::Transitions, 1);
+                }
                 (before != wanted).then_some((texture, before))
             }
         }
@@ -6776,6 +6804,39 @@ impl HostList {
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
+    /// A region of `size` bytes of the scratch buffer that no other clamp of
+    /// this recording holds until the cursor goes round: the buffer, the
+    /// region's offset, and the epoch the region belongs to (records clamped
+    /// in an older epoch may be overwritten). The card orders a clamp after
+    /// every earlier execution's reads, so going round only matters to the
+    /// windows that remember what a region holds.
+    pub(crate) fn indirect_ring(&self, size: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        static EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        const RING: u64 = 1 << 20;
+        let size = size.next_multiple_of(256);
+        let have = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| (s.0.clone(), s.1));
+        let (buffer, cap) = match have {
+            Some((b, cap)) if cap >= size.max(RING) => (b, cap),
+            _ => {
+                let b = self.indirect_scratch(size.max(RING))?;
+                let cap = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.1);
+                self.deferred().ring = (0, EPOCHS.fetch_add(1, Ordering::Relaxed));
+                (b, cap)
+            }
+        };
+        let mut d = self.deferred();
+        if d.ring.1 == 0 {
+            d.ring.1 = EPOCHS.fetch_add(1, Ordering::Relaxed);
+        }
+        let (at, epoch) = crate::indirect::ring_take(&mut d.ring, size, cap, || EPOCHS.fetch_add(1, Ordering::Relaxed));
+        Some((buffer, at, epoch))
+    }
+
+    /// The epoch of the scratch ring's regions (`indirect_ring`) in this recording.
+    pub(crate) fn ring_epoch(&self) -> u64 {
+        self.deferred().ring.1
+    }
+
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());

@@ -530,3 +530,43 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A console wave of 64 threads on a host of 32-lane waves with LDS: one write, then three reads
+/// of what it wrote. The two host waves meet before each access, or with
+/// `VICTORY_LDS_MEET_TRIM` only where an access may clash (before the write and the first read).
+#[test]
+fn split_waves_meet_only_where_lds_accesses_may_clash() {
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
+        [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
+    }
+    const DS_WRITE_B32: u32 = 0x0D;
+    const DS_READ_B32: u32 = 0x36;
+    let mut body = vec![0x7E00_0000 | 5 << 17 | 0x001 << 9 | 0x80]; // v_mov_b32 v5, 0
+    body.extend(ds(DS_WRITE_B32, 0, 5, 0));
+    body.extend(ds(DS_READ_B32, 6, 5, 0));
+    body.extend(ds(DS_READ_B32, 7, 5, 0));
+    body.extend(ds(DS_READ_B32, 8, 5, 0));
+    // buffer_store_dword v8, off, s[8:11], 0
+    body.extend([0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16 | 8 << 8]);
+    let mut native = native_of(&body, true, 64);
+    native.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 15, threads: [64, 1, 1] });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let meetings = |trim: bool| {
+        let was = lower::TEST_LDS_TRIM.replace(Some(trim));
+        lower::LDS_MEETINGS.set(0);
+        lowered(&native, &p, &HashSet::new()).expect("lowered");
+        lower::TEST_LDS_TRIM.set(was);
+        lower::LDS_MEETINGS.get()
+    };
+    assert_eq!(meetings(false), 4);
+    assert_eq!(meetings(true), 2);
+}
+
+#[test]
+fn waves_meet_after_a_write_and_before_a_write_after_any_access() {
+    use lower::lds_meet_needed as needed;
+    assert!(needed(true, true, true));
+    assert!(!needed(false, true, true));
+    assert!(needed(false, true, false));
+    assert!(!needed(false, false, false));
+}

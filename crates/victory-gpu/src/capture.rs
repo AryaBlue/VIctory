@@ -386,6 +386,8 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    static SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| std::env::var("VICTORY_DUMP_TARGETS").unwrap_or_default());
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -393,10 +395,58 @@ pub(crate) fn dump_targets(frame: u64) {
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             continue;
         }
+        if !dump_wanted(spec, d.Width, d.Height, d.Format.0 as u32) {
+            continue;
+        }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
+}
+
+/// Whether `VICTORY_DUMP_TARGETS` asks for a texture of this size and
+/// format: any value but a list dumps them all; a list of `<w>x<h>` or
+/// `<w>x<h>f<format>` only those.
+fn dump_wanted(spec: &str, width: u64, height: u32, format: u32) -> bool {
+    let picks: Vec<(u64, u32, Option<u32>)> = spec
+        .split(',')
+        .filter_map(|p| {
+            let (w, rest) = p.trim().split_once('x')?;
+            let (h, f) = match rest.split_once('f') {
+                Some((h, f)) => (h, Some(f.parse().ok()?)),
+                None => (rest, None),
+            };
+            Some((w.parse().ok()?, h.parse().ok()?, f))
+        })
+        .collect();
+    picks.is_empty()
+        || picks
+            .iter()
+            .any(|&(w, h, f)| w == width && h == height && f.is_none_or(|f| f == format))
+}
+
+/// Texels of one-channel 32-bit floats (depth, Hi-Z): how many are 0.0,
+/// 1.0, between, and other (outside 0..1 or not a number).
+fn float_spread(rows: &[u8], width: usize, height: usize, pitch: usize) -> [u32; 4] {
+    let mut spread = [0u32; 4];
+    for y in 0..height {
+        for x in 0..width {
+            let at = y * pitch + x * 4;
+            let Some(b) = rows.get(at..at + 4) else { continue };
+            let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            let slot = if v == 0.0 {
+                0
+            } else if v == 1.0 {
+                1
+            } else if v > 0.0 && v < 1.0 {
+                2
+            } else {
+                3
+            };
+            spread[slot] += 1;
+        }
+    }
+    spread
 }
 
 fn dump_one(
@@ -468,6 +518,11 @@ fn dump_one(
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
+        // r32 typeless, float, d32 and the depth plane of d32s8: 0, 1 and the rest.
+        if matches!(f.Format.0, 39..=41 | 19..=20) && pitch >= f.Width as usize * 4 {
+            let spread = float_spread(rows, f.Width as usize, f.Height as usize, pitch);
+            tracing::info!(frame, ?resource, width = f.Width, height = f.Height, format = d.Format.0, zero_one_between_other = ?spread, "float texture spread");
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
@@ -850,6 +905,25 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dump_list_picks_only_the_textures_it_names() {
+        assert!(super::dump_wanted("1", 2560, 1440, 19));
+        assert!(super::dump_wanted("1024x512", 1024, 512, 41));
+        assert!(!super::dump_wanted("1024x512", 2560, 1440, 19));
+        assert!(super::dump_wanted("1024x512f41,2560x1440f19", 2560, 1440, 19));
+        assert!(!super::dump_wanted("1024x512f41", 1024, 512, 28));
+    }
+
+    #[test]
+    fn float_spread_counts_far_near_and_between() {
+        let mut rows = Vec::new();
+        for v in [0.0f32, 0.0, 1.0, 0.5, -1.0, 0.0] {
+            rows.extend_from_slice(&v.to_le_bytes());
+        }
+        // two rows of two texels with a 12-byte pitch: the padding texel is skipped
+        assert_eq!(super::float_spread(&rows, 2, 2, 12), [2, 0, 1, 1]);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

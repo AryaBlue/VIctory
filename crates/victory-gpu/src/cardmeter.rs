@@ -38,10 +38,12 @@ pub(crate) enum Kind {
     Check,
     /// Every other host list: the title's own, our present copies.
     Lists,
+    /// A pass of a title list (`VICTORY_PASS_TIMES`): its key ([`pass_key`]).
+    Pass(u32),
 }
 
 /// Pairs of timestamps in the ring.
-const PAIRS: u32 = 8192;
+const PAIRS: u32 = 65536;
 /// A pair is read this long after it was recorded.
 const AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -88,6 +90,85 @@ pub(crate) fn on() -> bool {
         Some(v) => v != "0",
         None => cfg!(feature = "diagnostics"),
     })
+}
+
+/// `VICTORY_PASS_TIMES=1` (with the meter on): a title list is also timed
+/// pass by pass, a pair of timestamps from where its targets change or it
+/// goes from draws to dispatches (or back) to the next such place, and a
+/// table of passes by time is logged every few seconds: per frame, the
+/// card's milliseconds, the spans, draws, dispatches and clamps, keyed by
+/// targets (size, format), depth and the pass's first pipeline. Off by
+/// default. No waits: the pairs are read as the list pairs are.
+pub(crate) fn passes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_PASS_TIMES").is_some_and(|v| v == "1"))
+}
+
+/// Per pass key: name, card microseconds, spans, draws, dispatches, clamps
+/// since the last table.
+struct Passes {
+    names: Vec<String>,
+    ids: std::collections::BTreeMap<String, u32>,
+    sums: Vec<[u64; 5]>,
+    frames: u64,
+    since: Option<std::time::Instant>,
+}
+
+static PASSES: Mutex<Passes> = Mutex::new(Passes {
+    names: Vec::new(),
+    ids: std::collections::BTreeMap::new(),
+    sums: Vec::new(),
+    frames: 0,
+    since: None,
+});
+
+fn passes_lock() -> std::sync::MutexGuard<'static, Passes> {
+    PASSES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The id of pass `name` (made on first sight).
+pub(crate) fn pass_key(name: String) -> u32 {
+    let mut p = passes_lock();
+    if let Some(&id) = p.ids.get(&name) {
+        return id;
+    }
+    let id = p.names.len() as u32;
+    p.names.push(name.clone());
+    p.ids.insert(name, id);
+    p.sums.push([0; 5]);
+    id
+}
+
+/// What a pass recorded: 0 a draw, 1 a dispatch, 2 a clamp of ours.
+pub(crate) fn pass_count(id: u32, what: usize) {
+    if id == u32::MAX {
+        return;
+    }
+    if let Some(s) = passes_lock().sums.get_mut(id as usize) {
+        s[2 + what.min(2)] += 1;
+    }
+}
+
+/// The table's lines, largest time first: per frame over `frames`.
+fn pass_table(names: &[String], sums: &[[u64; 5]], frames: u64, most: usize) -> Vec<String> {
+    let frames = frames.max(1) as f64;
+    let mut order: Vec<usize> = (0..sums.len()).filter(|&i| sums[i][0] > 0 || sums[i][2] + sums[i][3] > 0).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sums[i][0]));
+    let total: u64 = sums.iter().map(|s| s[0]).sum();
+    let mut lines = vec![format!("passes by the card's time, per frame: {:.1} ms in all", total as f64 / 1e3 / frames)];
+    for &i in order.iter().take(most) {
+        let s = sums[i];
+        lines.push(format!(
+            "  {:7.2} ms {:6.1} spans {:7.1} draws {:6.1} dispatches {:6.1} clamps  {}",
+            s[0] as f64 / 1e3 / frames,
+            s[1] as f64 / frames,
+            s[2] as f64 / frames,
+            s[3] as f64 / frames,
+            s[4] as f64 / frames,
+            names[i]
+        ));
+    }
+    lines
 }
 
 fn make() -> Option<Meter> {
@@ -220,6 +301,26 @@ pub(crate) fn collect() {
                 add(T::CardListsUs, us);
                 add(T::CardLists, 1);
             }
+            Kind::Pass(id) => {
+                if let Some(s) = passes_lock().sums.get_mut(id as usize) {
+                    s[0] += us;
+                    s[1] += 1;
+                }
+            }
+        }
+    }
+    drop(meter);
+    if passes() {
+        let mut p = passes_lock();
+        p.frames += 1;
+        let since = *p.since.get_or_insert(now);
+        if now.duration_since(since) >= std::time::Duration::from_secs(10) {
+            for line in pass_table(&p.names, &p.sums, p.frames, 40) {
+                tracing::info!("{line}");
+            }
+            p.sums.iter_mut().for_each(|s| *s = [0; 5]);
+            p.frames = 0;
+            p.since = Some(now);
         }
     }
 }
@@ -227,6 +328,19 @@ pub(crate) fn collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pass_table_lists_the_longest_passes_per_frame_first() {
+        let names = ["shadow".to_owned(), "gbuffer".to_owned(), "idle".to_owned()];
+        let sums = [[20_000, 4, 100, 0, 50], [60_000, 2, 200, 0, 0], [0, 0, 0, 0, 0]];
+        let lines = pass_table(&names, &sums, 2, 10);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("40.0 ms in all"), "{}", lines[0]);
+        assert!(lines[1].ends_with("gbuffer") && lines[1].contains("30.00 ms"), "{}", lines[1]);
+        assert!(lines[2].ends_with("shadow") && lines[2].contains("25.0 clamps"), "{}", lines[2]);
+        // the same key twice is one pass
+        assert_eq!(pass_key("a test pass".to_owned()), pass_key("a test pass".to_owned()));
+    }
 
     #[test]
     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {
