@@ -79,6 +79,12 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path,
         info: prepared.info.clone(),
     };
+    // VICTORY_PATCH / VICTORY_NO_WATCHDOG: mapped and relocated, before tls and imports
+    crate::patch::apply(
+        loaded.base(),
+        loaded.info.size_of_image as usize,
+        &prepared.file_name(),
+    );
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
