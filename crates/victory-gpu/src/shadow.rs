@@ -105,7 +105,7 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// With `crate::card_mask`: changed dwords (offset, byte mask) to put
     /// into the card's side by the masked pass, beside `dirty`.
-    masked: Mutex<Vec<(u32, u32)>>,
+    masked: Mutex<crate::card_mask::Notes>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -388,12 +388,21 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>,
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = std::mem::take(&mut *dirty);
-                let masked = std::mem::take(&mut *c.masked.lock().unwrap_or_else(|e| e.into_inner()));
+                let mut notes = c.masked.lock().unwrap_or_else(|e| e.into_inner());
+                // with VICTORY_MERGE_MASKED_INDEX the masked runs are kept per send
+                let masked = if relay() && crate::card_mask::indexed() {
+                    notes.send(sent_as, fetched)
+                } else {
+                    std::mem::take(&mut notes.pending)
+                };
+                drop(notes);
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                    sent.extend(crate::card_mask::byte_runs(&masked).into_iter().map(|(a, b)| (a, b, sent_as)));
+                    if !crate::card_mask::indexed() {
+                        sent.extend(crate::card_mask::byte_runs(&masked).into_iter().map(|(a, b)| (a, b, sent_as)));
+                    }
                 }
                 (ranges, masked)
             })
@@ -2386,7 +2395,10 @@ impl Shadow {
             let dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
             !dirty.is_empty() || !c.sent.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
         };
-        let masked = !c.masked.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        let masked = {
+            let notes = c.masked.lock().unwrap_or_else(|e| e.into_inner());
+            !notes.pending.is_empty() || !notes.sent.is_empty()
+        };
         !unsent && !masked
     }
 
@@ -3072,7 +3084,8 @@ impl Shadow {
         }
         let runs = changed_runs(title, held);
         let entries = crate::card_mask::dword_masks(at, &runs);
-        let mut masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notes = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+        let masked = &mut notes.pending;
         if masked.len() + entries.len() > crate::card_mask::MOST {
             return false;
         }
@@ -3534,7 +3547,13 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             // title bytes the masked pass still has to put up are the title's too
-            let masked = crate::card_mask::byte_runs(&card.masked.lock().unwrap_or_else(|e| e.into_inner()));
+            let notes = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+            let mut masked = Vec::new();
+            if crate::card_mask::indexed() {
+                notes.skip(at, at + n, fetched_after, &mut masked);
+            } else {
+                masked = crate::card_mask::byte_runs(&notes.pending);
+            }
             dirty
                 .iter()
                 .copied()

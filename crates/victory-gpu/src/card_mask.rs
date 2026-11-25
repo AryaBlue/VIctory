@@ -45,23 +45,90 @@ pub(crate) fn dword_masks(at: usize, runs: &[(usize, usize)]) -> Vec<(u32, u32)>
 /// the relay's notes of what went up and what is still to go, which must
 /// hold no byte the pass leaves alone.
 pub(crate) fn byte_runs(entries: &[(u32, u32)]) -> Vec<(usize, usize)> {
-    let mut bytes: Vec<usize> = entries
-        .iter()
-        .flat_map(|&(word, mask)| {
-            (0..4usize)
-                .filter(move |b| mask >> (b * 8) & 0xff != 0)
-                .map(move |b| word as usize + b)
-        })
-        .collect();
-    bytes.sort_unstable();
+    // sorted by dword, not byte by byte: the same runs for a quarter of the sort
+    let mut words = entries.to_vec();
+    words.sort_unstable_by_key(|e| e.0);
+    // a dword noted twice: one mask, so its bytes come in order
+    words.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 |= later.1;
+        }
+        same
+    });
     let mut out: Vec<(usize, usize)> = Vec::new();
-    for b in bytes {
-        match out.last_mut() {
-            Some(last) if b <= last.1 => last.1 = last.1.max(b + 1),
-            _ => out.push((b, b + 1)),
+    for (word, mask) in words {
+        for b in 0..4usize {
+            if mask >> (b * 8) & 0xff == 0 {
+                continue;
+            }
+            let at = word as usize + b;
+            match out.last_mut() {
+                Some(last) if at <= last.1 => last.1 = last.1.max(at + 1),
+                _ => out.push((at, at + 1)),
+            }
         }
     }
     out
+}
+
+/// Whether the relay's notes of masked bytes are kept per send, sorted, and
+/// looked up by range (`VICTORY_MERGE_MASKED_INDEX=1`).
+///
+/// Why: fast-2 put 581k changed runs a frame through the masked pass; each
+/// went into the copy's `sent` list as a byte run, and every piece the relay
+/// merged (1,100-1,400 a frame) scanned that whole list and re-sorted the
+/// dwords still to go up byte by byte. The relay's landing time grew from
+/// 74-91 ms (vf-all-3) to 100-165 ms.
+pub(crate) fn indexed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MERGE_MASKED_INDEX").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the relay's notes of masked bytes are kept per send and looked up by range (VICTORY_MERGE_MASKED_INDEX=1)");
+        }
+        on
+    })
+}
+
+/// A copy's notes for the masked pass: the dwords still to go up, and with
+/// [`indexed`] the byte runs each send took (send number, sorted runs).
+#[derive(Default)]
+pub(crate) struct Notes {
+    pub(crate) pending: Vec<(u32, u32)>,
+    pub(crate) sent: Vec<(u64, Vec<(usize, usize)>)>,
+}
+
+impl Notes {
+    /// Send `sent_as` takes what is pending; with [`indexed`] its byte runs
+    /// are kept, and the groups every fetch still to merge came after go.
+    pub(crate) fn send(&mut self, sent_as: u64, fetched: u64) -> Vec<(u32, u32)> {
+        let pending = std::mem::take(&mut self.pending);
+        self.sent.retain(|g| g.0 > fetched);
+        if !pending.is_empty() {
+            self.sent.push((sent_as, byte_runs(&pending)));
+        }
+        pending
+    }
+
+    /// The masked bytes in `[from, to)` that are the title's for a fetch sent
+    /// after send `after`: those still to go up and those a later send took.
+    pub(crate) fn skip(&self, from: usize, to: usize, after: u64, out: &mut Vec<(usize, usize)>) {
+        let near: Vec<(u32, u32)> = self
+            .pending
+            .iter()
+            .copied()
+            .filter(|&(w, _)| (w as usize) < to && w as usize + 4 > from)
+            .collect();
+        out.extend(byte_runs(&near));
+        for (s, runs) in &self.sent {
+            if *s <= after {
+                continue;
+            }
+            let first = runs.partition_point(|r| r.1 <= from);
+            out.extend(runs[first..].iter().take_while(|r| r.0 < to).copied());
+        }
+    }
 }
 
 /// Ranges (offsets) the entries' dwords cover, near ones joined: for the
@@ -224,6 +291,98 @@ mod tests {
                 assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
             }
         }
+    }
+
+    /// The runs as the byte-by-byte sort made them.
+    fn byte_runs_one_by_one(entries: &[(u32, u32)]) -> Vec<(usize, usize)> {
+        let mut bytes: Vec<usize> = entries
+            .iter()
+            .flat_map(|&(word, mask)| {
+                (0..4usize)
+                    .filter(move |b| mask >> (b * 8) & 0xff != 0)
+                    .map(move |b| word as usize + b)
+            })
+            .collect();
+        bytes.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for b in bytes {
+            match out.last_mut() {
+                Some(last) if b <= last.1 => last.1 = last.1.max(b + 1),
+                _ => out.push((b, b + 1)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn runs_sorted_by_dword_are_those_sorted_by_byte() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..200 {
+            let entries: Vec<(u32, u32)> = (0..next() % 40)
+                .map(|_| ((next() % 64) * 4, next() & 0xff00_ff0f))
+                .collect();
+            assert_eq!(byte_runs(&entries), byte_runs_one_by_one(&entries));
+        }
+    }
+
+    /// What the relay leaves out of a piece, looked up per send, is what the
+    /// whole list of byte runs gave.
+    #[test]
+    fn notes_per_send_skip_what_the_full_list_skipped() {
+        let mut notes = Notes::default();
+        let mut flat: Vec<(usize, usize, u64)> = Vec::new();
+        for (send, words) in [
+            (5u64, [0u32, 8, 64]),
+            (6, [4, 200, 400]),
+            (7, [12, 64, 1000]),
+        ] {
+            notes.pending = words.iter().map(|&w| (w, 0x00ff_00ff)).collect();
+            flat.extend(
+                byte_runs(&notes.pending)
+                    .into_iter()
+                    .map(|(a, b)| (a, b, send)),
+            );
+            notes.send(send, 4);
+        }
+        notes.pending = vec![(96, 0xffff_0000), (2000, 0xff)];
+        for (from, to, after) in [
+            (0, 2048, 4),
+            (0, 70, 5),
+            (60, 210, 6),
+            (100, 999, 7),
+            (0, 100, 6),
+        ] {
+            let mut got = Vec::new();
+            notes.skip(from, to, after, &mut got);
+            let mut want: Vec<(usize, usize)> = byte_runs(&notes.pending)
+                .into_iter()
+                .chain(flat.iter().filter(|s| s.2 > after).map(|s| (s.0, s.1)))
+                .filter(|&(a, b)| a < to && b > from)
+                .collect();
+            let bytes = |runs: &mut Vec<(usize, usize)>| {
+                let mut on = vec![false; to - from];
+                for &(a, b) in runs.iter() {
+                    for x in a.max(from)..b.min(to) {
+                        on[x - from] = true;
+                    }
+                }
+                on
+            };
+            assert_eq!(
+                bytes(&mut got),
+                bytes(&mut want),
+                "{from}..{to} after {after}"
+            );
+        }
+        // send 5 is dropped once every fetch came after it
+        notes.send(8, 5);
+        assert!(notes.sent.iter().all(|g| g.0 > 5));
     }
 
     #[test]
