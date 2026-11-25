@@ -77,7 +77,7 @@ struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Pages,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -200,7 +200,7 @@ pub(crate) fn pieces_needed(since: u64, write: u64, noted: Option<Pieces>) -> u1
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Pages::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -505,11 +505,12 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.range(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -525,13 +526,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.written.range(first, last)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -591,13 +586,114 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in guarded {
         note(j, page, now, u16::MAX);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, j.written.range(first, last)))
+}
+
+/// The journal's pages kept flat (`VICTORY_JOURNAL_FLAT=1`; off by default):
+/// a sorted vec, so a refresh's range is one slice copy, not a tree walk
+/// collected entry by entry (s2-prep-1: 16.5 ms a frame in `writes`' collects).
+/// Pages new to the journal wait in a small tree and are merged in at the
+/// next range read.
+fn journal_flat() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_JOURNAL_FLAT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the write journal's pages are kept flat (VICTORY_JOURNAL_FLAT=1)");
+        }
+        on
+    })
+}
+
+/// New pages that wait before the flat journal is merged whole.
+const FRESH_MOST: usize = 1024;
+
+/// Page number → the asking that last found it written; a tree, or with
+/// [`journal_flat`] a sorted vec and the pages not merged into it yet.
+struct Pages {
+    tree: BTreeMap<usize, u64>,
+    flat: Vec<(usize, u64)>,
+    fresh: BTreeMap<usize, u64>,
+    // decided at the first use (tests set it)
+    mode: u8,
+}
+
+impl Pages {
+    const fn new() -> Self {
+        Pages {
+            tree: BTreeMap::new(),
+            flat: Vec::new(),
+            fresh: BTreeMap::new(),
+            mode: 0,
+        }
+    }
+
+    fn is_flat(&mut self) -> bool {
+        if self.mode == 0 {
+            self.mode = if journal_flat() { 2 } else { 1 };
+        }
+        self.mode == 2
+    }
+
+    fn insert(&mut self, page: usize, now: u64) -> Option<u64> {
+        if !self.is_flat() {
+            return self.tree.insert(page, now);
+        }
+        match self.flat.binary_search_by_key(&page, |e| e.0) {
+            Ok(i) => Some(std::mem::replace(&mut self.flat[i].1, now)),
+            Err(_) => self.fresh.insert(page, now),
+        }
+    }
+
+    // pages new since the last read go into the sorted vec, in one pass
+    fn merge(&mut self) {
+        if self.fresh.is_empty() {
+            return;
+        }
+        let fresh = std::mem::take(&mut self.fresh);
+        let old = std::mem::take(&mut self.flat);
+        let mut out = Vec::with_capacity(old.len() + fresh.len());
+        let mut a = old.into_iter().peekable();
+        let mut b = fresh.into_iter().peekable();
+        loop {
+            let take_a = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) => x.0 < y.0,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            out.push(if take_a { a.next() } else { b.next() }.unwrap_or_default());
+        }
+        self.flat = out;
+    }
+
+    /// The pages in `[first, last)` with their askings, in page order.
+    fn range(&mut self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        if !self.is_flat() {
+            return self.tree.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        }
+        // a full merge only once enough new pages wait: each costs the whole vec
+        if self.fresh.len() >= FRESH_MOST {
+            self.merge();
+        }
+        let a = self.flat.partition_point(|e| e.0 < first);
+        let b = self.flat.partition_point(|e| e.0 < last).max(a);
+        let old = &self.flat[a..b];
+        if last <= first || self.fresh.range(first..last).next().is_none() {
+            return old.to_vec();
+        }
+        let mut out = Vec::with_capacity(old.len() + 16);
+        let mut new = self.fresh.range(first..last).map(|(&p, &w)| (p, w)).peekable();
+        for &e in old {
+            while let Some(&n) = new.peek().filter(|n| n.0 < e.0) {
+                out.push(n);
+                new.next();
+            }
+            out.push(e);
+        }
+        out.extend(new);
+        out
+    }
 }
 
 impl Tracked {
@@ -1454,6 +1550,59 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// VICTORY_JOURNAL_FLAT: the flat journal answers every range as the
+    /// tree does, through new pages, rewrites and merges in any order.
+    #[test]
+    fn a_flat_journal_answers_as_the_tree_does() {
+        let (mut tree, mut flat) = (Pages::new(), Pages::new());
+        tree.mode = 1;
+        flat.mode = 2;
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        for now in 1..4000u64 {
+            let page = next() % 3000;
+            assert_eq!(tree.insert(page, now), flat.insert(page, now), "insert of page {page}");
+            if now % 7 == 0 {
+                let a = next() % 3100;
+                let b = a + next() % 400;
+                assert_eq!(tree.range(a, b), flat.range(a, b), "range {a}..{b}");
+            }
+        }
+        assert_eq!(tree.range(0, usize::MAX), flat.range(0, usize::MAX));
+        assert!(flat.range(5, 5).is_empty() && flat.range(9, 3).is_empty());
+    }
+
+    /// offline numbers: a 40k-page journal, ranges of 2,700 pages (the heap)
+    #[test]
+    #[ignore]
+    fn bench_journal_ranges() {
+        for mode in [1u8, 2] {
+            let mut j = Pages::new();
+            j.mode = mode;
+            for page in 0..40_000usize {
+                j.insert(page * 3, 1);
+            }
+            let t = std::time::Instant::now();
+            let mut n = 0;
+            for i in 0..2000usize {
+                let a = (i * 37) % 110_000;
+                n += j.range(a, a + 8100).len();
+                j.insert(a, i as u64);
+            }
+            println!(
+                "bench journal {}: {:.1} us a range of {} pages",
+                if mode == 1 { "tree" } else { "flat" },
+                t.elapsed().as_secs_f64() * 1e6 / 2000.0,
+                n / 2000
+            );
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
