@@ -12,10 +12,11 @@ pub(crate) type Current<T> = HashMap<usize, (Arc<T>, usize, usize)>;
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_BURST_REFRESH").is_some_and(|v| v == "1");
+        let on = std::env::var_os("VICTORY_BURST_REFRESH").is_some_and(|v| v == "1") || group_asked();
         if on {
             tracing::info!(
                 check = check_asked(),
+                group = group_asked(),
                 "copies stay up to date across the submissions of a burst (VICTORY_BURST_REFRESH=1)"
             );
         }
@@ -25,7 +26,25 @@ pub(crate) fn on() -> bool {
 
 fn check_asked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BURST_REFRESH_CHECK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        ["VICTORY_BURST_REFRESH_CHECK", "VICTORY_BURST_GROUP_CHECK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
+}
+
+// the refreshes of every submission waiting in a line are done with the first one's (VICTORY_BURST_GROUP=1)
+fn group_asked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURST_GROUP").is_some_and(|v| v == "1"))
+}
+
+// the highest enqueue count whose waiting submissions were looked at
+static GROUPED: AtomicU64 = AtomicU64::new(0);
+
+// the stamps `(after, up_to]` still to look at for a pass that began at enqueue count `seq`
+fn window(grouped: &AtomicU64, seq: u64) -> (u64, u64) {
+    (grouped.fetch_max(seq, SeqCst), seq)
 }
 
 // the old check runs as well and says what a skip would have missed (VICTORY_BURST_REFRESH_CHECK=1)
@@ -177,8 +196,8 @@ pub(crate) fn trim<T>(current: &mut Current<T>, at: usize, end: usize) {
     });
 }
 
-// skips, their bytes, skips across submissions, heap syncs left out, missed ranges, their bytes, submissions
-static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+// skips, their bytes, skips across submissions, heap syncs left out, missed ranges, their bytes, submissions, ranges refreshed early
+static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn count(i: usize, n: u64) {
     STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -216,6 +235,16 @@ impl Pass {
         }
         self.wrote = now;
         LOG.lock().unwrap_or_else(|e| e.into_inner()).apply(current);
+    }
+
+    // with the group switch: the stamps of waiting submissions whose refreshes this pass takes
+    pub(crate) fn group(&self) -> Option<(u64, u64)> {
+        group_asked().then(|| window(&GROUPED, self.seq))
+    }
+
+    // `ranges` of them were added early
+    pub(crate) fn grouped(&self, ranges: usize) {
+        count(7, ranges as u64);
     }
 
     // a refresh of `[address, address + len)` of `copy` was left out
@@ -275,15 +304,16 @@ fn line() {
     if STATS[6].load(Relaxed) < EVERY {
         return;
     }
-    let [skips, bytes, across, heaps, missed, missed_bytes, submissions] = [0, 1, 2, 3, 4, 5, 6].map(|i| STATS[i].swap(0, Relaxed));
+    let [skips, bytes, across, heaps, missed, missed_bytes, submissions, early] = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| STATS[i].swap(0, Relaxed));
     let per = submissions.max(1) as f64;
     tracing::info!(
         "burst refresh per submission (VICTORY_BURST_REFRESH=1): {:.1} refreshes left out ({:.1} of them from an earlier \
-         submission), {:.1} MB; {:.2} heap syncs left out; the check found {missed} skips over written pages, {:.2} MB, in {submissions} submissions",
+         submission), {:.1} MB; {:.2} heap syncs left out; {:.1} copies refreshed early (VICTORY_BURST_GROUP=1); the check found {missed} skips over written pages, {:.2} MB, in {submissions} submissions",
         skips as f64 / per,
         across as f64 / per,
         bytes as f64 / per / 1048576.0,
         heaps as f64 / per,
+        early as f64 / per,
         missed_bytes as f64 / 1048576.0,
     );
 }
@@ -381,6 +411,16 @@ mod tests {
         assert!(kept.heap_due(4, 5));
         // a submission that was in no line
         assert!(kept.heap_due(u64::MAX, 5));
+    }
+
+    #[test]
+    fn waiting_submissions_are_looked_at_once() {
+        let grouped = AtomicU64::new(0);
+        assert_eq!(window(&grouped, 5), (0, 5));
+        assert_eq!(window(&grouped, 5), (5, 5));
+        assert_eq!(window(&grouped, 9), (5, 9));
+        // a pass that began earlier finds nothing new
+        assert_eq!(window(&grouped, 7), (9, 7));
     }
 
     #[test]

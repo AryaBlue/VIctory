@@ -5534,6 +5534,16 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         batch.burst = crate::burst::begin(&mut batch.current);
+        // burst group: this submission's refreshes and those of the submissions waiting, per copy
+        let mut early: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            std::collections::HashMap::new();
+        if let Some((after, up_to)) = batch.burst.as_ref().and_then(|pass| pass.group()) {
+            for list in runs {
+                refreshes_into(list, &mut early);
+            }
+            crate::queue::held_runs(after, up_to, |list| refreshes_into(list, &mut early));
+            early.retain(|_, (shadow, from, to)| !batch.covered(shadow, *from, *to - *from));
+        }
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -5555,6 +5565,12 @@ impl Host {
                     }
                 }
             }
+            for (&key, (shadow, from, to)) in &early {
+                if !shadow.unwatched() {
+                    let span = spans.entry(key).or_insert((*from, *to));
+                    *span = (span.0.min(*from), span.1.max(*to));
+                }
+            }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
@@ -5571,6 +5587,15 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+        }
+        if !early.is_empty() {
+            if let Some(pass) = &batch.burst {
+                pass.grouped(early.len());
+            }
+            for (shadow, from, to) in early.into_values() {
+                batch.add(&shadow, from, to - from);
+            }
+            batch.flush();
         }
         for list in runs {
             list.run_deferred(&mut batch);
@@ -6956,8 +6981,11 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let exact = step_timers();
+        let mut nth = 0u32;
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            // every step with the switch; else one copy in STEP_SAMPLE, counted for all of them
+            let mut started = exact.then(std::time::Instant::now);
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -6966,6 +6994,10 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_wrote(dst, len);
+                    nth += 1;
+                    if !exact && nth % STEP_SAMPLE == 1 {
+                        started = Some(std::time::Instant::now());
+                    }
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -6979,6 +7011,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
+                    }
+                    nth += 1;
+                    if !exact && nth % STEP_SAMPLE == 1 {
+                        started = Some(std::time::Instant::now());
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -7005,7 +7041,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, started.map_or(0, |s| s.elapsed().as_micros() as u64));
                     }
                     continue;
                 }
@@ -7017,12 +7053,12 @@ impl HostList {
                     // askings a frame).
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
+                    let snapshot = exact.then(std::time::Instant::now);
                     shadow.writing(*address, *len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        add(C::SnapshotUs, snapshot.map_or(0, |s| s.elapsed().as_micros() as u64));
                     }
                     continue;
                 }
@@ -7033,11 +7069,37 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
+            if let Some(started) = started {
+                let us = started.elapsed().as_micros() as u64;
+                preparing(0, if exact { us } else { us * u64::from(STEP_SAMPLE) });
+            }
             preparing(1, copied as u64);
         }
     }
 }
+
+// burst group: per copy (by address), the span of the refreshes `list` asks for
+fn refreshes_into(
+    list: &HostList,
+    spans: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) {
+    for step in &list.deferred().copies {
+        if let Step::Refresh(shadow, address, len) = step {
+            let span = spans
+                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .or_insert_with(|| (shadow.clone(), *address, *address + *len));
+            (span.1, span.2) = (span.1.min(*address), span.2.max(*address + *len));
+        }
+    }
+}
+
+// every deferred step is timed, as before (VICTORY_STEP_TIMERS=1); else one title copy or fill in STEP_SAMPLE
+fn step_timers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STEP_TIMERS").is_some_and(|v| v == "1"))
+}
+
+const STEP_SAMPLE: u32 = 16;
 
 /// Whether a submission's refreshes of host copies run on several threads,
 /// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).

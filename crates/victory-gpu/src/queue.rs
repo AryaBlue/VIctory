@@ -512,6 +512,60 @@ pub(crate) fn before_sync() {
     }
 }
 
+// burst group: the host lists of the submissions waiting in a line, stamped in (after, up_to]
+#[cfg(windows)]
+pub(crate) fn held_runs(after: u64, up_to: u64, mut each: impl FnMut(&crate::host::HostList)) {
+    let mut look = |held: &[Held]| {
+        for h in held {
+            if let Held::Run(lists, order, stamp) = h
+                && *stamp > after
+                && *stamp <= up_to
+            {
+                for &i in order {
+                    each(lists[i].host());
+                }
+            }
+        }
+    };
+    let own = OWN_LINE.get();
+    if !own.is_null() {
+        // SAFETY: this thread holds that line's lock and leaves it alone until `Own` is dropped.
+        look(unsafe { &*own });
+    }
+    let queues = lock(&WAITING).clone();
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        // a line locked now is being run or added to: its submissions are prepared the usual way
+        let Ok(held) = line.try_lock() else {
+            continue;
+        };
+        look(&held);
+    }
+}
+
+// burst group: the line this thread keeps locked while it prepares a submission taken from it
+#[cfg(windows)]
+thread_local! {
+    static OWN_LINE: std::cell::Cell<*const Vec<Held>> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+#[cfg(windows)]
+struct Own;
+
+#[cfg(windows)]
+impl Drop for Own {
+    fn drop(&mut self) {
+        OWN_LINE.set(std::ptr::null());
+    }
+}
+
+#[cfg(windows)]
+fn own_line(held: &Vec<Held>) -> Own {
+    OWN_LINE.set(held);
+    Own
+}
+
 /// Whether any queue's line holds something.
 #[cfg(windows)]
 pub(crate) fn holds_any() -> bool {
@@ -652,6 +706,7 @@ fn release_held_now(all: bool) {
                                     held.remove(0);
                                 }
                             } else {
+                                let _own = own_line(&held);
                                 host.execute_late(lists, order);
                             }
                         } else {
