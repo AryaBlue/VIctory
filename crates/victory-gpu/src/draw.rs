@@ -777,6 +777,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// others recorded into the host list (`crate::external`): heaps, roots and pipeline are set again
+    pub(crate) fn host_state_lost(&mut self) {
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
