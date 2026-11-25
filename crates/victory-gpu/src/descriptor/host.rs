@@ -1336,8 +1336,19 @@ impl HostHeap {
         // texture is held by no slot, may have been let go, and would be
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
+        // published made (VICTORY_MADE_FAST): no need of the lock to say so
+        let published = self
+            .ready
+            .get(index as usize)
+            .is_some_and(|r| r.load(std::sync::atomic::Ordering::Acquire) == key);
+        let made = || {
+            self.made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index as usize)
+                .is_some_and(|&made| made != 0 && made == key)
+        };
+        (published || made())
             && self
                 .kept
                 .lock()
@@ -1434,7 +1445,7 @@ impl HostHeap {
                 continue;
             };
             // made again: draws wait for it under the lock
-            self.unready(slot);
+            self.unready(slot, WITHDRAWN_REMAKE);
             if let Some(kept) = make(&view, self.cpu(slot)) {
                 self.keep(slot, kept);
                 remade += 1;
@@ -1460,7 +1471,7 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
-        self.unready(index);
+        self.unready(index, WITHDRAWN_UNMAKE);
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
@@ -2000,6 +2011,7 @@ impl HostHeap {
             return None;
         }
         if let Some(view) = self.mirror_ready(index, handle) {
+            made_count(FAST_HIT);
             return Some(view);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2023,21 +2035,29 @@ impl HostHeap {
             .get(index as usize)?
             .load(std::sync::atomic::Ordering::Acquire);
         if ready == 0 {
+            made_count(FAST_UNPUBLISHED);
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         if tag != VIEW_TAG || ready != u64::from(generation) << 32 | u64::from(i) {
+            made_count(FAST_OTHER_VIEW);
             return None;
         }
-        view_at(i, generation)
+        let view = view_at(i, generation);
+        if view.is_none() {
+            made_count(FAST_GONE);
+        }
+        view
     }
 
-    /// Slot `index`'s made key is about to change: draws ask under the
-    /// lock again.
-    fn unready(&self, index: u32) {
-        if let Some(ready) = self.ready.get(index as usize) {
-            ready.store(0, std::sync::atomic::Ordering::Release);
+    /// Slot `index`'s made key is about to change (`why`, one of the
+    /// `WITHDRAWN_*` counts): draws ask under the lock again.
+    fn unready(&self, index: u32, why: usize) {
+        if let Some(ready) = self.ready.get(index as usize)
+            && ready.swap(0, std::sync::atomic::Ordering::AcqRel) != 0
+        {
+            made_count(why);
         }
     }
 
@@ -2053,7 +2073,7 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
-                self.unready(index);
+                self.unready(index, WITHDRAWN_NOT_A_VIEW);
                 made[index as usize] = 0;
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
@@ -2064,7 +2084,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            self.unready(index);
+            self.unready(index, if for_draw { WITHDRAWN_KEY_DRAW } else { WITHDRAWN_KEY });
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2114,7 +2134,7 @@ impl HostHeap {
     // the slot's host descriptor is made again at the next mirror (its copy left the tables)
     pub(crate) fn forget_made(&self, index: u32) {
         if let Some(key) = self.made.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
-            self.unready(index);
+            self.unready(index, WITHDRAWN_FORGET);
             *key = 0;
         }
     }
@@ -2371,6 +2391,55 @@ fn sync_batch() -> bool {
 /// its host descriptor is written, under the lock, and withdrawn before
 /// anything changes the slot; a draw that finds it current takes the view
 /// as `mirror` would have given it back.
+/// With [`made_fast`], since the last frame line: draws' mirrors answered
+/// without the lock (hit); sent to the lock because the slot's key was not
+/// published, the handle shows another view, or the view is gone; and
+/// published keys withdrawn, by cause (the key changed under a mirror for
+/// a draw, or one of the heap's passes; the record is no view; unmade;
+/// forgotten; made again by levels on demand).
+static MADE_FAST_COUNTS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+const FAST_HIT: usize = 0;
+const FAST_UNPUBLISHED: usize = 1;
+const FAST_OTHER_VIEW: usize = 2;
+const FAST_GONE: usize = 3;
+const WITHDRAWN_KEY_DRAW: usize = 4;
+const WITHDRAWN_KEY: usize = 5;
+const WITHDRAWN_NOT_A_VIEW: usize = 6;
+const WITHDRAWN_UNMAKE: usize = 7;
+const WITHDRAWN_FORGET: usize = 8;
+const WITHDRAWN_REMAKE: usize = 9;
+
+fn made_count(i: usize) {
+    MADE_FAST_COUNTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// With the frame line: [`MADE_FAST_COUNTS`] per frame over `frames`.
+pub(crate) fn made_fast_line(frames: f64) {
+    if !made_fast() {
+        return;
+    }
+    let n = MADE_FAST_COUNTS
+        .each_ref()
+        .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "made keys without the lock (VICTORY_MADE_FAST) per frame: {:.0} hits; to the lock {:.0} (not published {:.0}, \
+         another view at the handle {:.0}, view gone {:.0}); withdrawn: key changed under a draw {:.0}, under a heap \
+         pass {:.0}, no view {:.0}, unmade {:.0}, forgotten {:.0}, made again {:.0}",
+        n[0],
+        n[1] + n[2] + n[3],
+        n[1],
+        n[2],
+        n[3],
+        n[4],
+        n[5],
+        n[6],
+        n[7],
+        n[8],
+        n[9]
+    );
+}
+
 fn made_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MADE_FAST").is_some_and(|v| v == "1"))
@@ -3634,9 +3703,13 @@ mod tests {
         };
         assert!(heap.mirror_ready(2, handle).is_none());
         publish(2);
-        assert!(heap.mirror_ready(2, handle).is_some());
+        let count = |i: usize| MADE_FAST_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed);
+        let (hits, forgotten) = (count(FAST_HIT), count(WITHDRAWN_FORGET));
+        assert!(heap.mirror(2, handle, true).is_some());
+        assert!(count(FAST_HIT) > hits, "a draw's mirror took the fast path");
         assert!(heap.mirror_ready(3, handle).is_none());
         heap.forget_made(2);
+        assert!(count(WITHDRAWN_FORGET) > forgotten);
         assert!(heap.mirror_ready(2, handle).is_none());
         publish(3);
         assert!(heap.texture_slot_gone(3));
