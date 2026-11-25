@@ -494,7 +494,7 @@ pub(crate) struct State {
     pass_pso: usize,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: crate::fasthash::Map<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -3330,7 +3330,7 @@ impl State {
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let mut h = crate::fasthash::Fold::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.

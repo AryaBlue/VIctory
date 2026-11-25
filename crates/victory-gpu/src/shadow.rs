@@ -3279,6 +3279,27 @@ impl Shadow {
         true
     }
 
+    // burst check: the bytes of the range where the copy's CPU side is not title memory now (None: not to be compared)
+    pub(crate) fn differs(&self, address: usize, len: usize) -> Option<usize> {
+        // a long range is not read twice a skip
+        const MOST: usize = 256 << 10;
+        if self.place.is_some() || self.data.is_null() || len > MOST {
+            return None;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return Some(0);
+        }
+        let mut title = vec![0u8; to - from];
+        if !crate::host::read_into(from as *const u8, &mut title) {
+            return None;
+        }
+        // SAFETY: inside the copy's mapping; read only.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), to - from) };
+        Some(title.iter().zip(held).filter(|(a, b)| a != b).count())
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.

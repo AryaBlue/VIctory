@@ -93,7 +93,30 @@ pub(crate) fn now_ms() -> u64 {
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let frame = crate::frame::current();
+    if !moment_frame() {
+        return (frame << 32) | ((now_ms() / 100) & 0xffff_ffff);
+    }
+    // the clock is read once a frame, and at every 256th asking of a thread (a frame may last long)
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    thread_local! {
+        static ASKED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+    let asked = ASKED.get().wrapping_add(1);
+    ASKED.set(asked);
+    let last = LAST.load(Ordering::Relaxed);
+    if last >> 32 == frame && asked != 0 {
+        return last;
+    }
+    let now = (frame << 32) | ((now_ms() / 100) & 0xffff_ffff);
+    LAST.store(now, Ordering::Relaxed);
+    now
+}
+
+// moment reads the clock once a frame, not at every call (VICTORY_MOMENT_FRAME=1)
+fn moment_frame() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MOMENT_FRAME").is_some_and(|v| v == "1"))
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -2095,7 +2118,7 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fasthash::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -3194,7 +3217,7 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList], done: &dyn Fn(&std::sync::Arc<crate::shadow::Shadow>, usize, usize) -> bool) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3203,6 +3226,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
+                && !done(shadow, *address, *len)
             {
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
                     Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
@@ -3860,6 +3884,8 @@ fn read_backs(list: &HostList) {
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
+                // title memory written by us: burst refresh's ranges over it end
+                crate::burst::wrote(*at, rows.saturating_sub(1) * pitch + row);
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
                 if walls_trace() && *rows == 1 && *row <= 96 {
@@ -5728,13 +5754,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, &|shadow, address, len| crate::burst::merge_once() && batch.covered(shadow, address, len)) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -7709,7 +7735,7 @@ impl Batch {
         from: usize,
         to: usize,
     ) {
-        if !(refresh_once() || crate::burst::on()) || from >= to {
+        if !(refresh_once() || crate::burst::active()) || from >= to {
             return;
         }
         let entry = current
