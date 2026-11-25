@@ -23,6 +23,8 @@ mod card_mask;
 mod present_later;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(feature = "diagnostics")]
+mod cullpass;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
