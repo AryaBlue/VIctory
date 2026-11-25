@@ -586,6 +586,37 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// time cap of one picked-texture pass on the recording thread
+fn pass_span(set: Option<u64>, worker: bool, backlog: bool) -> std::time::Duration {
+    let ms = match (set, worker, backlog) {
+        (Some(ms), _, true) => ms * 3,
+        (Some(ms), _, false) => ms,
+        // with the worker the short cap is for a scene in play; a backlog gets the old plain cap,
+        // 60 ms left it 18% fewer uploads behind at the same 4 fps (fast-5 vs vf-all-3)
+        (None, true, true) => 250,
+        (None, true, false) => 20,
+        (None, false, true) => 750,
+        (None, false, false) => 250,
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod pass_span_tests {
+    use super::pass_span;
+    use std::time::Duration;
+
+    #[test]
+    fn a_backlog_with_the_worker_gets_the_old_plain_cap() {
+        assert_eq!(pass_span(None, true, true), Duration::from_millis(250));
+        assert_eq!(pass_span(None, true, false), Duration::from_millis(20));
+        assert_eq!(pass_span(None, false, true), Duration::from_millis(750));
+        assert_eq!(pass_span(None, false, false), Duration::from_millis(250));
+        assert_eq!(pass_span(Some(40), true, true), Duration::from_millis(120));
+        assert_eq!(pass_span(Some(40), false, false), Duration::from_millis(40));
+    }
+}
+
 /// picked-texture passes since the frame line: count, loop us, slots, ends (time, bytes, ran out), us in rechecks, mapped asks, views, uploads
 pub(crate) static HEAP_TEXTURE_PASSES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
@@ -2005,17 +2036,16 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            let worker = crate::texture_worker::on();
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if worker { 20 } else { 250 })
-        }));
+        static SPAN_MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let set = *SPAN_MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let backlog = catchup && due.len() >= 1024;
+        let span = pass_span(set, crate::texture_worker::on(), backlog);
+        let per_frame = if backlog { per_frame * 3 } else { per_frame };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
