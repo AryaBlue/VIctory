@@ -124,6 +124,7 @@ mod guard_log;
 pub mod switch;
 #[cfg(windows)]
 pub mod placement;
+mod guard_free;
 
 #[cfg(windows)]
 pub use host::on_failure;
