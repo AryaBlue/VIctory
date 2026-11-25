@@ -2119,6 +2119,12 @@ impl HostHeap {
         }
     }
 
+    // the made key of slot `index` (tests)
+    #[cfg(test)]
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0)
+    }
+
     /// Whether slot `index` is backed by a made host descriptor (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
