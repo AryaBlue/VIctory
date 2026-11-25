@@ -549,7 +549,7 @@ fn known_view(start: usize) -> bool {
     }
     let g = guards();
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first)
+    g.protected.contains(&first) || g.absent.contains(&first) || (seen_views() && g.views.contains(&first))
 }
 
 struct Guards {
