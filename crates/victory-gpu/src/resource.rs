@@ -2027,6 +2027,15 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+// host copy and twin from one look (VICTORY_READABLE_LEAN), made if need be, as host_resource does
+#[cfg(windows)]
+pub(crate) fn hosted_use(this: This) -> Option<(std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>)> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, true)
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {

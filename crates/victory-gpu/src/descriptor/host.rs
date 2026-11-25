@@ -528,6 +528,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
+    crate::wsmemo::remapped(at, len);
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;

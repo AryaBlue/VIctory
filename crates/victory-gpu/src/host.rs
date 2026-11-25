@@ -883,6 +883,9 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    // lean marks (crate::lean): renewed when the refresh set or the state table loses what it held
+    refresh_mark: std::sync::atomic::AtomicU64,
+    states_mark: std::sync::atomic::AtomicU64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -4107,6 +4110,8 @@ impl Host {
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
+                refresh_mark: std::sync::atomic::AtomicU64::new(lean_mark()),
+                states_mark: std::sync::atomic::AtomicU64::new(lean_mark()),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -6368,6 +6373,8 @@ impl HostList {
             *deferred = Deferred::default();
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.refresh_mark.store(lean_mark(), Ordering::Relaxed);
+        self.states_mark.store(lean_mark(), Ordering::Relaxed);
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -6466,10 +6473,15 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
+        self.transition_copy(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// [`HostList::transition`] with the host copy known and `wanted` legal for it.
+    pub(crate) fn transition_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -6478,9 +6490,19 @@ impl HostList {
                 if before != wanted {
                     crate::copystat::add(crate::copystat::C::Transitions, 1);
                 }
-                (before != wanted).then_some((texture, before))
+                if before == wanted {
+                    return None;
+                }
+                Some(before)
             }
-        }
+        };
+        self.states_mark.store(lean_mark(), Ordering::Relaxed);
+        before
+    }
+
+    /// The list's state mark (`crate::lean`): 0 when off.
+    pub(crate) fn states_mark(&self) -> u64 {
+        self.states_mark.load(Ordering::Relaxed)
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -6493,10 +6515,14 @@ impl HostList {
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy.clone()));
+                self.states_mark.store(lean_mark(), Ordering::Relaxed);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.states_mark.store(lean_mark(), Ordering::Relaxed);
+                }
                 (before != wanted).then_some(before)
             }
         };
@@ -7023,6 +7049,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        self.refresh_mark.store(lean_mark(), Ordering::Relaxed);
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7042,12 +7069,19 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let mark = self.refresh_mark.load(Ordering::Relaxed);
+        if crate::lean::refreshed(mark, key) {
+            return;
+        }
+        let mut deferred = self.deferred();
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+        if mark != 0 {
+            crate::lean::note_refreshed(mark, key);
         }
     }
 
@@ -7400,6 +7434,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
+        self.refresh_mark.store(lean_mark(), Ordering::Relaxed);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -8929,6 +8964,11 @@ fn title_window() -> Option<HWND> {
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
     found
+}
+
+// a fresh lean mark, or 0 (never matches) with VICTORY_READABLE_LEAN off
+fn lean_mark() -> u64 {
+    if crate::lean::on() { crate::lean::fresh() } else { 0 }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console

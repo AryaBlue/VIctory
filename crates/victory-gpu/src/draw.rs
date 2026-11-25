@@ -2474,7 +2474,7 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let mapped = pass_timed(7, || crate::texture::mapped_bytes(address as *const u8, len as usize));
+                let mapped = pass_timed(7, || crate::wsmemo::mapped_bytes(address as *const u8, len as usize, frame));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // kept: a remap over its pages reads as unmapped for a moment
@@ -4285,14 +4285,28 @@ fn readable_with(
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
-                crate::texture::upload(list, *resource as This, t);
+            // lean: one look at the host copy for the whole read
+            let made = crate::lean::on().then(|| crate::resource::hosted_use(*resource as This));
+            if let Some(made) = &made {
+                if !aliased
+                    && let Some((copy, _)) = made
+                    && crate::texture::title_written(&copy.texture)
+                {
+                    crate::texture::upload(list, *resource as This, &copy.texture);
+                }
+                if made.as_ref().is_some_and(|m| m.1.is_some()) {
+                    list.twin_use(*resource as This, false, false);
+                }
+            } else {
+                if !aliased
+                    && let Some(t) = crate::resource::host_resource(*resource as This)
+                    && crate::texture::title_written(t)
+                {
+                    crate::texture::upload(list, *resource as This, t);
+                }
+                // A depth texture shaders also write: what they wrote, first.
+                list.twin_use(*resource as This, false, false);
             }
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -4302,7 +4316,11 @@ fn readable_with(
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            match &made {
+                Some(Some((copy, _))) => crate::lean::ensure(list, copy, state),
+                Some(None) => {}
+                None => crate::list::ensure_state(list, *resource as This, state),
+            }
             // only when its line is wanted: GetDesc per read was ~2 ms a frame in diag profiles
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
@@ -4323,8 +4341,15 @@ fn readable_with(
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
-            if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            let made = crate::lean::on().then(|| crate::resource::hosted_use(*resource as This));
+            match made {
+                Some(Some((copy, None))) => crate::lean::ensure(list, &copy, UNORDERED_ACCESS),
+                Some(None) => {}
+                _ => {
+                    if !list.twin_use(*resource as This, true, true) {
+                        crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                    }
+                }
             }
         }
         _ => {}
