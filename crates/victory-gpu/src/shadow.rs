@@ -2647,6 +2647,16 @@ impl Shadow {
         }
     }
 
+    // the snapshot's lock (a card copy's cpu side), for crate::land
+    pub(crate) fn side_lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.before.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // the title address the copy starts at
+    pub(crate) fn title_start(&self) -> usize {
+        self.start as usize
+    }
+
     /// [`relay`]: the declared range `[address, address + len)` of a copy
     /// in the PC's memory is about to be looked through
     /// (`crate::shadow::find_all`) by the thread that settles: counted as
@@ -2669,14 +2679,21 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
-        let start = self.start as usize;
-        if self.card.is_some() || n == 0 || at + n > self.len as usize {
-            return 0;
-        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
+        // SAFETY: the snapshot, under its lock held here.
+        unsafe { self.relay_merge_held(at, n, before.as_mut_ptr(), now, title) }
+    }
+
+    /// # Safety
+    /// relay_merge with the snapshot's lock held by the caller; `before` is the snapshot (the copy's length).
+    pub(crate) unsafe fn relay_merge_held(&self, at: usize, n: usize, before: *mut u8, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        let start = self.start as usize;
+        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+            return 0;
+        }
         now.clear();
         now.reserve(n);
         // SAFETY: inside the copy's mapping (checked above), read into
@@ -2690,7 +2707,7 @@ impl Shadow {
         // (`writing`), and these offsets are in a range declared and not
         // done with, whose bytes it holds; nothing else touches them
         // without the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
+        let held = unsafe { std::slice::from_raw_parts_mut(before.add(at), n) };
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
@@ -3560,6 +3577,12 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.card_merge_relay_held(at, gpu, fetched_after, title)
+    }
+
+    // card_merge_relay with the cpu side's lock held by the caller (crate::land)
+    pub(crate) fn card_merge_relay_held(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -3567,7 +3590,6 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -4470,7 +4492,7 @@ mod promote_tests {
 }
 
 #[cfg(test)]
-mod card_merge_tests {
+pub(crate) mod card_merge_tests {
     use super::{Card, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -4508,6 +4530,22 @@ mod card_merge_tests {
                 .ok()?;
             buffer
         }
+    }
+
+    // a copy over title memory `start` for `crate::land`'s tests: in the card's memory with `sent` notes, else with `snapshot`
+    pub(crate) fn test_copy(side: *mut u8, start: u64, len: u64, sent: Option<Vec<(usize, usize, u64)>>, snapshot: Option<Vec<u8>>) -> Option<std::sync::Arc<Shadow>> {
+        let (buffer, staging) = (warp_buffer()?, warp_buffer()?);
+        let mut shadow = Shadow::new(buffer, side, 0, start, len);
+        shadow.card = sent.map(|sent| Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::new(sent),
+            masked: Mutex::default(),
+            size: 0,
+        });
+        *shadow.before.lock().unwrap() = snapshot;
+        Some(std::sync::Arc::new(shadow))
     }
 
     /// The mixed landing the fetch inside flights must survive, on a real
