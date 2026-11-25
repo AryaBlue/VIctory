@@ -232,6 +232,25 @@ fn keep_windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_KEEP").is_some_and(|v| v == "1"))
 }
 
+/// The text of a pass's targets: each colour target's and the depth
+/// target's size and host format.
+fn targets_text(handles: &[u64], depth: u64) -> String {
+    let describe = |r: Option<&ID3D12Resource>| {
+        r.map_or("-".to_owned(), |t| {
+            // SAFETY: a live texture.
+            let d = unsafe { t.GetDesc() };
+            format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+        })
+    };
+    let colour: Vec<String> = handles
+        .iter()
+        .filter_map(|&h| crate::descriptor::rtv_record(h))
+        .map(|r| describe(crate::resource::host_resource(r.resource)))
+        .collect();
+    let depth = crate::descriptor::dsv_record(depth).map(|r| describe(crate::resource::host_resource(r.resource)));
+    format!("[{}] depth {}", colour.join(", "), depth.unwrap_or_else(|| "-".to_owned()))
+}
+
 /// Whether a direct draw ends the window: always without the switch, else
 /// when its shaders may store (or its pipeline is not known).
 fn draw_ends_window(keep: bool, stores: Option<bool>) -> bool {
@@ -299,6 +318,13 @@ pub(crate) struct State {
     root_args: std::collections::HashMap<(bool, u32), Vec<u32>>,
     /// The pipeline our last clamp replaced (its compute pipeline).
     pso_lost: usize,
+    /// With `crate::cardmeter::passes`: the targets set since the pass
+    /// began (a new pass at the next draw), their text, the kind of the
+    /// pass (0 none, 1 draws, 2 dispatches) and its key.
+    pass_targets: Option<String>,
+    pass_kind: u8,
+    pass_id: u32,
+    pass_pso: usize,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -884,6 +910,9 @@ impl State {
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
+        if crate::cardmeter::passes() {
+            self.pass_targets = Some(targets_text(handles, depth));
+        }
         self.targets_set = true;
         self.targets.clear();
         let mut rtvs = Vec::new();
@@ -994,6 +1023,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.pass_kind = 0;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1230,8 +1260,41 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
+    /// With `crate::cardmeter::passes`: a pass begins where the targets
+    /// changed or the list goes from draws to dispatches or back; keyed by
+    /// targets and the pass's first pipeline.
+    fn pass_mark(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        if !crate::cardmeter::passes() {
+            return;
+        }
+        let kind = if compute { 2 } else { 1 };
+        let targets = if compute { None } else { self.pass_targets.take() };
+        // dispatches are timed pipeline by pipeline
+        let pso = p.pso.as_raw() as usize;
+        if self.pass_kind == kind && targets.is_none() && (!compute || self.pass_pso == pso) {
+            return;
+        }
+        self.pass_pso = pso;
+        let key = if compute {
+            format!("dispatches | {}", p.name)
+        } else {
+            let t = match targets {
+                Some(t) => t,
+                None => targets_text(&self.target_handles, self.depth_handle),
+            };
+            format!("draws {t} | {}", p.name)
+        };
+        self.pass_kind = kind;
+        self.pass_id = crate::cardmeter::pass_key(key);
+        list.pass_begin(self.pass_id);
+    }
+
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        self.pass_mark(list, p, compute);
+        if crate::cardmeter::passes() {
+            crate::cardmeter::pass_count(self.pass_id, usize::from(compute));
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         #[cfg(feature = "diagnostics")]
@@ -3433,6 +3496,11 @@ impl State {
                     },
                     1,
                 );
+                // the clamp belongs to the pass of the draw it serves
+                self.pass_mark(list, p, kind == DISPATCH);
+                if crate::cardmeter::passes() {
+                    crate::cardmeter::pass_count(self.pass_id, 2);
+                }
                 let ahead = windowed && records > 1;
                 let bounded = if many {
                     crate::indirect::bound_in_ring(list, (&args.buffer, offset), count_arg, (kind, step, records), ahead)

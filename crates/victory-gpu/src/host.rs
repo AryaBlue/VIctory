@@ -846,6 +846,9 @@ pub(crate) struct HostList {
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
+    /// With `crate::cardmeter::passes`: the pair timing the pass being
+    /// recorded, or none.
+    pass_span: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -3904,6 +3907,7 @@ impl Host {
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
+                pass_span: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6053,6 +6057,7 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
+        self.pass_end();
         crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)));
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -6101,10 +6106,25 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.pass_span.store(u32::MAX, Ordering::Relaxed);
         self.meter
             .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// A pass of key `key` begins here (`crate::cardmeter::passes`): the
+    /// pass before it ends.
+    pub(crate) fn pass_begin(&self, key: u32) {
+        self.pass_end();
+        let span = crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Pass(key));
+        self.pass_span.store(span.raw(), Ordering::Relaxed);
+    }
+
+    /// The pass being recorded ends here.
+    pub(crate) fn pass_end(&self) {
+        let span = self.pass_span.swap(u32::MAX, Ordering::Relaxed);
+        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(span));
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
