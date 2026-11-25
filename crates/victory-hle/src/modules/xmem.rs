@@ -347,7 +347,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE, bool);
+// handle, committed, next slot handed to a page bound late (VICTORY_POOL_LAZY)
+struct Section(HANDLE, bool, std::sync::atomic::AtomicUsize);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -388,6 +389,28 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    // pages given out but never mapped or written (VICTORY_POOL_LAZY): no slot yet
+    unbound: HashMap<usize, Arc<Section>>,
+}
+
+// VICTORY_POOL_LAZY=1: a physical page gets its slot of the section when first mapped or written, so pages
+// mapped together in address order sit together in the section and one placed buffer shows them (VICTORY_INPLACE=3)
+fn pool_lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_LAZY").is_some_and(|v| v == "1"))
+}
+
+// gives unbound pages slots, in the order given: consecutive pages of one section get consecutive slots
+fn bind(physical: &mut Physical, pages: &[usize]) {
+    if physical.unbound.is_empty() {
+        return;
+    }
+    for page in pages {
+        if let Some(section) = physical.unbound.remove(page) {
+            let index = section.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            physical.pages.insert(*page, Slice { section, index });
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -468,10 +491,20 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, committed);
-    let section = Arc::new(Section(handle, committed));
+    let section = Arc::new(Section(handle, committed, std::sync::atomic::AtomicUsize::new(0)));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
+    if pool_lazy() {
+        // slots are handed out when a page is first mapped or written, in that order
+        for index in 0..n {
+            let number = first + index * FRAMES;
+            physical.unbound.insert(number, section.clone());
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(index).write(number) };
+        }
+        return 1;
+    }
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -498,7 +531,9 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let page = unsafe { *pages.add(i) };
+        physical.pages.remove(&page);
+        physical.unbound.remove(&page);
     }
     1
 }
@@ -556,7 +591,8 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let mut physical = physical();
+    bind(&mut physical, pages);
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -705,6 +741,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    bind(&mut physical, pages);
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -1388,6 +1425,33 @@ mod tests {
         assert_eq!(lengths(&a, usize::MAX, 2), None);
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    // pages bound late take slots in the order first used: the title's own order becomes one run
+    #[test]
+    fn late_bound_pages_follow_the_order_they_are_first_used() {
+        let a = allocate(4);
+        {
+            let mut physical = physical();
+            for page in &a {
+                let slice = physical.pages.remove(page).expect("bound");
+                physical.unbound.insert(*page, slice.section);
+            }
+        }
+        let lengths = |pages: &[usize]| runs(pages, 0, pages.len() * PAGE).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>());
+        let order = [a[2], a[0], a[3], a[1]];
+        assert_eq!(lengths(&order), Some(vec![4]), "first use in this order: one run");
+        assert_eq!(lengths(&a), Some(vec![1, 1, 1, 1]), "bound now: allocation order is scattered");
+        assert!(physical().unbound.is_empty());
+        let b = allocate(2);
+        {
+            let mut physical = physical();
+            let slice = physical.pages.remove(&b[1]).expect("bound");
+            physical.unbound.insert(b[1], slice.section);
+        }
+        assert_eq!(XMemFreePhysicalPages(4, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(2, b.as_ptr()), 1);
+        assert!(!physical().unbound.contains_key(&b[1]), "freed while unbound");
     }
 
     #[test]
