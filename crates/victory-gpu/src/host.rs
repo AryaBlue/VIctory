@@ -7384,13 +7384,19 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if crate::safecopy::on() {
-        return crate::safecopy::copy(dst, src, len);
-    }
-    let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    // readback trace: no guards under our own copy
+    let held = crate::readtrace::hold(src as usize, len);
+    crate::readtrace::hold(dst as usize, len);
+    let ok = if crate::safecopy::on() {
+        crate::safecopy::copy(dst, src, len)
+    } else {
+        let mut done = 0;
+        // SAFETY: the destination is mapped writable memory of `len` bytes; the
+        // kernel checks the source.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    };
+    crate::readtrace::rearm(held);
+    ok
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -7439,7 +7445,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
+    crate::readtrace::hold(dst as usize, len);
     if len == 0 || write(dst as usize, len) {
+        crate::readtrace::arm(dst as usize, len);
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -7449,6 +7457,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
+    crate::readtrace::arm(dst as usize, len);
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of

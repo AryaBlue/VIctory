@@ -70,6 +70,84 @@ fn ffx_force(scale: f32) -> [Patch; 2] {
     ]
 }
 
+// VICTORY_SHADOW_CASCADES=1..3: the per-frame clamp of the sun's cascade
+// count (+0x97dc50, `min(count, 4)` into +0x84ddbe0) clamps lower, so the far
+// cascades and their draws go
+const CASCADES_RVA: usize = 0x97dc50;
+const CASCADES_OLD: [u8; 8] = [0xb9, 0x04, 0x00, 0x00, 0x00, 0x83, 0xf8, 0x04];
+
+fn cascades(n: u8) -> Option<Patch> {
+    (1..=3).contains(&n).then(|| Patch {
+        module: None,
+        rva: CASCADES_RVA,
+        expect: Some(CASCADES_OLD.to_vec()),
+        bytes: vec![0xb9, n, 0x00, 0x00, 0x00, 0x83, 0xf8, n],
+    })
+}
+
+// constants the switches below point code at: .rdata's zero tail past its
+// virtual size (+0x67e1c0c), still inside the mapped page
+const SLACK_RVA: usize = 0x67e1c10;
+// [cascade scale x1, x0.001] for the lea, then 170 x scale, then the lod scale
+const SLACK_CASCADE: usize = SLACK_RVA;
+const SLACK_FAR: usize = SLACK_RVA + 8;
+const SLACK_LOD: usize = SLACK_RVA + 12;
+
+// a rip-relative operand's disp32 repointed at `target`; `at` is the
+// instruction, `end` its length
+fn repoint(at: usize, old: &[u8], end: usize, target: usize) -> Patch {
+    let disp = (target as i64 - (at + end) as i64) as i32;
+    let mut bytes = old.to_vec();
+    bytes[end - 4..end].copy_from_slice(&disp.to_le_bytes());
+    Patch { module: None, rva: at, expect: Some(old.to_vec()), bytes }
+}
+
+fn constant(at: usize, values: &[f32]) -> Patch {
+    Patch {
+        module: None,
+        rva: at,
+        expect: Some(vec![0; 4 * values.len()]),
+        bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }
+}
+
+fn scale_var(name: &str, low: f32) -> Option<f32> {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite())
+        .map(|s| s.clamp(low, 1.0))
+}
+
+// VICTORY_SHADOW_DIST=0.25..1: the sun's cascade split distances (+0x97dc94
+// picks 1 or 0.001 from +0x616be30 by a flag, times the four splits) and the
+// last split's 170 m cap (+0x97dfb3) are scaled: smaller cascades, fewer
+// casters in each
+const SHADOW_DIST_LEA_RVA: usize = 0x97dc7a;
+const SHADOW_DIST_LEA_OLD: [u8; 7] = [0x48, 0x8d, 0x0d, 0xaf, 0xe1, 0x7e, 0x05];
+const SHADOW_FAR_RVA: usize = 0x97dfb3;
+const SHADOW_FAR_OLD: [u8; 9] = [0xc4, 0xe2, 0x79, 0x18, 0x05, 0xc4, 0x38, 0x7e, 0x05];
+
+fn shadow_dist(s: f32) -> [Patch; 4] {
+    [
+        constant(SLACK_CASCADE, &[s, 0.001 * s]),
+        constant(SLACK_FAR, &[170.0 * s]),
+        repoint(SHADOW_DIST_LEA_RVA, &SHADOW_DIST_LEA_OLD, 7, SLACK_CASCADE),
+        repoint(SHADOW_FAR_RVA, &SHADOW_FAR_OLD, 9, SLACK_FAR),
+    ]
+}
+
+// VICTORY_LOD_SCALE=0.3..1: the lod scales' per-frame sum (+0x3e571f0, out
+// at +0xa15e100 and the per-level scales after it) starts from the global
+// override (+0xab4a20c, 1 unless debug sets it); it reads a constant instead,
+// so every lod switches nearer and far detail drops a level sooner
+const LOD_RVA: usize = 0x3e57472;
+const LOD_OLD: [u8; 8] = [0xc5, 0x7a, 0x10, 0x1d, 0x92, 0x2d, 0xcf, 0x06];
+
+fn lod_scale(s: f32) -> [Patch; 2] {
+    [constant(SLACK_LOD, &[s]), repoint(LOD_RVA, &LOD_OLD, 8, SLACK_LOD)]
+}
+
 fn hex(s: &str) -> Option<usize> {
     usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
 }
@@ -96,6 +174,15 @@ pub(crate) fn from_env() -> Vec<Patch> {
     }
     if on("VICTORY_FFX_FORCE") {
         patches.extend(ffx_force(ffx_scale()));
+    }
+    if let Some(s) = scale_var("VICTORY_SHADOW_DIST", 0.25) {
+        patches.extend(shadow_dist(s));
+    }
+    if let Some(s) = scale_var("VICTORY_LOD_SCALE", 0.3) {
+        patches.extend(lod_scale(s));
+    }
+    if let Some(p) = env::var("VICTORY_SHADOW_CASCADES").ok().and_then(|v| v.trim().parse().ok()).and_then(cascades) {
+        patches.push(p);
     }
     patches
 }
@@ -231,6 +318,88 @@ mod tests {
         assert_eq!(kind.bytes.len(), FFX_TYPE_OLD.len());
         assert_eq!(scale.bytes.len(), FFX_SCALE_OLD.len());
         assert_eq!(&scale.bytes[1..5], &0.5f32.to_bits().to_le_bytes());
+    }
+
+    #[test]
+    fn cascades_patch_lowers_both_clamp_immediates_only() {
+        let mut image = vec![0u8; CASCADES_RVA + 0x20];
+        image[CASCADES_RVA..CASCADES_RVA + 8].copy_from_slice(&CASCADES_OLD);
+        let p = cascades(2).unwrap();
+        assert_eq!(write_image(&mut image, &p), Ok(CASCADES_OLD.to_vec()));
+        assert_eq!(&image[CASCADES_RVA..CASCADES_RVA + 8], &[0xb9, 2, 0, 0, 0, 0x83, 0xf8, 2]);
+        assert!(cascades(0).is_none() && cascades(4).is_none());
+    }
+
+    // the shipped exe's bytes at an rva (VICTORY_TITLE_EXE or the usual copy), if it is there
+    fn title_bytes(rva: usize, n: usize) -> Option<Vec<u8>> {
+        let path = env::var("VICTORY_TITLE_EXE")
+            .unwrap_or_else(|_| r"F:\download\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe".into());
+        let mut f = std::fs::File::open(path).ok()?;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut head = vec![0u8; 0x1000];
+        f.read_exact(&mut head).ok()?;
+        let u16_at = |o: usize| u16::from_le_bytes([head[o], head[o + 1]]) as usize;
+        let u32_at = |o: usize| u32::from_le_bytes(head[o..o + 4].try_into().unwrap()) as usize;
+        let pe = u32_at(0x3c);
+        let sections = pe + 24 + u16_at(pe + 20);
+        let at = (0..u16_at(pe + 6)).map(|i| sections + 40 * i).find(|&s| {
+            let (va, raw) = (u32_at(s + 12), u32_at(s + 16));
+            (va..va + raw).contains(&rva)
+        })?;
+        f.seek(SeekFrom::Start((rva - u32_at(at + 12) + u32_at(at + 20)) as u64)).ok()?;
+        let mut out = vec![0u8; n];
+        f.read_exact(&mut out).ok()?;
+        Some(out)
+    }
+
+    #[test]
+    fn known_patches_match_the_shipped_exe() {
+        let Some(found) = title_bytes(CASCADES_RVA, 8) else {
+            eprintln!("title exe not found, skipped");
+            return;
+        };
+        assert_eq!(found, CASCADES_OLD);
+        assert_eq!(title_bytes(FFX_TYPE_RVA, 6).unwrap(), FFX_TYPE_OLD);
+        assert_eq!(title_bytes(SHADOW_DIST_LEA_RVA, 7).unwrap(), SHADOW_DIST_LEA_OLD);
+        assert_eq!(title_bytes(SHADOW_FAR_RVA, 9).unwrap(), SHADOW_FAR_OLD);
+        assert_eq!(title_bytes(LOD_RVA, 8).unwrap(), LOD_OLD);
+        assert_eq!(title_bytes(SLACK_RVA, 16).unwrap(), vec![0; 16]);
+        // the old operands' targets: the 1/0.001 pair, 170, the global lod scale
+        let target = |at: usize, end: usize, old: &[u8]| (at + end) as i64 + i32::from_le_bytes(old[end - 4..end].try_into().unwrap()) as i64;
+        assert_eq!(target(SHADOW_DIST_LEA_RVA, 7, &SHADOW_DIST_LEA_OLD), 0x616be30);
+        assert_eq!(title_bytes(0x616be30, 8).unwrap(), [1.0f32.to_le_bytes(), 0.001f32.to_le_bytes()].concat());
+        assert_eq!(title_bytes(target(SHADOW_FAR_RVA, 9, &SHADOW_FAR_OLD) as usize, 4).unwrap(), 170.0f32.to_le_bytes());
+        assert_eq!(target(LOD_RVA, 8, &LOD_OLD), 0xab4a20c);
+        assert_eq!(title_bytes(FFX_SCALE_RVA, FFX_SCALE_OLD.len()).unwrap(), FFX_SCALE_OLD);
+    }
+
+    #[test]
+    fn distance_patches_point_their_operands_at_the_new_constants() {
+        let p = shadow_dist(0.5);
+        assert_eq!(p[0].bytes, [0.5f32.to_le_bytes(), 0.0005f32.to_le_bytes()].concat());
+        assert_eq!(p[1].bytes, 85.0f32.to_le_bytes());
+        for (patch, end, target) in [(&p[2], 7, SLACK_CASCADE), (&p[3], 9, SLACK_FAR)] {
+            let disp = i32::from_le_bytes(patch.bytes[end - 4..end].try_into().unwrap());
+            assert_eq!(patch.rva as i64 + end as i64 + disp as i64, target as i64);
+            assert_eq!(patch.bytes[..end - 4], patch.expect.as_ref().unwrap()[..end - 4]);
+        }
+        let [value, load] = lod_scale(0.6);
+        assert_eq!(value.bytes, 0.6f32.to_le_bytes());
+        let disp = i32::from_le_bytes(load.bytes[4..8].try_into().unwrap());
+        assert_eq!(LOD_RVA as i64 + 8 + disp as i64, SLACK_LOD as i64);
+        assert_eq!(&load.bytes[..4], &LOD_OLD[..4]);
+        // constants only land on zeros
+        let mut image = vec![0u8; SLACK_RVA + 0x20];
+        image[SLACK_LOD] = 1;
+        assert!(write_image(&mut image, &value).is_err());
+    }
+
+    #[test]
+    fn cascades_patch_refuses_other_bytes() {
+        let mut image = vec![0x90u8; CASCADES_RVA + 0x20];
+        let before = image.clone();
+        assert!(write_image(&mut image, &cascades(3).unwrap()).is_err());
+        assert_eq!(image, before);
     }
 
     #[test]
