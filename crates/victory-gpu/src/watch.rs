@@ -1617,6 +1617,49 @@ mod tests {
                 n / 2000
             );
         }
+    /// A title write that lands while a submission is prepared (after its
+    /// asking, as with an early present while the title builds the next
+    /// frame) is not lost to the asking's reset: the submission's own take
+    /// misses it, the next submission's asking finds it, once.
+    #[test]
+    fn a_write_landing_mid_submit_is_found_by_the_next_asking() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (a, b) = (p + 8, p + 2 * PAGE + 8);
+        let copy = track(p, 4 * PAGE, false).expect("watched");
+        let ranges = [(p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)];
+        // SAFETY: committed pages of ours.
+        unsafe { (a as *mut u8).write(1) };
+        // submission N: one asking (kernel bits read and reset), then its refreshes
+        ask_ahead(&ranges);
+        // the title writes mid-submit, after the reset
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (a as *mut u8).write(2);
+            (b as *mut u8).write(3);
+        }
+        assert_eq!(copy.take(p, p + 3 * PAGE), [(p, p + PAGE)], "submission N's asking found what was before it");
+        ask_ahead_done();
+        // submission N+1 asks again: both mid-submit writes are found
+        ask_ahead(&ranges);
+        assert_eq!(
+            copy.take(p, p + 3 * PAGE),
+            [(p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)],
+            "a write after submission N's asking was dropped"
+        );
+        ask_ahead_done();
+        // and only once
+        assert!(copy.take(p, p + 3 * PAGE).is_empty());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
