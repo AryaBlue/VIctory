@@ -2345,6 +2345,42 @@ mod tests {
         // kept, not freed: the global journal remembers these pages, and a reused address would hand them to the next test
     }
 
+    // a kernel write (ReadFile) into watched memory that is no view: the write watch reports the pages
+    #[test]
+    fn a_kernel_read_into_watched_memory_is_found_by_the_write_watch() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        // SAFETY: a fresh write-watched allocation, kept
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        // written pages of the allocation, reset as the journal's askings reset them
+        let written = || {
+            let mut found = [0usize; 64];
+            let (mut count, mut granularity) = (found.len(), 0u32);
+            // SAFETY: room for `count` answers
+            let failed = unsafe { GetWriteWatch(1, p as *const _, 4 * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity) } != 0;
+            assert!(!failed);
+            found[..count].iter().map(|&at| (at - p) / PAGE).collect::<BTreeSet<usize>>()
+        };
+        assert!(written().is_empty());
+        // touched first: a page never touched counts as written at the kernel's first touch, read or write
+        for at in (0..4 * PAGE).step_by(KERNEL_PAGE) {
+            // SAFETY: committed pages of ours
+            unsafe { ((p + at) as *mut u8).write(1) };
+        }
+        assert_eq!(written().len(), 4);
+        assert!(written().is_empty());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[0x5a; 3 * 4096]).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        // SAFETY: committed pages of ours; the kernel writes them
+        let into = unsafe { std::slice::from_raw_parts_mut((p + 2 * PAGE + 100) as *mut u8, 3 * 4096) };
+        file.read_exact(into).unwrap();
+        assert_eq!(into[4096], 0x5a);
+        assert_eq!(written(), BTreeSet::from([2]), "a kernel read into watched memory left no write-watch bit");
+        assert!(written().is_empty());
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]

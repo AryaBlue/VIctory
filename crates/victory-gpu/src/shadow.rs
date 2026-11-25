@@ -46,7 +46,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<Pending>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -273,6 +273,54 @@ pub(crate) fn card_room_kept() -> u64 {
         return 0;
     }
     card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+}
+
+// pending ranges where they are walked: declarations, their sum of lengths, the longest; refreshes and their sum;
+// merges under flights, their sum, the ranges they asked about; frames; then microseconds (VICTORY_PENDING_STATS=1):
+// declaring, a merge's askings, its merges
+static PEND: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+fn pend_times() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_STATS").is_some_and(|v| v == "1"))
+}
+
+fn pend_add(i: usize, n: u64) {
+    PEND[i].fetch_add(n, Ordering::Relaxed);
+}
+
+// at a declaration: counts the frames and says the line every 256
+fn pend_tick() {
+    const EVERY: u64 = 256;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::frame::current();
+    if LAST.swap(now, Ordering::Relaxed) == now || PEND[8].fetch_add(1, Ordering::Relaxed) + 1 < EVERY {
+        return;
+    }
+    let s: [u64; 12] = std::array::from_fn(|i| PEND[i].swap(0, Ordering::Relaxed));
+    let (frames, each) = (s[8].max(1) as f64, |sum: u64, n: u64| sum as f64 / n.max(1) as f64);
+    tracing::info!(
+        "pending ranges per frame: {:.0} declarations walking {:.0} each (the longest list {}); {:.0} refreshes of copies with some walking {:.0} each; {:.0} merges under flights walking {:.0} each and asking about {:.0} ranges; ms (VICTORY_PENDING_STATS=1: {}): declaring {:.1}, the merges' askings {:.1}, their merging {:.1}",
+        s[0] as f64 / frames,
+        each(s[1], s[0]),
+        s[2],
+        s[3] as f64 / frames,
+        each(s[4], s[3]),
+        s[5] as f64 / frames,
+        each(s[6], s[5]),
+        s[7] as f64 / frames,
+        pend_times(),
+        s[9] as f64 / 1000.0 / frames,
+        s[10] as f64 / 1000.0 / frames,
+        s[11] as f64 / 1000.0 / frames,
+    );
+    if pending_indexed() && pending_check() {
+        tracing::info!(
+            checked = PENDING_CHECKED[0].swap(0, Ordering::Relaxed),
+            differing = PENDING_CHECKED[1].load(Ordering::Relaxed),
+            "pending check: lookups made by the walk too, and those that differed (since the start)"
+        );
+    }
 }
 
 /// The copies in the card's memory.
@@ -810,13 +858,30 @@ pub(crate) fn relay_fetched(number: u64) {
 /// of the first flight's copy-back removed it while the second was still
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
+// .1 with pending_indexed: where each range is in the list
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(Vec<((usize, usize), u32, u64)>, std::collections::HashMap<(usize, usize), usize>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
     fn declare(&mut self, range: (usize, usize), number: u64) {
+        if pending_indexed() {
+            match self.1.get(&range) {
+                Some(&at) => {
+                    let f = &mut self.0[at];
+                    if f.2 != number {
+                        f.1 += 1;
+                        f.2 = number;
+                    }
+                }
+                None => {
+                    self.1.insert(range, self.0.len());
+                    self.0.push((range, 1, number));
+                }
+            }
+            return;
+        }
         match self.0.iter_mut().find(|f| f.0 == range) {
             Some(f) => {
                 if f.2 != number {
@@ -832,12 +897,21 @@ impl Flights {
     /// the ranges no other submission still holds.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut free = Vec::new();
+        let indexed = pending_indexed();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
+            let found = if indexed { self.1.get(range).copied() } else { self.0.iter().position(|f| f.0 == *range) };
+            match found {
                 Some(at) => {
                     self.0[at].1 = self.0[at].1.saturating_sub(1);
                     if self.0[at].1 == 0 {
                         self.0.swap_remove(at);
+                        if indexed {
+                            self.1.remove(range);
+                            // the last one took its place
+                            if let Some(moved) = self.0.get(at) {
+                                self.1.insert(moved.0, at);
+                            }
+                        }
                         free.push(*range);
                     }
                 }
@@ -846,6 +920,160 @@ impl Flights {
             }
         }
         free
+    }
+}
+
+// VICTORY_PENDING_INDEX=1 (on in the crate's tests): pending ranges are looked up, not walked
+pub(crate) fn pending_indexed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PENDING_INDEX").map_or(cfg!(test), |v| v == "1");
+        if on && !cfg!(test) {
+            tracing::info!(
+                check = pending_check(),
+                "ranges shaders may be writing are looked up by range, and a merge under flights asks once for its span (VICTORY_PENDING_INDEX=1)"
+            );
+        }
+        on
+    })
+}
+
+// VICTORY_PENDING_CHECK=1 (on in the tests): every lookup is made by the walk too, and the two compared
+fn pending_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PENDING_CHECK").map_or(cfg!(test), |v| v == "1"))
+}
+
+// lookups checked, and those the walk answered otherwise
+pub(crate) static PENDING_CHECKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn pending_differs(what: &str, len: usize) {
+    if PENDING_CHECKED[1].fetch_add(1, Ordering::Relaxed) < 16 {
+        tracing::warn!(what, len, "pending check: the index and the walk over the list disagree");
+    }
+    debug_assert!(!cfg!(test), "pending check: {what}");
+}
+
+/// The ranges shaders of submissions not yet copied back may be writing,
+/// as declared (`list`, which derefs: the old code walks it), and with
+/// [`pending_indexed`] an index of them: the set of the ranges and their
+/// union, apart and in order.
+#[derive(Default)]
+struct Pending {
+    list: Vec<(usize, usize)>,
+    set: std::collections::HashSet<(usize, usize)>,
+    union: Vec<(usize, usize)>,
+    // the list's length the index was made at; `redo`: ranges left it since
+    made: usize,
+    redo: bool,
+}
+
+impl std::ops::Deref for Pending {
+    type Target = Vec<(usize, usize)>;
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+impl std::ops::DerefMut for Pending {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.list
+    }
+}
+
+impl Pending {
+    // the index made again if the list changed behind it
+    fn sync(&mut self) {
+        if !self.redo && self.made == self.list.len() {
+            return;
+        }
+        self.set = self.list.iter().copied().collect();
+        self.union = joined(self.list.clone());
+        (self.made, self.redo) = (self.list.len(), false);
+    }
+
+    /// Whether `range` is declared, as `list.contains`.
+    fn has(&mut self, range: (usize, usize)) -> bool {
+        self.sync();
+        let has = self.set.contains(&range);
+        if pending_check() {
+            PENDING_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            if has != self.list.contains(&range) {
+                pending_differs("has", self.list.len());
+            }
+        }
+        has
+    }
+
+    /// Declares `range`, as `list.push`.
+    fn add(&mut self, range: (usize, usize)) {
+        self.sync();
+        self.list.push(range);
+        self.made = self.list.len();
+        self.set.insert(range);
+        let (mut lo, mut hi) = range;
+        if lo >= hi {
+            return;
+        }
+        // the ranges of the union it overlaps or touches become one with it
+        let first = self.union.partition_point(|r| r.1 < lo);
+        let mut last = first;
+        while last < self.union.len() && self.union[last].0 <= hi {
+            (lo, hi) = (lo.min(self.union[last].0), hi.max(self.union[last].1));
+            last += 1;
+        }
+        self.union.splice(first..last, [(lo, hi)]);
+    }
+
+    /// The ranges in `gone` leave, as `list.retain(|r| !gone.contains(r))`.
+    fn leave(&mut self, gone: &[(usize, usize)]) {
+        if gone.is_empty() || self.list.is_empty() {
+            return;
+        }
+        let gone: std::collections::HashSet<(usize, usize)> = gone.iter().copied().collect();
+        let before = self.list.len();
+        self.list.retain(|r| !gone.contains(r));
+        if self.list.len() != before {
+            self.redo = true;
+        }
+    }
+
+    /// What is declared inside `[from, to)`, cut to it: apart, in order,
+    /// touching ranges as one. The same bytes as the list's ranges that
+    /// overlap `[from, to)`, cut.
+    fn over(&mut self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.sync();
+        let first = self.union.partition_point(|r| r.1 <= from);
+        let out: Vec<(usize, usize)> = self.union[first..]
+            .iter()
+            .take_while(|r| r.0 < to)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .filter(|&(a, e)| a < e)
+            .collect();
+        if pending_check() {
+            PENDING_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            let walked = joined(
+                self.list
+                    .iter()
+                    .filter(|&&(a, e)| a < to && e > from)
+                    .map(|&(a, e)| (a.max(from), e.min(to)))
+                    .filter(|&(a, e)| a < e)
+                    .collect(),
+            );
+            if walked != out {
+                pending_differs("over", self.list.len());
+            }
+        }
+        out
+    }
+}
+
+// its microseconds into PEND at its end
+struct Timed(std::time::Instant, usize);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        pend_add(self.1, self.0.elapsed().as_micros() as u64);
     }
 }
 
@@ -2305,6 +2533,49 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
 mod stale_tests {
     use super::*;
 
+    // the index answers as the walk does through declarations and leavings (the check is on in tests and panics)
+    #[test]
+    fn the_pending_index_answers_as_the_walk() {
+        let mut pending = Pending::default();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |most: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % most as u64) as usize
+        };
+        for round in 0..4000 {
+            let a = next(4096) * 16;
+            let range = (a, a + (1 + next(64)) * 16);
+            match next(8) {
+                0..=3 => {
+                    if !pending.has(range) {
+                        pending.add(range);
+                    }
+                }
+                4 => {
+                    let gone: Vec<(usize, usize)> = pending.iter().copied().filter(|_| next(3) == 0).collect();
+                    pending.leave(&gone);
+                    assert!(gone.iter().all(|r| !pending.has(*r)));
+                }
+                5 if round % 97 == 0 => pending.clear(),
+                _ => {
+                    let over = pending.over(range.0, range.1 + next(4096));
+                    assert!(over.windows(2).all(|w| w[0].1 < w[1].0), "apart and in order");
+                }
+            }
+        }
+        assert!(PENDING_CHECKED[0].load(Ordering::Relaxed) > 1000);
+        // a range that only touches is one with its neighbour, and a cut never leaves an empty range
+        let mut pending = Pending::default();
+        pending.add((16, 32));
+        pending.add((32, 48));
+        pending.add((64, 80));
+        assert_eq!(pending.over(0, 100), [(16, 48), (64, 80)]);
+        assert!(pending.over(48, 64).is_empty());
+        assert_eq!(pending.over(40, 70), [(40, 48), (64, 70)]);
+    }
+
     #[test]
     fn pages_never_taken_are_stale_written_or_not() {
         let base = 0x100;
@@ -2644,28 +2915,41 @@ impl Shadow {
         let range = (address, address + len);
         self.note_frame(H_GPU_AT);
         census::card_wrote(self);
+        pend_tick();
+        let started = pend_times().then(std::time::Instant::now);
+        let _timed = started.map(|s| Timed(s, 9));
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pend_add(0, 1);
+        pend_add(1, pending.len() as u64);
+        PEND[2].fetch_max(pending.len() as u64, Ordering::Relaxed);
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
         // Dispatches declare the same ranges thousands of times.
-        if pending.contains(&range) {
+        let indexed = pending_indexed();
+        if if indexed { pending.has(range) } else { pending.contains(&range) } {
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
-            pending.push(range);
+            if indexed {
+                pending.add(range);
+            } else {
+                pending.push(range);
+            }
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        // with the index: what is declared over the range, a few ranges, not every range of the copy
+        let over = if indexed { pending.over(address, address + len) } else { Vec::new() };
+        for &(a, e) in if indexed { over.iter() } else { pending.iter() } {
             let (a, e) = self.inside(a, e - a);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
@@ -2682,7 +2966,11 @@ impl Shadow {
             }
             parts = rest;
         }
-        pending.push(range);
+        if indexed {
+            pending.add(range);
+        } else {
+            pending.push(range);
+        }
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3090,7 +3378,13 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| !free.contains(r));
+            if pending_indexed() {
+                pending.leave(&free);
+            } else {
+                pending.retain(|r| !free.contains(r));
+            }
+        } else if pending_indexed() {
+            pending.leave(ranges);
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
@@ -3171,14 +3465,14 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending_indexed() {
+                pending.over(from, to)
+            } else {
+                pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect()
+            }
+        };
         if busy.is_empty() {
             return false;
         }
@@ -3215,17 +3509,20 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pend_add(5, 1);
+            pend_add(6, pending.len() as u64);
+            if pending_indexed() {
+                pending.over(from, to)
+            } else {
+                pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect()
+            }
+        };
         if busy.is_empty() {
             return false;
         }
+        pend_add(7, busy.len() as u64);
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
@@ -3234,6 +3531,45 @@ impl Shadow {
             && self.card.is_some()
             && crate::host::host().and_then(|h| crate::card_mask::program(&h.device)).is_some();
         let mut title = vec![0u8; PAGE];
+        // with the index: one asking for the span, and only the ranges with a stale page go on
+        const SPAN_ASK: usize = 4;
+        let spanned = (pending_indexed() && busy.len() >= SPAN_ASK)
+            .then(|| {
+                let _asking = pend_times().then(|| Timed(std::time::Instant::now(), 10));
+                let (now, written) = crate::watch::writes(from, to, true)?;
+                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                Some((now, stale_pages_in(base, &copied, from, to, &written)))
+            })
+            .flatten();
+        if let Some((now, stale)) = spanned {
+            for (a, e) in busy {
+                let pages = &stale[stale.partition_point(|&p| p < a / PAGE)..stale.partition_point(|&p| p < e.div_ceil(PAGE))];
+                if pending_check() {
+                    // as the walk asks: the journal again for this range alone
+                    PENDING_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    let alone = crate::watch::asked(a, e).map(|(_, written)| {
+                        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        stale_pages_in(base, &copied, a, e, &written)
+                    });
+                    if alone.is_some_and(|alone| alone != pages) {
+                        pending_differs("stale pages", pages.len());
+                    }
+                }
+                if pages.is_empty() {
+                    continue;
+                }
+                let _merging = pend_times().then(|| Timed(std::time::Instant::now(), 11));
+                let settle = if merge::wide() {
+                    self.merge_stale_wide(a, e, pages, now, runs_left, masked)
+                } else {
+                    self.merge_stale(a, e, pages, now, runs_left, masked, &mut title)
+                };
+                if settle {
+                    return true;
+                }
+            }
+            return false;
+        }
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3241,6 +3577,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
+            let asking = pend_times().then(|| Timed(std::time::Instant::now(), 10));
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
                 return true;
             };
@@ -3248,6 +3585,8 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            drop(asking);
+            let _merging = pend_times().then(|| Timed(std::time::Instant::now(), 11));
             let settle = if merge::wide() {
                 self.merge_stale_wide(a, e, &stale, now, runs_left, masked)
             } else {
@@ -3446,16 +3785,21 @@ impl Shadow {
         if !crate::push::on() {
             return self.update_old(from, to).0;
         }
+        self.update_pushed(from, to, crate::push::check(), &crate::watch::standing).0
+    }
+
+    // push: the refresh of `[from, to)` (inside the buffer); the bytes copied and whether it was over at once
+    fn update_pushed(&self, from: usize, to: usize, check: bool, standing: &dyn Fn(usize, usize) -> bool) -> (usize, bool) {
         use crate::push::stat;
         crate::push::tick();
         let mut held = false;
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let known = self.quiet.lock().unwrap_or_else(|e| e.into_inner()).holds(from, to);
             match known {
-                Some(true) if crate::watch::standing(from, to) => {
-                    if !crate::push::check() {
+                Some(true) if standing(from, to) => {
+                    if !check {
                         stat(0, 1);
-                        return 0;
+                        return (0, true);
                     }
                     held = true;
                 }
@@ -3478,19 +3822,25 @@ impl Shadow {
         if free && bytes == 0 {
             self.quiet.lock().unwrap_or_else(|e| e.into_inner()).note(from, to, at);
         }
-        bytes
+        (bytes, false)
     }
 
     // the refresh of `[from, to)` (inside the buffer) as it always was; and whether no shader writes in it
     fn update_old(&self, from: usize, to: usize) -> (usize, bool) {
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.is_empty() {
+                pend_add(3, 1);
+                pend_add(4, pending.len() as u64);
+            }
+            if pending.is_empty() {
+                Vec::new()
+            } else if pending_indexed() {
+                pending.over(from, to)
+            } else {
+                pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect()
+            }
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -5185,6 +5535,96 @@ mod promote_tests {
         assert_eq!(CARD_TO_SEND.lock().unwrap().iter().filter(|w| w.as_ptr() == Arc::as_ptr(&shadow)).count(), 1);
         assert_eq!(mine(card_dirty_as(5, true)).len(), 1);
         CARDED.lock().unwrap().retain(|w| w.as_ptr() != Arc::as_ptr(&shadow));
+    }
+
+    // push: a refresh is over at once only while nothing changed, and then the old way would copy nothing
+    #[test]
+    fn a_quiet_range_is_over_at_once_until_a_write_is_found() {
+        const MB: usize = 1 << 20;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(device) = warp() else { return };
+        // an address no other test had: the journal and the guards are shared and remember freed ranges
+        const AT: usize = 0x5a00_0000_0000;
+        // SAFETY: the test's own allocations
+        let (base, placed) = unsafe {
+            let base = mem::VirtualAlloc(AT as *const _, 3 * MB, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE) as usize;
+            let other = mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            (base, crate::inplace::place_part(&device, other as u64, 4096).ok())
+        };
+        if base == 0 {
+            return;
+        }
+        let Some(placed) = placed else { return };
+        let start = base.next_multiple_of(MB);
+        let len = 4 * PAGE;
+        let mut side = vec![0u8; len];
+        let shadow = Shadow::new(placed.buffer.clone(), side.as_mut_ptr(), 0, start as u64, len as u64);
+        let title = |at: usize| (start + at) as *mut u8;
+        // SAFETY: committed pages of the test's
+        let write = |at: usize, byte: u8| unsafe { title(at).write(byte) };
+        // SAFETY: both are `len` bytes and live
+        let same = |shadow: &Shadow| unsafe { std::slice::from_raw_parts(title(0), len) == std::slice::from_raw_parts(shadow.data.cast_const(), len) };
+        // the submission's asking, as ask_once makes it: the kernel is asked and the journal notes what it found
+        let asking = || assert!(crate::watch::writes(start, start + len, true).is_some());
+        let stands = |_: usize, _: usize| true;
+        let update = |shadow: &Shadow| shadow.update_pushed(start, start + len, false, &stands);
+
+        // every 4 KiB page touched first: the kernel's read of one never touched counts as a write to it
+        for at in (0..len).step_by(4096) {
+            write(at, 0x11);
+        }
+        write(PAGE + 5, 1);
+        asking();
+        // never taken: copied whole, and not noted
+        let (bytes, over) = update(&shadow);
+        assert!(bytes > 0 && !over && same(&shadow));
+        assert_eq!(shadow.watched.load(Ordering::Relaxed), 1, "not taken as write-watched memory");
+        // nothing to copy: noted, by the old way
+        assert_eq!(update(&shadow), (0, false));
+        // and from now on over at once
+        assert_eq!(update(&shadow), (0, true));
+        assert_eq!(shadow.update_pushed(start + PAGE, start + 2 * PAGE, false, &stands), (0, true), "a part of the range");
+
+        // the title writes; until an asking finds it the old way would not see it either
+        write(2 * PAGE + 9, 2);
+        assert_eq!(update(&shadow), (0, true));
+        asking();
+        let (bytes, over) = update(&shadow);
+        assert!(!over, "a write the asking found left the range over");
+        assert_eq!(bytes, PAGE);
+        assert!(same(&shadow));
+        assert_eq!(update(&shadow), (0, false));
+        assert_eq!(update(&shadow), (0, true));
+
+        // the old way would have to ask: not over, whatever is noted
+        let asks = |_: usize, _: usize| false;
+        assert_eq!(shadow.update_pushed(start, start + len, false, &asks), (0, false));
+
+        // checked: decided the old way, which stands
+        write(7, 3);
+        asking();
+        let (bytes, over) = shadow.update_pushed(start, start + len, true, &stands);
+        assert!(bytes > 0 && !over && same(&shadow));
+        assert_eq!(shadow.update_pushed(start, start + len, true, &stands), (0, false));
+
+        // a shader write pending: the old way, and nothing noted from it
+        assert_eq!(update(&shadow), (0, true));
+        shadow.pending.lock().unwrap().push((start, start + 64));
+        write(3 * PAGE + 1, 4);
+        asking();
+        let (bytes, over) = update(&shadow);
+        assert!(bytes > 0 && !over);
+        assert_eq!(update(&shadow), (0, false));
+        assert_eq!(update(&shadow), (0, false), "noted with a shader write pending");
+        shadow.pending.lock().unwrap().clear();
+        assert_eq!(update(&shadow), (0, false));
+        assert_eq!(update(&shadow), (0, true));
+
+        // no longer watched: every refresh copies the whole range, as before
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        assert_eq!(update(&shadow), (len, false));
+        drop(shadow);
+        // the write-watched pages are kept: the journal remembers them
     }
 
     // declared writes count once per frame
