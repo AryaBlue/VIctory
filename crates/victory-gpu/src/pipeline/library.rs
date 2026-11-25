@@ -524,7 +524,7 @@ pub(crate) fn pipeline(
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        super::stats::part(super::stats::Part::Load, || load(&library.library, PCWSTR(wide.as_ptr())))
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -543,7 +543,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let began = std::time::Instant::now();
+        let pso = super::stats::part(super::stats::Part::Create, create)?;
+        super::stats::slow_compile(began.elapsed(), || LABEL.with(|l| l.borrow().clone()));
+        pso
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -553,14 +556,16 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
-    let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
-    }
+    super::stats::part(super::stats::Part::Store, || {
+        let _all = one_call();
+        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+        let _call = call("store", name);
+        // SAFETY: a live pipeline; a name already stored (a description that
+        // differs) is refused, which leaves the library as it was.
+        if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+    });
     Ok(pso)
 }
 

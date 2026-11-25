@@ -159,11 +159,35 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PIPELINE_WAIT_SKIP_QUEUED=1`: no waiting for a pipeline that
+/// still sits behind more requested ones than there are workers: driver
+/// compiles take 1-8 s each here (vf-fill-1), so it is not made within
+/// the budget and the frame waits for nothing.
+fn skip_queued() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SKIP_QUEUED").is_some_and(|v| v == "1"))
+}
+
+/// Whether a pipeline in `state` can be made within a frame's budget with
+/// `queued` requested pipelines waiting and `workers` making them.
+fn worth_waiting(state: u8, queued: usize, workers: usize) -> bool {
+    state != REQUESTED || queued <= workers.max(1)
+}
+
+/// The pipeline workers running.
+static WORKERS: AtomicU64 = AtomicU64::new(0);
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
+    }
+    if skip_queued() {
+        let queued = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).requested.len();
+        if !worth_waiting(p.queue_state.load(Ordering::Relaxed), queued, WORKERS.load(Ordering::Relaxed) as usize) {
+            return;
+        }
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
@@ -195,6 +219,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    super::stats::waited(waited);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
@@ -304,16 +329,25 @@ fn workers() -> bool {
                 .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
+                    // `VICTORY_PIPELINE_PRIORITY=normal`: at the title's priority.
+                    let normal = std::env::var("VICTORY_PIPELINE_PRIORITY").is_ok_and(|v| v == "normal");
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let priority = if normal { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_BELOW_NORMAL };
+                        let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
-                        next().make();
+                        let p = next();
+                        super::stats::make(|| p.make());
+                        let (requested, early) = {
+                            let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            (queue.requested.len(), queue.early.len())
+                        };
+                        super::stats::maybe_log(requested, early, WAITING.load(Ordering::Relaxed));
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
-                            super::library::save(false);
+                            super::stats::part(super::stats::Part::Save, || super::library::save(false));
                         }
                     }
                 });
@@ -321,6 +355,7 @@ fn workers() -> bool {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
                 running = true;
+                WORKERS.fetch_add(1, Ordering::Relaxed);
             }
         }
         running
@@ -348,6 +383,14 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pipeline_deep_in_the_queue_is_not_waited_for() {
+        assert!(!worth_waiting(REQUESTED, 500, 8));
+        assert!(worth_waiting(REQUESTED, 8, 8));
+        assert!(worth_waiting(MAKING, 500, 8));
+        assert!(worth_waiting(REQUESTED, 1, 0));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

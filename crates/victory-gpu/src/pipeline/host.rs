@@ -374,7 +374,7 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            super::stats::part(super::stats::Part::Translate, || s.translated())?;
         }
         let host = host()?;
 
