@@ -202,7 +202,7 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         for range in written.take(start as usize, end as usize) {
-            sync_range(&parts, range, &mut page_bytes, &mut counts);
+            sync_range(&parts, range, &mut page_bytes, &mut counts, false);
         }
     }
     drop(heaps);
@@ -234,9 +234,9 @@ fn heap_parts<'a>(at: usize, start: u64) -> Option<(HeapParts<'a>, &'a crate::wa
     Some((HeapParts { host, start, step: u64::from(step), count }, written))
 }
 
-// mirrors the changed records of title bytes [range_from, range_end) of a heap; counts pages, looked, mirrored
+// mirrors the changed records of title bytes [range_from, range_end) of a heap; counts pages, looked, mirrored; fine: made lock per record
 #[cfg(windows)]
-fn sync_range(parts: &HeapParts<'_>, (range_from, range_end): (usize, usize), page_bytes: &mut Vec<u8>, counts: &mut [u64; 3]) {
+fn sync_range(parts: &HeapParts<'_>, (range_from, range_end): (usize, usize), page_bytes: &mut Vec<u8>, counts: &mut [u64; 3], fine: bool) {
     let HeapParts { host, start, step, count: mirrored_count } = *parts;
     let mut page = range_from & !(crate::watch::PAGE - 1);
     while page < range_end {
@@ -253,7 +253,7 @@ fn sync_range(parts: &HeapParts<'_>, (range_from, range_end): (usize, usize), pa
             // (`HostHeap::mirror_copied_page`); one by one below
             // with `VICTORY_HEAP_SYNC_PAGE=0`.
             let slots = if page_at_once() {
-                let (seen, made) = host.mirror_copied_page(slots, (start, step), from, page_bytes);
+                let (seen, made) = host.mirror_copied_page(slots, (start, step), from, page_bytes, fine);
                 counts[1] += seen;
                 counts[2] += made;
                 0..0
