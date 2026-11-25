@@ -172,6 +172,7 @@ static WROTE: AtomicU64 = AtomicU64::new(0);
 
 // title memory `[at, at + len)` was written or remapped other than by the title's own code
 pub(crate) fn wrote(at: usize, len: usize) {
+    crate::ask_early::wrote(at, len);
     if len == 0 || !on() {
         return;
     }
