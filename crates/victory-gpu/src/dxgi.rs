@@ -221,26 +221,33 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// Series X on a 1080p set lists a 1080p mode), else 1920x1080
+/// (`=3840x2160` gives the old 4K mode). The title renders its world at
+/// two thirds of it.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let size = display_size_from(std::env::var("VICTORY_DISPLAY_MODE").ok().as_deref());
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
+/// [`display_size`] from the switch's text, if any.
+fn display_size_from(asked: Option<&str>) -> (u32, u32) {
+    let asked = asked.and_then(|v| {
+        let (w, h) = v.trim().split_once(['x', 'X'])?;
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    });
+    match asked {
+        Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+        _ => (1920, 1080),
+    }
+}
+
+/// The console's mode list: one mode ([`display_size`], 1080p unless asked) at 60 Hz (the title looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
@@ -296,6 +303,16 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    /// 1080p unless the switch says otherwise; nonsense falls back to it.
+    #[test]
+    fn the_display_mode_is_1080p_unless_asked() {
+        assert_eq!(display_size_from(None), (1920, 1080));
+        assert_eq!(display_size_from(Some("3840x2160")), (3840, 2160));
+        assert_eq!(display_size_from(Some(" 2560X1440 ")), (2560, 1440));
+        assert_eq!(display_size_from(Some("banana")), (1920, 1080));
+        assert_eq!(display_size_from(Some("10x10")), (1920, 1080));
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.
