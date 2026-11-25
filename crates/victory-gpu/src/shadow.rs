@@ -4062,7 +4062,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     crate::tablereuse::bump();
-    buffers().remove(&(start, resource));
+    // out of the tables: the heap pass makes again the slots that show it
+    if let Some(copy) = buffers().remove(&(start, resource)).and_then(|e| e.shadow) {
+        copy.supersede();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making

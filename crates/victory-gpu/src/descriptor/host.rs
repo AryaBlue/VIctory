@@ -2293,13 +2293,28 @@ impl HostHeap {
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
-    /// resource (diagnostics: a buffer view's slot must show the host copy
-    /// that is brought up to date for it).
-    #[cfg(feature = "diagnostics")]
+    /// resource (a buffer view's slot must show the host copy that is
+    /// brought up to date for it).
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(index as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    /// Slot `index` (title record at `handle`) shows another host copy than
+    /// `buffer`, the one brought up to date for its view: made again now
+    /// from the copy its view finds. The made key alone cannot tell, as the
+    /// title's record did not change: the copy behind it did (the title
+    /// released its buffer and made another at the same address, or a
+    /// buffer came over memory a window copy held). `None` if it showed
+    /// `buffer` (or nothing); else whether it shows `buffer` now.
+    pub(crate) fn remake_elsewhere(&self, index: u32, handle: u64, buffer: &ID3D12Resource) -> Option<bool> {
+        if self.shows(index, buffer) != Some(false) {
+            return None;
+        }
+        self.forget_made(index);
+        self.mirror(index, handle, true);
+        Some(self.shows(index, buffer) == Some(true))
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -3939,6 +3954,52 @@ mod tests {
         super::super::record(h1, View::Constant(0x4000, 256));
         heap.mirror_due(&[(2, h1)], true);
         assert_eq!(ready(2), 0);
+    }
+
+    /// A buffer view's slot made on a copy that is then replaced with no
+    /// new record from the title (its buffer released and another made at
+    /// the same address; a buffer made over memory a window copy held) is
+    /// made again on the copy its view finds now. The released buffer's
+    /// copy is superseded.
+    #[test]
+    fn a_slot_showing_a_replaced_copy_is_made_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // addresses no other test asks about
+        const BASE: u64 = 0x6d5a_0000_0000;
+        const WINDOW: u64 = 0x6d5b_0000_0000;
+        let mut records = [[0u32; 8]; 2];
+        let [buffered, windowed] = records.each_mut().map(|r| r.as_mut_ptr() as u64);
+        // the title's buffer, its view, and the slot made on its copy
+        crate::shadow::register(0x5a01, BASE, 1 << 16);
+        super::super::record(buffered, View::Constant(BASE + 0x100, 256));
+        assert!(heap.mirror(2, buffered, true).is_some());
+        let first = crate::shadow::find(BASE + 0x100, 256).expect("a copy");
+        assert_eq!(heap.shows(2, &first.buffer), Some(true));
+        assert_eq!(heap.remake_elsewhere(2, buffered, &first.buffer), None);
+        // released, and another buffer at the same address: same record, another copy
+        crate::shadow::unregister(0x5a01, BASE);
+        assert!(first.superseded(), "a released buffer's copy is out of the tables");
+        crate::shadow::register(0x5a02, BASE, 1 << 16);
+        let second = crate::shadow::find(BASE + 0x100, 256).expect("a copy");
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(heap.shows(2, &second.buffer), Some(false), "the slot still shows the released copy");
+        assert_eq!(heap.remake_elsewhere(2, buffered, &second.buffer), Some(true));
+        assert_eq!(heap.shows(2, &second.buffer), Some(true));
+        assert_eq!(heap.remake_elsewhere(2, buffered, &second.buffer), None);
+        // memory outside buffers: a window copy, then a buffer made over it
+        super::super::record(windowed, View::Constant(WINDOW, 256));
+        assert!(heap.mirror(3, windowed, true).is_some());
+        let window = crate::shadow::find(WINDOW, 256).expect("a window copy");
+        assert_eq!(heap.shows(3, &window.buffer), Some(true));
+        crate::shadow::register(0x5a03, WINDOW, 1 << 16);
+        let over = crate::shadow::find(WINDOW, 256).expect("a copy");
+        assert!(!std::sync::Arc::ptr_eq(&window, &over));
+        assert_eq!(heap.remake_elsewhere(3, windowed, &over.buffer), Some(true));
+        assert_eq!(heap.shows(3, &over.buffer), Some(true));
+        crate::shadow::unregister(0x5a02, BASE);
+        crate::shadow::unregister(0x5a03, WINDOW);
     }
 
     // VICTORY_MADE_STRIPES: draws on several threads and two passes over the same pages leave every slot made from its record

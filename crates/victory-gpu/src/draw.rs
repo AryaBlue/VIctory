@@ -629,9 +629,9 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 /// the copy the pass brought up to date for them, since the start
 /// (diagnostics; for the memory line). It stays 0 while the pass and the
 /// slots agree; with `VICTORY_VIEW_EXTENT=0` it counts the views that were
-/// read stale.
-#[cfg(feature = "diagnostics")]
-pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+/// read stale. Such a slot is made again on the copy (the second count:
+/// of those, the ones that then showed it).
+pub(crate) static HEAP_VIEWS_ELSEWHERE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -729,9 +729,10 @@ fn walk_slot(
     if caching {
         cache.insert(index, (key, shadow.clone(), address, address + len));
     }
-    #[cfg(feature = "diagnostics")]
-    if host.shows(index, &shadow.buffer) == Some(false) {
-        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+    // a slot made on a copy since replaced, the title's record unchanged: made again on this one
+    if let Some(remade) = host.remake_elsewhere(index, handle, &shadow.buffer) {
+        HEAP_VIEWS_ELSEWHERE[0].fetch_add(1, Ordering::Relaxed);
+        HEAP_VIEWS_ELSEWHERE[1].fetch_add(u64::from(remade), Ordering::Relaxed);
     }
     Some((shadow, address, address + len))
 }
