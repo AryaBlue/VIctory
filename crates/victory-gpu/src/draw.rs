@@ -997,6 +997,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .map_or(u64::MAX, |mb| mb << 20)
     });
     let shadow = crate::shadow::find(address, 1)?;
+    crate::shadow::census::kind(&shadow, if srv { crate::shadow::census::Kind::View } else { crate::shadow::census::Kind::Constant });
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -1417,6 +1418,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 continue;
             };
+            crate::shadow::census::kind(&shadow, crate::shadow::census::Kind::VertexIndex);
             shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1435,6 +1437,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 return false;
             };
+            crate::shadow::census::kind(&shadow, crate::shadow::census::Kind::VertexIndex);
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1792,6 +1795,7 @@ impl State {
         });
         let find = |a: u64| {
             let s = crate::shadow::find(a, 1)?;
+            crate::shadow::census::kind(&s, crate::shadow::census::Kind::Written);
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1911,6 +1915,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                if let Some((_, s)) = &shadow {
+                    crate::shadow::census::kind(s, crate::shadow::census::Kind::View);
+                }
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
@@ -3711,9 +3718,13 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        crate::shadow::census::kind(&args, crate::shadow::census::Kind::Indirect);
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
-                Some(s) => Some((s, at)),
+                Some(s) => {
+                    crate::shadow::census::kind(&s, crate::shadow::census::Kind::Indirect);
+                    Some((s, at))
+                }
                 None => {
                     why("count outside title buffers");
                     return false;

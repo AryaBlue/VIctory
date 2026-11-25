@@ -2786,6 +2786,7 @@ fn buffer_srv(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    crate::shadow::census::kind(&shadow, crate::shadow::census::Kind::View);
     let offset = shadow.offset(address);
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
@@ -2874,6 +2875,7 @@ fn buffer_uav(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    crate::shadow::census::kind(&shadow, crate::shadow::census::Kind::Written);
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
     let (shadow, own) = {
@@ -3100,6 +3102,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     match view {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
+            crate::shadow::census::kind(&shadow, crate::shadow::census::Kind::Constant);
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(

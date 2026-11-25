@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+pub(crate) mod census;
 mod lookup;
 
 mod merge;
@@ -91,6 +92,8 @@ pub(crate) struct Shadow {
     heat: [AtomicU64; 6],
     // reached through the descriptor heap: how often shaders read it is unknown, so never picked
     bindless: std::sync::atomic::AtomicBool,
+    // diagnostics: counts by class (VICTORY_INPLACE_PROBE census)
+    census: census::Meter,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2519,6 +2522,7 @@ impl Shadow {
         let len = len.min(self.start + self.len - address);
         // bytes shaders were given to read: in place every one of them crosses the bus
         self.heat[H_ASKED].fetch_add(len, Ordering::Relaxed);
+        census::asked(self, len);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -2553,6 +2557,7 @@ impl Shadow {
             superseded: std::sync::atomic::AtomicBool::new(false),
             heat: [const { AtomicU64::new(0) }; 6],
             bindless: std::sync::atomic::AtomicBool::new(false),
+            census: census::Meter::default(),
         }
     }
 
@@ -2638,6 +2643,7 @@ impl Shadow {
         }
         let range = (address, address + len);
         self.note_frame(H_GPU_AT);
+        census::card_wrote(self);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -2802,6 +2808,7 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
+                census::back(self, n.min(title.len()));
                 crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
@@ -2916,6 +2923,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        census::back(self, title.len());
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
@@ -3396,7 +3404,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        let bytes = self.update_inner(address, len);
+        let bytes = census::checked(self, len, || self.update_inner(address, len), |&b| b);
         if bytes > 0 {
             self.note_frame(H_CPU_AT);
             self.heat[H_CPU_BYTES].fetch_add(bytes as u64, Ordering::Relaxed);
@@ -3414,6 +3422,7 @@ impl Shadow {
 
     // the heap pass reached it through descriptor slots
     pub(crate) fn mark_bindless(&self) {
+        census::kind(self, census::Kind::Heap);
         if !self.bindless.load(Ordering::Relaxed) {
             self.bindless.store(true, Ordering::Relaxed);
         }
@@ -3917,6 +3926,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
+                census::back(self, title.len());
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
@@ -4011,6 +4021,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        census::back(self, title.len());
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
@@ -4311,6 +4322,15 @@ fn take_back(trial: &Trial) -> u64 {
 // whether a trial made frames costlier than `tolerance` percent allows
 pub(crate) fn trial_failed(before_ms: f64, after_ms: f64, tolerance: f64) -> bool {
     after_ms > before_ms * (1.0 + tolerance / 100.0)
+}
+
+// once a second: the census by class, every 10 s (diagnostics, VICTORY_INPLACE_PROBE)
+pub(crate) fn census_tick() {
+    census::tick(|| {
+        let mut copies: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+        copies.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+        copies
+    });
 }
 
 // once a second with VICTORY_INPLACE_PICK or VICTORY_INPLACE_WRITTEN: copies worth it are swapped for title memory

@@ -1525,6 +1525,7 @@ pub(crate) fn tick() {
     if written_on() || pick() {
         crate::shadow::promote();
     }
+    crate::shadow::census_tick();
     if probe_level() == 0 {
         return;
     }
