@@ -545,10 +545,13 @@ pub(crate) fn run_until(reached: impl Fn() -> bool) -> bool {
     }
 }
 
+/// The releasers' lock: one caller of [`release_held_now`] at a time, so a
+/// queue's submissions keep their order.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn release_held_now(all: bool) {
-    // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() && crate::present_later::due().is_none() {
         return;
     }
@@ -1137,40 +1140,22 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     crate::copystat::present_begins();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
-    // with VICTORY_PRESENT_LATER our thread runs the lines up to the present
+    // with VICTORY_PRESENT_LATER (or _EARLY) our thread runs the lines up to the present
     #[cfg(windows)]
-    let later = crate::present_later::on() && behind() && crate::host::late_free_present();
+    let later = crate::present_later::later_for(
+        crate::present_later::on(),
+        crate::present_later::early(),
+        behind(),
+        crate::host::late_free_present(),
+    );
     // With `present_behind` (and not `later`): the frame is shown by our
     // thread, behind what the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
     let sent_behind = !later && present_behind() && send_behind(this, planes, plane_parameters);
     #[cfg(not(windows))]
     let _ = this;
-    // Submissions sent to the card and not waited for are settled first,
-    // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if later || sent_behind {
-        // nothing runs here: our thread runs the lines (up to the marks, or to the present sent behind)
-    } else if crate::host::late() && !crate::host::late_free_present() {
-        // (With `behind`: what the queues hold runs here first, and what
-        // it sent is settled with the rest.)
-        if behind() {
-            release_held_now(false);
-        }
-        crate::host::settle_for_present();
-        release_held_now(false);
-        crate::host::settle_for_present();
-    } else if crate::host::late() {
-        // The present is sent ahead too: what waits for a value a flight
-        // will write runs behind that flight, and nothing is settled here.
-        release_held_now(false);
-    }
-    // shortcut: what a queue still holds at a present runs now, whatever
-    // its fence: a wait is not kept across frames.
-    #[cfg(windows)]
-    if !later && !sent_behind {
-        release_held(forces());
-    }
+    present_lines(later || sent_behind);
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1239,6 +1224,35 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+
+/// The title's side of a present before the frame is shown: what the
+/// lines hold up to it runs here and the flights are settled, unless our
+/// thread runs the lines (`ours`: nothing runs or is waited for here).
+#[cfg(windows)]
+fn present_lines(ours: bool) {
+    if ours {
+        return;
+    }
+    // Submissions sent to the card and not waited for are settled first,
+    // and what that frees runs in its own order, before anything is forced.
+    if crate::host::late() && !crate::host::late_free_present() {
+        // (With `behind`: what the queues hold runs here first, and what
+        // it sent is settled with the rest.)
+        if behind() {
+            release_held_now(false);
+        }
+        crate::host::settle_for_present();
+        release_held_now(false);
+        crate::host::settle_for_present();
+    } else if crate::host::late() {
+        // The present is sent ahead too: what waits for a value a flight
+        // will write runs behind that flight, and nothing is settled here.
+        release_held_now(false);
+    }
+    // shortcut: what a queue still holds at a present runs now, whatever
+    // its fence: a wait is not kept across frames.
+    release_held(forces());
 }
 
 /// Shows `resource`, the first plane's first resource, in our window.
@@ -1664,6 +1678,99 @@ mod tests {
         assert_eq!(crate::fence::completed(told), 1);
         assert!(lock(&queue(a).held).is_empty());
         assert!(lock(&queue(b).held).is_empty());
+    }
+
+    /// VICTORY_PRESENT_EARLY: while our thread prepares a submission (it
+    /// holds the releasers' lock) the title's present gives the present and
+    /// returns; the old way it stands on that lock. Our thread then runs
+    /// what was given before the present, shows it, and leaves what came
+    /// after behind its own wait.
+    #[cfg(windows)]
+    #[test]
+    fn an_early_present_does_not_wait_for_our_thread() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _one = crate::present_later::TEST_ONE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut never, mut told, mut gate) = (null, null, null);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut never), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut told), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut gate), S_OK);
+        let (q_at, told_at, gate_at) = (q as usize, told as usize, gate as usize);
+        lock(&queue(q).held).extend([
+            Held::Wait(never as usize, 5),
+            Held::Signal(told_at, 1),
+        ]);
+        lock(&WAITING).push(q_at);
+        // our thread is preparing: it holds the releasers' lock
+        let ours = |go: std::sync::mpsc::Receiver<()>| {
+            let (holds, held) = channel();
+            let t = std::thread::spawn(move || {
+                let _g = lock(&RELEASING);
+                holds.send(()).unwrap();
+                let _ = go.recv();
+            });
+            held.recv().unwrap();
+            t
+        };
+        let (go, wait) = channel();
+        let preparing = ours(wait);
+        let (done, returned) = channel();
+        let title = std::thread::spawn(move || {
+            present_lines(true);
+            present_later(crate::present_later::Due { resource: 0, frame: 1 });
+            done.send(()).unwrap();
+        });
+        returned
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the early present waited for our thread");
+        title.join().unwrap();
+        assert_eq!(crate::fence::completed(told), 0, "the title's thread ran the line");
+        // given after the present: behind the mark, and behind a wait
+        lock(&queue(q).held).extend([Held::Wait(gate_at, 1), Held::Signal(told_at, 2)]);
+        go.send(()).unwrap();
+        preparing.join().unwrap();
+        release_held_now(false);
+        assert_eq!(crate::present_later::due(), None, "the present was not shown");
+        assert_eq!(crate::fence::completed(told), 1, "what was before the present did not run, or what came after did");
+        assert_eq!(lock(&queue(q).held).len(), 2);
+        crate::fence::set(gate, 1);
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(told), 2);
+        assert!(lock(&queue(q).held).is_empty());
+        // the old way: the present stands until our thread lets go
+        lock(&queue(q).held).extend([Held::Wait(never as usize, 5), Held::Signal(told_at, 3)]);
+        if !lock(&WAITING).contains(&q_at) {
+            lock(&WAITING).push(q_at);
+        }
+        let (go, wait) = channel();
+        let preparing = ours(wait);
+        let (done, returned) = channel();
+        let title = std::thread::spawn(move || {
+            present_lines(false);
+            done.send(()).unwrap();
+        });
+        assert!(
+            returned.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the old present did not wait for our thread"
+        );
+        go.send(()).unwrap();
+        preparing.join().unwrap();
+        returned.recv_timeout(Duration::from_secs(10)).expect("the old present never returned");
+        title.join().unwrap();
+        assert_eq!(crate::fence::completed(told), 3);
+        assert!(lock(&queue(q).held).is_empty());
     }
 
     #[test]

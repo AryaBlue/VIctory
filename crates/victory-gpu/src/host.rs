@@ -2128,7 +2128,27 @@ fn late_exact() -> bool {
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
 pub(crate) fn late_free_present() -> bool {
-    late_stage() > 2
+    free_present_at(late_stage(), present_flight())
+}
+
+/// Stage 3's present at stages 1 and 2 too (`VICTORY_PRESENT_FLIGHT=1`, or
+/// `VICTORY_PRESENT_EARLY=1` which needs it): the present's copy is a
+/// flight and the present settles nothing, so the card and the copy-back
+/// finish one frame while the next is prepared. Off by default.
+fn present_flight() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRESENT_FLIGHT").is_some_and(|v| v == "1") || crate::present_later::early();
+        if on && (1..=2).contains(&late_stage()) {
+            tracing::info!("the present is sent as a flight and settles nothing (VICTORY_PRESENT_FLIGHT=1)");
+        }
+        on
+    })
+}
+
+/// Whether presents settle nothing at late stage `stage`.
+pub(crate) fn free_present_at(stage: u8, flight: bool) -> bool {
+    stage > 2 || (stage > 0 && flight)
 }
 
 /// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
