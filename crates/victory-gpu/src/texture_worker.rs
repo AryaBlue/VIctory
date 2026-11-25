@@ -153,6 +153,22 @@ pub(crate) fn ready(resource: This, texture: &ID3D12Resource) -> bool {
     false
 }
 
+fn arrivals() -> &'static Worker<Job> {
+    static WORKER: std::sync::OnceLock<Worker<Job>> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        Worker::new(MOST, true, |resource, Job(texture, token)| {
+            crate::texture::restage(resource as This, &texture, token);
+        })
+    })
+}
+
+/// DirectStorage landed bytes in `resource`'s memory (`crate::texture_hold::landed`): it is read
+/// again on a worker now; false if it is with it already or its queue is full.
+pub(crate) fn arrived(resource: This, texture: ID3D12Resource) -> bool {
+    let worker = arrivals();
+    !worker.busy(resource as usize) && worker.hand(resource as usize, || Job(texture, crate::texture::handed(resource)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Jobs, Pending, Worker};

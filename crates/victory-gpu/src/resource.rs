@@ -1161,6 +1161,8 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// Another placed texture was placed over its memory since it was last viewed.
+    replaced: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1380,6 +1382,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::texture_hold::made_again(this as usize, r.data() as u64, footprint(&r.desc).map_or(0, |f| f.size), host.bytes);
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
@@ -1760,25 +1764,25 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    // with VICTORY_TEXTURE_HOLD copies the title still holds stay while the card has room
+    let hold = crate::texture_hold::on();
+    let level = if hold { crate::texture_hold::level_now() } else { crate::texture_hold::Level::Sweep };
+    let mut trimmable = Vec::new();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
-            continue;
-        }
+    let idle_of = |r: &Resource, made: &Option<Made>| {
+        made.as_ref().is_some_and(|(host, _)| {
+            crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+        })
+    };
+    let mut let_go = |at: usize, r: &Resource, why: usize| -> bool {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
+            if idle_of(r, &made) {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
@@ -1787,16 +1791,62 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
+        let Some((host, _)) = gone else {
+            return false;
+        };
+        r.host.gone.store(true, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::texture_hold::let_go(at, r.data() as u64, footprint(&r.desc).map_or(0, |f| f.size));
+        if hold {
+            crate::texture_hold::STATS[why].fetch_add(1, Relaxed);
+        }
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        went += 1;
+        bytes += host.bytes;
+        if first.is_none() {
+            first = Some(at);
+        }
+        crate::host::retire(host);
+        true
+    };
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        if hold {
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if !idle_of(r, &made) {
+                continue;
             }
-            crate::host::retire(host);
+            let placed = r.host.placed.load(Relaxed);
+            let kept = crate::texture_hold::held(
+                hold,
+                level,
+                placed,
+                r.host.replaced.load(Relaxed),
+                placed && crate::texture::committed(r.data().cast_const(), 1),
+            );
+            if kept {
+                crate::texture_hold::STATS[0].fetch_add(1, Relaxed);
+                if let crate::texture_hold::Level::Trim(_) = level {
+                    let size = made.as_ref().map_or(0, |(h, _)| h.bytes);
+                    trimmable.push((r.host.used.load(Relaxed), size, at));
+                }
+                continue;
+            }
+            drop(made);
+        }
+        let_go(at, r, 2);
+    }
+    if let crate::texture_hold::Level::Trim(over) = level {
+        for at in crate::texture_hold::least_used(trimmable, over) {
+            // SAFETY: as above, still under the table's lock.
+            let r = unsafe { &*(at as *const Resource) };
+            let_go(at, r, 1);
         }
     }
     if went > 0 {
@@ -2291,6 +2341,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            replaced: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2536,6 +2587,60 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The most bytes of title memory a placed texture takes: how far back a texture overlapping an
+/// address may start.
+#[cfg(windows)]
+static LARGEST_PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The placed textures of `map` overlapping `[address, address + bytes)`, but `me`.
+#[cfg(windows)]
+fn placed_overlapping(
+    map: &std::collections::BTreeMap<(u64, [u32; 14]), usize>,
+    address: u64,
+    bytes: u64,
+    me: usize,
+) -> Vec<usize> {
+    let back = address.saturating_sub(LARGEST_PLACED.load(std::sync::atomic::Ordering::Relaxed));
+    map.range((back, [0; 14])..(address.saturating_add(bytes), [0; 14]))
+        .filter(|&(&(at, ref desc), &r)| {
+            r != me && crate::texture_hold::overlap(at, placed_bytes(desc).unwrap_or(0), address, bytes)
+        })
+        .map(|(_, &r)| r)
+        .collect()
+}
+
+/// Texture `me` is (again) the one placed at `address`: the others there were placed over.
+#[cfg(windows)]
+fn placed_over(map: &std::collections::BTreeMap<(u64, [u32; 14]), usize>, address: u64, desc: &[u32; 14], me: usize) {
+    let bytes = placed_bytes(desc).unwrap_or(0);
+    for r in placed_overlapping(map, address, bytes, me) {
+        resource(r as This).host.replaced.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Placed textures with a host copy whose memory overlaps `[at, at + len)` and that nothing was
+/// placed over: each with its host texture.
+#[cfg(windows)]
+pub(crate) fn placed_with_copies(at: u64, len: u64) -> Vec<(This, windows::Win32::Graphics::Direct3D12::ID3D12Resource)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let found = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        placed_overlapping(&map, at, len, 0)
+    };
+    // placed textures are kept for the run, so they outlive the lock
+    found
+        .into_iter()
+        .filter_map(|r| {
+            let res = resource(r as This);
+            if res.host.replaced.load(Relaxed) {
+                return None;
+            }
+            let made = res.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            made.as_ref().map(|(host, _)| (r as This, host.texture.clone()))
+        })
+        .collect()
+}
+
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(windows)]
@@ -2616,6 +2721,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         }
     }
     if let Some(&r) = map.get(&(address, *desc)) {
+        // viewed again after something was placed over it: it is the one there now
+        if crate::texture_hold::on() && resource(r as This).host.replaced.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            placed_over(&map, address, desc, r);
+        }
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -2637,6 +2746,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    if let Some(bytes) = placed_bytes(desc) {
+        LARGEST_PLACED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+    if crate::texture_hold::on() {
+        placed_over(&map, address, desc, out as usize);
+    }
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host

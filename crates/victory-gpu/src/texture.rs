@@ -1340,6 +1340,25 @@ pub(crate) fn prestage(resource: This, texture: &ID3D12Resource, token: u64) {
     s.prepared.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// On the arrivals worker (`VICTORY_TEXTURE_ARRIVE`): `resource`'s memory was written, so its
+/// staging buffer is read again now, or made as [`prestage`] does if it has none.
+pub(crate) fn restage(resource: This, texture: &ID3D12Resource, token: u64) {
+    let staged = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if !take_hand(resource as usize, token) {
+            return;
+        }
+        map.as_ref().and_then(|map| map.get(&(resource as usize)).cloned())
+    };
+    match staged {
+        // a held level of it is what a slot shows; the pass finds it read and records the upload
+        Some(s) => {
+            s.refresh();
+        }
+        None => prestage(resource, texture, crate::texture::handed(resource)),
+    }
+}
+
 /// Whether the texture worker has made `resource`'s staging ready ([`prestage`]).
 pub(crate) fn prepared(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());

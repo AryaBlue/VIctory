@@ -90,6 +90,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texture_hold;
+#[cfg(windows)]
 mod texture_worker;
 #[cfg(windows)]
 pub mod upscale;

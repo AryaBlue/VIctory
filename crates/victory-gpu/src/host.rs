@@ -8117,6 +8117,15 @@ impl Meter {
                     "picked textures that kept their last view since the last line (VICTORY_TEXTURE_KEEP=1):                      {kept_away} looks that found the memory unmapped, {kept_waiting} passes over a texture the worker had not made ready"
                 );
             }
+            let [held, least, swept, same, same_bytes, changed, changed_bytes, handed_in, landings] =
+                [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| crate::texture_hold::STATS[i].swap(0, Ordering::Relaxed));
+            if held + least + swept + same + changed + landings > 0 {
+                tracing::info!(
+                    "host copies of filled textures since the last line: {same} made again with their memory as it                      was at the let-go ({:.0} MB), {changed} with it changed ({:.0} MB); held (VICTORY_TEXTURE_HOLD=1):                      {held} idle copies kept a sweep, {least} let go as least used past the soft line, {swept} let go                      past the hard line or as the title let them go; arrivals (VICTORY_TEXTURE_ARRIVE=1): {landings}                      DirectStorage writes landed on copies, {handed_in} textures handed to be read again",
+                    same_bytes as f64 / 1048576.0,
+                    changed_bytes as f64 / 1048576.0
+                );
+            }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
