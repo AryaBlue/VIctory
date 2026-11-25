@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod merge;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -2978,6 +2980,9 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let masked = crate::card_mask::on()
+            && self.card.is_some()
+            && crate::host::host().and_then(|h| crate::card_mask::program(&h.device)).is_some();
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -2993,70 +2998,87 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
-            for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
-                    continue;
-                }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    if crate::card_mask::on() && self.card_masked(at, title, held) {
-                        drop(before);
-                        self.took_page(page, base, start, end, a, e, now);
-                        continue;
-                    }
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                    }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                    }
-                }
-                drop(before);
-                self.took_page(page, base, start, end, a, e, now);
+            let settle = if merge::wide() {
+                self.merge_stale_wide(a, e, &stale, now, runs_left, masked)
+            } else {
+                self.merge_stale(a, e, &stale, now, runs_left, masked, &mut title)
+            };
+            if settle {
+                return true;
             }
+        }
+        false
+    }
+
+    /// [`Shadow::merge_under_writes`] for the stale pages of one range
+    /// `[a, e)` shaders may be writing; whether the flights must settle.
+    #[allow(clippy::too_many_arguments)]
+    fn merge_stale(&self, a: usize, e: usize, stale: &[usize], now: u64, runs_left: &mut usize, masked: bool, title: &mut [u8]) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        for &page in stale {
+            let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+            if lo >= hi {
+                continue;
+            }
+            let n = hi - lo;
+            let title = &mut title[..n];
+            // The lock of the copy's reference (the snapshot, or the
+            // CPU's side of a copy in the card's memory), from before
+            // title memory is read until the title's bytes are in: with
+            // the copy-back on its own thread ([`relay`]) that thread
+            // puts what the card wrote into title memory and into the
+            // reference under the same lock, and a page read before
+            // such a merge and compared after it would take the card's
+            // bytes for the title's.
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            // A page that is not there is left as it is, and looked at
+            // again next time.
+            if !crate::host::read_into(lo as *const u8, title) {
+                continue;
+            }
+            MERGED[0].fetch_add(1, Ordering::Relaxed);
+            let at = lo - start;
+            if self.card.is_some() {
+                // SAFETY: inside the mapping of the copy's CPU side,
+                // which only the submitting thread writes.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                if masked && self.card_masked(at, title, held) {
+                    drop(before);
+                    self.took_page(page, base, start, end, a, e, now);
+                    continue;
+                }
+                let runs = joined_over(changed_runs(title, held), merge_gap());
+                if runs.len() > *runs_left {
+                    return true;
+                }
+                *runs_left -= runs.len();
+                for (r, m) in runs {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    self.card_changed(at + r, at + r + m);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                }
+            } else {
+                let Some(snapshot) = before.as_mut() else {
+                    return true;
+                };
+                // SAFETY: the snapshot's allocation holds the copy's
+                // bytes at the copy's offsets (`writing`), and these
+                // are in a declared range.
+                let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                for (r, m) in changed_runs(title, held) {
+                    // SAFETY: inside the copy's mapping. The card may be
+                    // writing the copy beside these bytes; they are
+                    // written here and nothing around them.
+                    unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                }
+            }
+            drop(before);
+            self.took_page(page, base, start, end, a, e, now);
         }
         false
     }
@@ -3081,9 +3103,6 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
-        if crate::host::host().and_then(|h| crate::card_mask::program(&h.device)).is_none() {
-            return false;
-        }
         let runs = changed_runs(title, held);
         let entries = crate::card_mask::dword_masks(at, &runs);
         let mut notes = card.masked.lock().unwrap_or_else(|e| e.into_inner());
