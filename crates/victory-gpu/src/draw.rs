@@ -395,12 +395,13 @@ pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 14] = [const { std:
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_line(frames: f64) {
     let n: Vec<f64> = WINDOW_WHY.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    let s: Vec<f64> = crate::indirect::GATHER_SEGS.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     let g: Vec<f64> = crate::indirect::GATHER_NONE.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     tracing::info!(
         "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
          buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
          {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw; \
-         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0})",
+         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0}); {:.0} segments opened in lists that had stopped gathering (VICTORY_GATHER_SEGMENTS=1), {:.0} records clamped in them, {:.0} commands read them",
         n[0],
         n[1..9].iter().sum::<f64>(),
         n[1],
@@ -421,6 +422,9 @@ pub(crate) fn window_line(frames: f64) {
         g[2],
         g[3],
         g[4],
+        s[0],
+        s[1],
+        s[2],
     );
 }
 
@@ -1379,6 +1383,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        list.set_title_waited(false);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1489,7 +1494,7 @@ impl State {
         }
         self.pass_pso = pso;
         let key = if compute {
-            format!("dispatches | {}", p.name)
+            format!("dispatches | {}{}", p.name, compute_shape_text(p))
         } else {
             let t = match targets {
                 Some(t) => t,
@@ -1504,6 +1509,7 @@ impl State {
 
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        list.set_title_waited(false);
         self.pass_mark(list, p, compute);
         if crate::cardmeter::passes() {
             crate::cardmeter::pass_count(self.pass_id, usize::from(compute));
@@ -3781,14 +3787,37 @@ impl State {
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
-            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
+            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), (offset, arguments), (kind, stride)).map(|(scratch, at, opened)| {
+                // a segment's pass went in front: our pipeline replaced the title's
+                if opened {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (scratch, at)
+            });
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             slot
         } else {
             None
         };
-        let (bounded, at) = match (hit, gathered) {
+        // a dispatch whose arguments no shader writes: title memory holds them
+        let cpu_args = kind == DISPATCH && max == 1 && counter.is_none() && !args.in_place() && !args.gpu_wrote();
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH && hit.is_none() {
+            crate::copystat::add(
+                if cpu_args { crate::copystat::C::DispatchArgsCpu } else { crate::copystat::C::DispatchArgsShader },
+                1,
+            );
+        }
+        let on_cpu = if cpu_args && hit.is_none() && crate::indirect::cpu_dispatch_clamp() {
+            cpu_clamped(list, arguments, stride)
+        } else {
+            None
+        };
+        let (bounded, at) = if let Some(clamped) = on_cpu {
+            clamped
+        } else { match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::WindowHits, 1);
@@ -3949,6 +3978,10 @@ impl State {
                         }
                     }
                 }
+                crate::indirect::share_wait(crate::indirect::wait_share() & 1 != 0 && list.title_waited());
+                if crate::indirect::clamp_stats() && kind == DISPATCH {
+                    crate::indirect::clamp_slot(list.clamp_slot(crate::host::clamp_tag(&p.name, args.id())));
+                }
                 let bounded = if let Some((buffer, ats, epoch, fits)) = batched {
                     // the plan's windows go in before the head's, which is looked up first
                     for (p, &at) in fits.iter().zip(&ats[1..]) {
@@ -3974,6 +4007,8 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)).map(|b| (b, 0, 0))
                 };
+                crate::indirect::share_wait(false);
+                crate::indirect::clamp_slot(0);
                 let Some((bounded, at, epoch)) = bounded else {
                     self.end_windows();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -4032,7 +4067,7 @@ impl State {
                 }
                 (bounded, at)
             }
-        };
+        } };
         #[cfg(feature = "diagnostics")]
         {
             self.last_indirect = (args.id(), offset);
@@ -4081,6 +4116,50 @@ impl State {
         }
         true
     }
+}
+
+/// An indirect dispatch's record (`stride` bytes at `arguments` in title memory) clamped on
+/// the CPU when the list is submitted, into the list's upload memory, which the card reads
+/// as indirect arguments (`crate::indirect::cpu_dispatch_clamp`).
+fn cpu_clamped(list: &HostList, arguments: u64, stride: u32) -> Option<(ID3D12Resource, u64)> {
+    if !(12..=256).contains(&stride) || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let (buffer, at, data) = list.scratch_region(u64::from(stride))?;
+    let budget = list.cpu_budget();
+    let (src, dst, len) = (arguments as usize, data as usize, stride as usize);
+    list.defer_host(move || {
+        let mut record = [0u8; 256];
+        crate::host::copy_mapped(record.as_mut_ptr(), src as *const u8, len, false);
+        let word = |i: usize| u32::from_le_bytes([record[i * 4], record[i * 4 + 1], record[i * 4 + 2], record[i * 4 + 3]]);
+        let groups = crate::indirect::clamp_dispatch_record([word(0), word(1), word(2)], &budget);
+        for (i, g) in groups.iter().enumerate() {
+            record[i * 4..i * 4 + 4].copy_from_slice(&g.to_le_bytes());
+        }
+        // SAFETY: the list's own upload memory, `len` bytes of it, alive until its reset.
+        unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), dst as *mut u8, len) };
+    });
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::DispatchClampedOnCpu, 1);
+    Some((buffer, at))
+}
+
+/// A compute pipeline's group shape as pass keys name it: threads per group, and w64 for
+/// waves of 64.
+fn compute_shape_text(p: &HostPipeline) -> String {
+    static SHAPES: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut shapes = SHAPES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(text) = shapes.get(&p.name) {
+        return text.clone();
+    }
+    let text = p
+        .stages
+        .iter()
+        .find_map(|s| s.shader.compute_shape())
+        .map_or(String::new(), |([x, y, z], w64)| format!(" {x}x{y}x{z}{}", if w64 { " w64" } else { "" }));
+    shapes.insert(p.name.clone(), text.clone());
+    text
 }
 
 /// The host command signature for one argument of `kind` with records

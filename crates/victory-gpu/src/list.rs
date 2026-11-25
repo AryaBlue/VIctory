@@ -745,6 +745,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    worked(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -851,6 +852,8 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    worked(this);
+    stored(this, buffer_range(dst, dst_offset, len).map_or(0, |p| p as u64), len);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -883,6 +886,8 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    worked(this);
+    stored_buffer(this, dst);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -948,6 +953,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    worked(this);
     copy_resource(this, dst, src);
 }
 
@@ -973,6 +979,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    worked(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1204,6 +1211,7 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    worked(this);
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1215,6 +1223,7 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    worked(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1291,6 +1300,7 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    worked(this);
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1341,6 +1351,7 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    worked(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1380,6 +1391,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    worked(this);
+    stored(this, dst, len);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1436,6 +1449,8 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    worked(this);
+    stored_buffer(this, buffer);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -2020,6 +2035,43 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
+/// Work recorded after the title's own wait: a clamp waits for itself again
+/// (`crate::indirect::wait_share`).
+/// Title memory `len` bytes from `at` is about to be written by the list: a
+/// record gathered there is read before it, so its set gathers no more
+/// (`crate::indirect::gather`).
+fn stored(this: This, at: u64, len: u64) {
+    #[cfg(windows)]
+    if at != 0
+        && let Some(list) = host_list(this)
+    {
+        list.gather_wrote((at, at.saturating_add(len)));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, at, len);
+}
+
+/// [`stored`] for the whole of a buffer.
+fn stored_buffer(this: This, buffer: This) {
+    #[cfg(windows)]
+    if let Some((at, len)) = crate::resource::buffer_bytes(buffer) {
+        stored(this, at as u64, len);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer);
+}
+
+fn worked(this: This) {
+    #[cfg(windows)]
+    if crate::indirect::wait_share() & 1 != 0
+        && let Some(list) = host_list(this)
+    {
+        list.set_title_waited(false);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
 extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -2055,6 +2107,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.set_title_waited(true);
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -2163,10 +2216,14 @@ unsafe fn group_wait(count: u32, groups: *const u8) -> Wait {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    worked(this);
+    stored(this, address, 4);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    worked(this);
+    stored(this, address, 8);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {

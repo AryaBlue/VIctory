@@ -887,6 +887,14 @@ pub(crate) struct HostList {
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
+    /// Whether the title's own wait for every earlier shader write is the last work
+    /// recorded (`crate::indirect::wait_share`).
+    title_waited: std::sync::atomic::AtomicBool,
+    /// With `crate::indirect::cpu_dispatch_clamp`: the work the dispatches clamped on the
+    /// CPU charged since the list's submission began.
+    cpu_budget: std::sync::Arc<AtomicU32>,
+    /// The stats slots' tags of the list's last recording, read with its budget's words.
+    last_tags: std::sync::Arc<Mutex<Vec<u32>>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1378,6 +1386,56 @@ pub(crate) fn dred_on() -> bool {
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The bytes of a list's budget buffer: the budget's words, then the clamp's stats slots.
+const BUDGET_BYTES: u64 = 256 + 4 * crate::indirect::CLAMP_SLOTS as u64;
+
+/// With `crate::indirect::clamp_stats`, since the frame line: records the clamp changed
+/// (dispatches, draws outside windows), and per indirect dispatch tag (pipeline, argument
+/// buffer) the clamps read back and those that changed their record.
+static CLAMP_ALTERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static CLAMP_TAGS: std::sync::Mutex<Option<(std::collections::HashMap<(String, u64), u32>, Vec<(String, u64, u64, u64)>)>> =
+    std::sync::Mutex::new(None);
+
+/// The tag of indirect dispatches of `pipeline` from the argument copy `args`.
+pub(crate) fn clamp_tag(pipeline: &str, args: u64) -> u32 {
+    let mut tags = CLAMP_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let (ids, all) = tags.get_or_insert_with(Default::default);
+    if let Some(&id) = ids.get(&(pipeline.to_owned(), args)) {
+        return id;
+    }
+    let id = all.len() as u32;
+    ids.insert((pipeline.to_owned(), args), id);
+    all.push((pipeline.to_owned(), args, 0, 0));
+    id
+}
+
+/// The clamp stats since the last call, as lines: totals, then the tags whose clamps
+/// changed a record, most first.
+pub(crate) fn clamp_stats_lines(frames: f64) -> Vec<String> {
+    let [dispatches, draws] = [0, 1].map(|i| CLAMP_ALTERED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let mut tags = CLAMP_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, all)) = tags.as_mut() else {
+        return vec![format!("clamp stats per frame: {dispatches:.1} dispatch records changed, {draws:.1} draw records changed")];
+    };
+    let runs: u64 = all.iter().map(|t| t.2).sum();
+    let mut changed: Vec<(String, u64, u64, u64)> = all.iter().filter(|t| t.3 > 0).cloned().collect();
+    changed.sort_by_key(|t| std::cmp::Reverse(t.3));
+    let mut lines = vec![format!(
+        "clamp stats per frame: dispatch clamps {:.1} run (read back by slot), {dispatches:.1} dispatch records changed, {draws:.1} draw records changed outside windows; {} pipeline and buffer pairs, {} of them ever changed",
+        runs as f64 / frames,
+        all.len(),
+        changed.len()
+    )];
+    for (pipeline, args, run, alt) in changed.iter().take(8) {
+        lines.push(format!("  changed {alt} of {run} clamps: {pipeline}, argument copy {args}"));
+    }
+    for t in all.iter_mut() {
+        t.2 = 0;
+        t.3 = 0;
+    }
+    lines
+}
 
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
@@ -2051,6 +2109,11 @@ struct Deferred {
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
+    /// Whether the CPU's clamp budget is zeroed for this recording.
+    cpu_budget_zeroed: bool,
+    /// With `crate::indirect::clamp_stats`: the tags of the clamps given stats slots, in
+    /// slot order.
+    clamp_tags: Vec<u32>,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -4021,6 +4084,9 @@ impl Host {
                 pass_span: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
+                title_waited: std::sync::atomic::AtomicBool::new(false),
+                cpu_budget: std::sync::Arc::default(),
+                last_tags: std::sync::Arc::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6225,7 +6291,7 @@ impl HostList {
         self.pass_end();
         // The scratch buffers its prelude fills and leaves readable as
         // arguments: common again behind the list, as every scratch buffer.
-        for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.records() > 0) {
+        for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.readable()) {
             // SAFETY: an open list and a live buffer.
             unsafe {
                 self.list.ResourceBarrier(&[transition(
@@ -6264,7 +6330,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        {
+            let mut deferred = self.deferred();
+            *self.last_tags.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut deferred.clamp_tags);
+            *deferred = Deferred::default();
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6299,6 +6369,7 @@ impl HostList {
             fail(format_args!("a host command list did not reset ({e})"));
         }
         self.pass_span.store(u32::MAX, Ordering::Relaxed);
+        self.title_waited.store(false, Ordering::Relaxed);
         self.meter
             .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -6311,6 +6382,38 @@ impl HostList {
         self.pass_end();
         let span = crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Pass(key));
         self.pass_span.store(span.raw(), Ordering::Relaxed);
+    }
+
+    /// Whether the title's own wait is the last work recorded.
+    pub(crate) fn title_waited(&self) -> bool {
+        self.title_waited.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_title_waited(&self, waited: bool) {
+        self.title_waited.store(waited, Ordering::Relaxed);
+    }
+
+    /// The budget of the dispatches clamped on the CPU, zeroed when the list is submitted
+    /// before the first of them.
+    pub(crate) fn cpu_budget(&self) -> std::sync::Arc<AtomicU32> {
+        let mut deferred = self.deferred();
+        if !deferred.cpu_budget_zeroed {
+            deferred.cpu_budget_zeroed = true;
+            let budget = self.cpu_budget.clone();
+            deferred.copies.push(Step::Host(Box::new(move || budget.store(0, Ordering::Relaxed))));
+        }
+        self.cpu_budget.clone()
+    }
+
+    /// A stats slot for the next clamp, of dispatches tagged `tag`: one more than its
+    /// index, or 0 if the list has none left.
+    pub(crate) fn clamp_slot(&self, tag: u32) -> u32 {
+        let mut deferred = self.deferred();
+        if deferred.clamp_tags.len() >= crate::indirect::CLAMP_SLOTS as usize {
+            return 0;
+        }
+        deferred.clamp_tags.push(tag);
+        deferred.clamp_tags.len() as u32
     }
 
     /// The pass being recorded ends here.
@@ -6657,22 +6760,59 @@ impl HostList {
 
     /// From here on the list gathers no records (`crate::indirect::gather`):
     /// what is about to be recorded may write arguments.
+    /// Title memory `[lo, hi)` is about to be written (a copy or an
+    /// immediate write the list records): the sets whose records may lie
+    /// there gather no more of them ([`crate::indirect::gather`]).
+    pub(crate) fn gather_wrote(&self, range: (u64, u64)) {
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        for set in &mut gather.sets {
+            set.wrote(range);
+        }
+    }
+
     pub(crate) fn gather_close(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        gather.closed = true;
+        for set in &mut gather.sets {
+            set.close();
+        }
+    }
+
+    /// The pass of a segment opened in `set` ([`crate::indirect::gather_segments`]),
+    /// recorded in the list here. False with nothing recorded if it cannot be.
+    fn segment_pass(&self, set: &mut crate::indirect::GatherSet, seg: crate::indirect::Segment) -> bool {
+        let (Some(c), Some(budget)) = (crate::indirect::clamp(), self.budget()) else {
+            return false;
+        };
+        let before = if set.readable() { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+        let done = crate::indirect::record_gather_as(
+            c,
+            &self.list,
+            (&set.scratch, before),
+            budget,
+            &set.src,
+            set.table_gpu + u64::from(seg.count) * 4,
+            (set.kind, set.stride, seg.most),
+            (u64::from(seg.base) * u64::from(set.stride), true),
+        );
+        set.in_list |= done;
+        done
     }
 
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
-    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, (offset, title): (u32, u64), (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
         let none = |why: usize| {
             crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
             None
         };
+        let segments = crate::indirect::gather_segments();
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        if gather.closed {
+        if gather.closed && !segments {
             return none(1);
         }
+        let closed = gather.closed;
         let found = gather
             .sets
             .iter()
@@ -6707,7 +6847,7 @@ impl HostList {
                         scratch
                     }
                 };
-                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
+                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_TABLE_WORDS) * 4) else {
                     gather.spare.push(scratch);
                     return none(4);
                 };
@@ -6715,11 +6855,35 @@ impl HostList {
                 gather.sets.len() - 1
             }
         };
+        let closed = closed || gather.sets[at].shut;
+        if closed && !segments {
+            return none(1);
+        }
         let set = &mut gather.sets[at];
+        let mut opened = false;
+        if closed && set.open.is_none_or(|s| s.n >= s.most) {
+            let Some(seg) = set.open_segment() else {
+                return none(3);
+            };
+            if !self.segment_pass(set, seg) {
+                set.close();
+                return none(4);
+            }
+            opened = true;
+            crate::indirect::GATHER_SEGS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        let had = set.open.map_or(0, |s| s.n);
         let Some(slot) = set.slot(offset) else {
             return none(3);
         };
-        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride)))
+        set.note(title, stride);
+        if closed {
+            crate::indirect::GATHER_SEGS[2].fetch_add(1, Ordering::Relaxed);
+            if set.open.map_or(0, |s| s.n) > had {
+                crate::indirect::GATHER_SEGS[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride), opened))
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -6905,16 +7069,21 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (buffer, at, data) = self.scratch_region(len)?;
+        // SAFETY: a live buffer.
+        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+    }
+
+    /// As [`HostList::scratch`]: the buffer, the offset in it and the CPU pointer.
+    pub(crate) fn scratch_region(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            self.deferred().hold_upload(buffer.clone(), len);
+            return Some((buffer, 0, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -6931,10 +7100,10 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
+        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0._buffer.clone());
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some((buffer, at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -6950,7 +7119,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer(BUDGET_BYTES)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -6959,6 +7128,7 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
+            let last_tags = self.last_tags.clone();
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -6969,7 +7139,22 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                if crate::indirect::clamp_stats() {
+                    CLAMP_ALTERED[0].fetch_add(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
+                    CLAMP_ALTERED[1].fetch_add(u64::from(words.add(4).read_volatile()), Ordering::Relaxed);
+                    let last = last_tags.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut tags = CLAMP_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((_, all)) = tags.as_mut() {
+                        for (slot, &tag) in last.iter().enumerate() {
+                            let n = words.add(64 + slot).read_volatile();
+                            if let Some(t) = all.get_mut(tag as usize) {
+                                t.2 += 1;
+                                t.3 += u64::from(n.min(1));
+                            }
+                        }
+                    }
+                }
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6989,7 +7174,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer(BUDGET_BYTES)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -7003,7 +7188,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7044,7 +7229,8 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            let bytes = if crate::indirect::clamp_stats() { BUDGET_BYTES - 4 } else { 8 };
+            self.list.CopyBufferRegion(mapped, 4, card, 4, bytes);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8152,6 +8338,11 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        if crate::indirect::clamp_stats() {
+            for line in clamp_stats_lines(frames) {
+                tracing::info!("{line}");
+            }
+        }
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
         // dispatch runs; the counter went when the clamp's budget moved to

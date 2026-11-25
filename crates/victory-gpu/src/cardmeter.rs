@@ -114,7 +114,12 @@ pub(crate) fn on() -> bool {
 /// default. No waits: the pairs are read as the list pairs are.
 pub(crate) fn passes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_PASS_TIMES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_PASS_TIMES").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// The table's rows before the rest are summed by kind: every pass with `VICTORY_PASS_TIMES=2`.
+fn pass_rows() -> usize {
+    if std::env::var_os("VICTORY_PASS_TIMES").is_some_and(|v| v == "2") { usize::MAX } else { 40 }
 }
 
 /// Per pass key: name, card microseconds, spans, draws, dispatches, clamps
@@ -483,7 +488,7 @@ pub(crate) fn collect() {
         p.frames += 1;
         let since = *p.since.get_or_insert(now);
         if now.duration_since(since) >= std::time::Duration::from_secs(10) {
-            for line in pass_table(&p.names, &p.sums, p.frames, 40) {
+            for line in pass_table(&p.names, &p.sums, p.frames, pass_rows()) {
                 tracing::info!("{line}");
             }
             p.sums.iter_mut().for_each(|s| *s = [0; 7]);

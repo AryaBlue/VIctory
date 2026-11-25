@@ -72,6 +72,8 @@ static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
+// With VICTORY_CLAMP_STATS: the group's records the clamp changed.
+groupshared uint altered_n;
 groupshared uint all_asked;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -89,7 +91,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // is a count of four bytes, or the source itself, and is not read here.)
     [branch]
     if ((has_count & 4u) != 0) {
-        src_at = count_buf.Load(count_offset + id.x * 4u);
+        // with bit 0 as well: the count is the table's first word
+        src_at = count_buf.Load(count_offset + ((has_count & 1u) != 0 ? 4u : 0u) + id.x * 4u);
     }
     uint dst_at = id.x * stride;
     uint cost = 0;
@@ -200,6 +203,37 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
     }
+    // Bit 7: count the records the clamp changes (outside a window), per list in the
+    // budget's words 3 (dispatches) and 4 (draws), and per clamp in its slot (bits 8 up,
+    // one more than the slot; group 0's records).
+    if ((has_count & 128u) != 0) {
+        if (gi == 0) {
+            altered_n = 0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (active && !ahead) {
+            bool cut = fits[gi] == 0;
+            bool changed;
+            if (kind <= 1) {
+                changed = any((cut ? uint2(0, 0) : draw_counts) != src_args.Load2(src_at));
+            } else {
+                changed = any((cut ? uint3(0, 0, 0) : groups) != src_args.Load3(src_at));
+            }
+            if (changed) {
+                uint was;
+                InterlockedAdd(altered_n, 1u, was);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (gi == 0 && altered_n > 0) {
+            uint was;
+            budget.InterlockedAdd(kind == 2 ? 12 : 16, altered_n, was);
+        }
+        uint slot = has_count >> 8;
+        if (gi == 0 && slot != 0 && first == 0) {
+            budget.Store(256 + (slot - 1) * 4, altered_n);
+        }
+    }
     if (!active) {
         return;
     }
@@ -224,7 +258,76 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
-struct Clamp {
+/// Whether the clamp counts the records it changes (`VICTORY_CLAMP_STATS=1`; diagnostics):
+/// per list, and per indirect dispatch by pipeline and argument buffer
+/// (`crate::host::clamp_stats_line`).
+pub(crate) fn clamp_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_STATS").is_some_and(|v| v == "1"))
+}
+
+/// The stats slots of a list's budget buffer: one word each, after its first 256 bytes.
+pub(crate) const CLAMP_SLOTS: u32 = 2048;
+
+thread_local! {
+    /// One more than the stats slot the next clamp alone writes, or 0.
+    static CLAMP_SLOT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The next clamp of one record set on this thread writes its stats to `slot` (one more
+/// than its index; 0 for none).
+pub(crate) fn clamp_slot(slot: u32) {
+    CLAMP_SLOT.with(|s| s.set(slot));
+}
+
+/// Whether an indirect dispatch whose arguments no shader was ever declared to write is
+/// clamped on the CPU when its list is submitted, into the list's upload memory, with no
+/// clamp of ours on the card (`VICTORY_DISPATCH_CPU_CLAMP=1`; off by default).
+pub(crate) fn cpu_dispatch_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_CPU_CLAMP").is_some_and(|v| v == "1"))
+}
+
+/// Which of a clamp's two waits for every shader write are left out
+/// (`VICTORY_CLAMP_WAIT_SHARE`; off by default): bit 0 the one before, when the title's
+/// own wait was the last work recorded; bit 1 the one after, whose work the move of the
+/// scratch buffer to indirect arguments does.
+pub(crate) fn wait_share() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CLAMP_WAIT_SHARE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0) & 3)
+}
+
+thread_local! {
+    /// Set around one clamp whose wait before the title's own wait stands in for.
+    static SHARED_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next clamp recorded on this thread leaves out its wait before (`shared`), or not.
+pub(crate) fn share_wait(shared: bool) {
+    SHARED_WAIT.with(|s| s.set(shared));
+}
+
+const CPU_GROUPS: u32 = 1 << 20;
+const CPU_BUDGET: u32 = 1 << 27;
+
+/// A dispatch record's group counts clamped as the clamp shader does, charging `budget`
+/// (threads, a group as 64): past it the record runs empty.
+pub(crate) fn clamp_dispatch_record(g: [u32; 3], budget: &std::sync::atomic::AtomicU32) -> [u32; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = g.map(|v| v.min(65535));
+    if g[2] != 0 && g[0] * g[1] > CPU_GROUPS / g[2] {
+        g = [0; 3];
+    }
+    let cost = g[0] * g[1] * g[2] * 64;
+    if cost == 0 {
+        return g;
+    }
+    let charge = |at: u32| if at >= CPU_BUDGET || CPU_BUDGET - at <= cost { CPU_BUDGET } else { at + cost };
+    let before = budget.fetch_update(Relaxed, Relaxed, |at| Some(charge(at))).unwrap_or(CPU_BUDGET);
+    if before < CPU_BUDGET && CPU_BUDGET - before >= cost { g } else { [0; 3] }
+}
+
+pub(crate) struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
 }
@@ -234,7 +337,7 @@ unsafe impl Send for Clamp {}
 // SAFETY: as above.
 unsafe impl Sync for Clamp {}
 
-fn clamp() -> Option<&'static Clamp> {
+pub(crate) fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
         .get_or_init(|| match make() {
@@ -460,13 +563,15 @@ fn record_clamp_at(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamps_at(c, l, (dst, before), budget, &[ClampJob { dst_offset, src, count, spec, ahead }])
+    record_clamps_at(c, l, (dst, before), budget, &[ClampJob { slot: CLAMP_SLOT.with(|s| s.replace(0)), dst_offset, src, count, spec, ahead }])
 }
 
 /// One clamp of [`record_clamps_at`]: where it writes in the scratch buffer, its records'
 /// source, count buffer, layout (kind, stride, records), and whether they are a window
 /// clamped ahead.
 pub(crate) struct ClampJob<'a> {
+    /// One more than its stats slot ([`clamp_slot`]), or 0.
+    pub(crate) slot: u32,
     pub(crate) dst_offset: u64,
     pub(crate) src: (&'a ID3D12Resource, u64),
     pub(crate) count: Option<(&'a ID3D12Resource, u64)>,
@@ -506,7 +611,8 @@ fn job_roots(dst: &ID3D12Resource, job: &ClampJob) -> Option<([u32; 6], u64, u64
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(job.ahead) << 1), count_offset];
+    let stats = if clamp_stats() || job.slot != 0 { 128 | (job.slot << 8) } else { 0 };
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(job.ahead) << 1) | stats, count_offset];
     Some((constants, src_gpu, count_gpu, dst_gpu))
 }
 
@@ -554,9 +660,15 @@ fn record_clamps_at(
         ),
     ];
     let skip = usize::from(!waits);
+    let shared = SHARED_WAIT.with(|s| s.replace(false));
+    #[cfg(feature = "diagnostics")]
+    if shared && waits {
+        crate::copystat::add(crate::copystat::C::ClampWaitsShared, 1);
+    }
+    let after = usize::from(!waits || wait_share() & 2 != 0);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[usize::from(!waits || shared)..]);
         let mut bound = false;
         for (job, (constants, src_gpu, count_gpu, dst_gpu)) in jobs.iter().zip(&roots) {
             let records = job.spec.2;
@@ -575,8 +687,9 @@ fn record_clamps_at(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[after..]);
     }
+    let _ = skip;
     true
 }
 
@@ -603,7 +716,7 @@ pub(crate) fn bound_batch_in_ring(
     let made: Vec<ClampJob> = jobs
         .iter()
         .zip(&offsets)
-        .map(|(&(src, spec, ahead), &dst_offset)| ClampJob { dst_offset, src, count: None, spec, ahead })
+        .map(|(&(src, spec, ahead), &dst_offset)| ClampJob { slot: 0, dst_offset, src, count: None, spec, ahead })
         .collect();
     let before = list.indirect_state(&dst);
     if !record_clamps_at(c, &list.list, (&dst, before), budget, &made) {
@@ -619,6 +732,39 @@ pub(crate) fn bound_batch_in_ring(
 pub(crate) const GATHER_MOST: u32 = 4096;
 /// The widest record gathered: its slot in the scratch buffer.
 pub(crate) const GATHER_STRIDE: u32 = 32;
+/// The most segments a set opens in its list ([`gather_segments`]): each
+/// takes a word of the table for its count.
+const SEGMENTS_MOST: u32 = 256;
+/// The words of a set's table: an offset per slot, a count per segment.
+pub(crate) const GATHER_TABLE_WORDS: u32 = GATHER_MOST + SEGMENTS_MOST;
+/// The most records one segment clamps: its pass runs this many threads
+/// whatever the count comes to.
+const SEGMENT_MOST: u32 = 512;
+
+/// Whether a list that stopped gathering opens a segment instead
+/// (`VICTORY_GATHER_SEGMENTS=1`, with gathering on; off by default): the
+/// first record a draw asks for after something that may write arguments
+/// is clamped in the list right there, with every later record of its
+/// set until the next such thing, in one pass whose count the list's
+/// upload memory holds by the time it runs.
+pub(crate) fn gather_segments() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_SEGMENTS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last line: segments opened, records clamped in them, and
+/// commands that read one.
+pub(crate) static GATHER_SEGS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A segment open in the list: its slots start at `base`, its count is
+/// table word `count`, and it holds `n` of at most `most` records.
+#[derive(Clone, Copy)]
+pub(crate) struct Segment {
+    pub(crate) base: u32,
+    pub(crate) count: u32,
+    pub(crate) n: u32,
+    pub(crate) most: u32,
+}
 
 /// The records of one argument buffer that a list's draws read, to be
 /// clamped in one pass before the list runs ([`gather`]): the buffer (a
@@ -631,10 +777,24 @@ pub(crate) struct GatherSet {
     pub(crate) kind: u32,
     pub(crate) stride: u32,
     pub(crate) scratch: ID3D12Resource,
-    table_gpu: u64,
+    pub(crate) table_gpu: u64,
     table: usize,
-    /// A record's offset in the buffer, and its slot.
+    /// A record's offset in the buffer, and its slot, in the open segment
+    /// (the prelude's while the list gathers).
     slots: std::collections::HashMap<u32, u32>,
+    /// The next free slot and table word.
+    next: u32,
+    word: u32,
+    /// The slots the prelude clamps.
+    prelude: u32,
+    /// The segment open in the list ([`gather_segments`]).
+    pub(crate) open: Option<Segment>,
+    /// A segment's pass left the scratch readable as arguments.
+    pub(crate) in_list: bool,
+    /// The title memory the open segment's records (the prelude's while
+    /// the list gathers) lie in, and whether a write ended them.
+    span: (u64, u64),
+    pub(crate) shut: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the table is the list's own
@@ -643,28 +803,105 @@ unsafe impl Send for GatherSet {}
 
 impl GatherSet {
     pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
-        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, slots: Default::default() }
+        Self {
+            src,
+            src_id,
+            kind,
+            stride,
+            scratch,
+            table_gpu,
+            table: table as usize,
+            slots: Default::default(),
+            next: 0,
+            word: 0,
+            prelude: 0,
+            open: None,
+            in_list: false,
+            span: (u64::MAX, 0),
+            shut: false,
+        }
     }
 
-    /// The records gathered so far.
+    /// The records the prelude clamps.
     pub(crate) fn records(&self) -> u32 {
-        self.slots.len() as u32
+        self.prelude
+    }
+
+    /// Whether the list leaves the scratch readable as arguments.
+    pub(crate) fn readable(&self) -> bool {
+        self.prelude > 0 || self.in_list
+    }
+
+    fn put(&mut self, word: u32, value: u32) {
+        // SAFETY: the table holds `GATHER_TABLE_WORDS` words.
+        unsafe { (self.table as *mut u32).add(word as usize).write_volatile(value) };
     }
 
     /// The slot of the record at `offset`: the one it has, or the next
-    /// free one. None when the set is full.
+    /// free one. None when the set (or its open segment) is full.
     pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
+        if self.shut && self.open.is_none() {
+            return None;
+        }
         if let Some(&slot) = self.slots.get(&offset) {
             return Some(slot);
         }
-        let slot = self.slots.len() as u32;
-        if slot >= GATHER_MOST {
+        let slot = self.next;
+        if slot >= GATHER_MOST || self.word >= GATHER_TABLE_WORDS {
             return None;
         }
-        // SAFETY: the table holds `GATHER_MOST` words.
-        unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
+        match &mut self.open {
+            Some(seg) if seg.n >= seg.most => return None,
+            Some(seg) => seg.n += 1,
+            None => self.prelude += 1,
+        }
+        self.put(self.word, offset);
+        self.word += 1;
+        self.next += 1;
+        if let Some(seg) = self.open {
+            self.put(seg.count, seg.n);
+        }
         self.slots.insert(offset, slot);
         Some(slot)
+    }
+
+    /// Ends the prelude's records or the open segment: what is recorded
+    /// next may write the records.
+    pub(crate) fn close(&mut self) {
+        self.slots.clear();
+        self.open = None;
+        self.span = (u64::MAX, 0);
+        self.shut = true;
+    }
+
+    /// Notes that the record a slot was given for lies at `title` in title memory.
+    pub(crate) fn note(&mut self, title: u64, stride: u32) {
+        self.span = (self.span.0.min(title), self.span.1.max(title.saturating_add(u64::from(stride))));
+    }
+
+    /// Title memory `[lo, hi)` is about to be written: true, with the set
+    /// closed, if a record it gave a slot to may lie there.
+    pub(crate) fn wrote(&mut self, (lo, hi): (u64, u64)) -> bool {
+        let hit = lo < self.span.1 && self.span.0 < hi;
+        if hit {
+            self.close();
+        }
+        hit
+    }
+
+    /// Opens a segment in the list: None if the set has no room.
+    pub(crate) fn open_segment(&mut self) -> Option<Segment> {
+        self.close();
+        self.shut = false;
+        let room = GATHER_MOST.saturating_sub(self.next).min(GATHER_TABLE_WORDS.saturating_sub(self.word + 1));
+        if room == 0 {
+            return None;
+        }
+        let seg = Segment { base: self.next, count: self.word, n: 0, most: room.min(SEGMENT_MOST) };
+        self.put(seg.count, 0);
+        self.word += 1;
+        self.open = Some(seg);
+        Some(seg)
     }
 
     /// The scratch buffer `src`'s set uses, to keep for the list's next recording.
@@ -701,14 +938,14 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
 /// about 1,450 draws a frame each had a compute pass of ours in front of
 /// them: the card left drawing for compute and came back, about nine
 /// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), (offset, title): (u64, u64), spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
     let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
         GATHER_NONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     };
-    list.gather_slot(src, src_id, offset, spec)
+    list.gather_slot(src, src_id, (offset, title), spec)
 }
 
 /// Since the last line: records that got no slot because they do not fit
@@ -723,7 +960,7 @@ pub(crate) static GATHER_NONE: [std::sync::atomic::AtomicU64; 5] = [const { std:
 /// buffer `src`, and stored clamped at `i * stride`. Charged to the budget
 /// word at `budget` as records clamped one by one are. False, with nothing
 /// recorded, if the layout or the addresses do not fit the clamp.
-fn record_gather_as(
+pub(crate) fn record_gather_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
@@ -731,9 +968,10 @@ fn record_gather_as(
     src: &ID3D12Resource,
     table_gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    (base, counted): (u64, bool),
 ) -> bool {
     // SAFETY: live D3D12 buffer resources.
-    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + base) };
     if gatherable(src_gpu, 0, (kind, stride)).is_none()
         || records == 0
         || records > GATHER_MOST
@@ -743,7 +981,7 @@ fn record_gather_as(
     {
         return false;
     }
-    let constants = [kind, stride, records, 0u32, 4u32, 0u32];
+    let constants = [kind, stride, records, 0u32, if counted { 5u32 } else { 4 }, 0u32];
     let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
     let second = [
         uav_barrier(),
@@ -792,7 +1030,7 @@ pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], 
     }
     let mut all = true;
     for set in sets.iter().filter(|s| s.records() > 0) {
-        all &= record_gather_as(c, l, (&set.scratch, D3D12_RESOURCE_STATE_COMMON), at, &set.src, set.table_gpu, (set.kind, set.stride, set.records()));
+        all &= record_gather_as(c, l, (&set.scratch, D3D12_RESOURCE_STATE_COMMON), at, &set.src, set.table_gpu, (set.kind, set.stride, set.records()), (0, false));
     }
     // SAFETY: as above.
     unsafe {
@@ -1721,7 +1959,7 @@ void main() {
         }
         let jobs: Vec<ClampJob> = windows
             .iter()
-            .map(|&(from, to)| ClampJob { dst_offset: to, src: (&src_buf, from), count: None, spec: (KIND_MESH, STRIDE, RECORDS), ahead: true })
+            .map(|&(from, to)| ClampJob { slot: 0, dst_offset: to, src: (&src_buf, from), count: None, spec: (KIND_MESH, STRIDE, RECORDS), ahead: true })
             .collect();
         assert!(record_clamps_at(&warp.clamp, &warp.list, (&dst_buf, D3D12_RESOURCE_STATE_COMMON), budget_gpu, &jobs));
         // SAFETY: an open list; the scratch buffer is left readable as arguments.
@@ -1819,6 +2057,7 @@ void main() {
             &src_buf,
             table_gpu,
             (KIND_MESH, STRIDE, records.len() as u32),
+            (0, false),
         ));
         // SAFETY: an open list; the scratch buffer, which the pass left
         // readable as arguments, is copied for the check.
@@ -1849,6 +2088,184 @@ void main() {
         // The source is read only.
         // SAFETY: a mapped buffer.
         assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
+    }
+
+    #[test]
+    fn warp_a_set_opens_segments_after_its_prelude_with_a_count_word_each() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        let mut table = vec![0u32; GATHER_TABLE_WORDS as usize];
+        let mut set = GatherSet::new(warp.default_uav(256), 1, (10, 12), warp.default_uav(256), (0, table.as_mut_ptr().cast()));
+        assert_eq!((set.slot(0x40), set.slot(0x80), set.slot(0x40)), (Some(0), Some(1), Some(0)));
+        set.close();
+        let seg = set.open_segment().unwrap();
+        assert_eq!((seg.base, seg.count, seg.n), (2, 2, 0));
+        // the same record after a close is a new slot: it may have been written
+        assert_eq!((set.slot(0x40), set.slot(0xc0), set.slot(0x40)), (Some(2), Some(3), Some(2)));
+        assert_eq!(&table[..6], &[0x40, 0x80, 2, 0x40, 0xc0, 0]);
+        assert_eq!((set.records(), set.readable()), (2, true));
+        let seg = set.open_segment().unwrap();
+        assert_eq!((seg.base, seg.count), (4, 5));
+    }
+
+    #[test]
+    fn warp_a_write_over_a_gathered_record_ends_its_set_and_only_its_set() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        let mut table = vec![0u32; GATHER_TABLE_WORDS as usize];
+        let mut set = GatherSet::new(warp.default_uav(256), 1, (10, 12), warp.default_uav(256), (0, table.as_mut_ptr().cast()));
+        assert_eq!(set.slot(0x40), Some(0));
+        set.note(0x1_0040, 12);
+        assert_eq!(set.slot(0x80), Some(1));
+        set.note(0x1_0080, 12);
+        // writes beside the records leave the set gathering
+        assert!(!set.wrote((0x1_0000, 0x1_0040)));
+        assert!(!set.wrote((0x1_008c, 0x1_0100)));
+        assert_eq!(set.slot(0x40), Some(0));
+        // a write over one record: no slot from here on, the prelude keeps what it had
+        assert!(set.wrote((0x1_0088, 0x1_008c)));
+        assert_eq!((set.slot(0x40), set.slot(0xc0)), (None, None));
+        assert_eq!(set.records(), 2);
+        // with segments, the next one serves again
+        assert!(set.open_segment().is_some());
+        assert_eq!(set.slot(0x40), Some(2));
+    }
+
+    #[test]
+    fn warp_a_segment_clamps_as_many_records_as_its_count_word_says() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        const BASE: u64 = 2;
+        let records: [(u32, [u32; 3]); 3] = [(0x0100, [5, 1, 1]), (0x0040, [70000, 3, 1]), (0x0200, [9, 1, 1])];
+        let total = 0x1000usize;
+        let mut src = vec![0x5Au8; total];
+        for (at, words) in records {
+            for (w, word) in words.into_iter().enumerate() {
+                let i = at as usize + w * 4;
+                src[i..i + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let slots = 64 * u64::from(STRIDE);
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(1024);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(slots);
+        let dst_buf = warp.default_uav(slots);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(table_ptr, 0, 1024);
+            let t = table_ptr as *mut u32;
+            // a word before the segment, the count, then the offsets
+            t.write_volatile(0x0100);
+            t.add(1).write_volatile(records.len() as u32 - 1);
+            for (i, (at, _)) in records.into_iter().enumerate() {
+                t.add(2 + i).write_volatile(at);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0xEE, slots as usize);
+        }
+        let to_slots = [transition(&dst_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)];
+        // SAFETY: an open list; the scratch starts as filled with the readback's bytes.
+        unsafe {
+            warp.list.ResourceBarrier(&to_slots);
+            warp.list.CopyBufferRegion(&dst_buf, 0, &readback_buf, 0, slots);
+        }
+        assert!(record_gather_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COPY_DEST),
+            budget_gpu,
+            &src_buf,
+            table_gpu + 4,
+            (KIND_MESH, STRIDE, 62),
+            (BASE * u64::from(STRIDE), true),
+        ));
+        // SAFETY: an open list; the scratch, left readable as arguments, is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, slots);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (slots / 4) as usize).to_vec(),
+            )
+        };
+        let b = (BASE * 3) as usize;
+        assert!(out[..b].iter().all(|&w| w == 0xEEEE_EEEE), "slots before the segment untouched");
+        assert_eq!(&out[b..b + 3], &[5, 1, 1]);
+        assert_eq!(&out[b + 3..b + 6], &[65535, 1, 1]);
+        assert!(out[b + 6..].iter().all(|&w| w == 0xEEEE_EEEE), "slots past the count untouched");
+        assert_eq!(spent, (5 + 65535) * 128, "only the counted records charged");
+    }
+
+    #[test]
+    fn warp_a_segment_after_a_write_reads_the_written_record() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        const AT: u32 = 0x40;
+        let src = warp.default_uav(0x100);
+        let (up_buf, up_ptr, _) = warp.shared_buffer(0x100);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(64);
+        let dst_buf = warp.default_uav(64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            let u = up_ptr as *mut u32;
+            for (i, w) in [7u32, 1, 1, 70000, 2, 1].into_iter().enumerate() {
+                u.add(i).write_volatile(w);
+            }
+            let t = table_ptr as *mut u32;
+            for (i, w) in [1u32, AT, 1, AT].into_iter().enumerate() {
+                t.add(i).write_volatile(w);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        let copy_in = |l: &ID3D12GraphicsCommandList, from: u64| unsafe {
+            l.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            l.CopyBufferRegion(&src, u64::from(AT), &up_buf, from, 12);
+            l.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+        };
+        // the title's record, a segment over it, the title writing it, a segment over it again
+        copy_in(&warp.list, 0);
+        assert!(record_gather_as(&warp.clamp, &warp.list, (&dst_buf, D3D12_RESOURCE_STATE_COMMON), budget_gpu, &src, table_gpu, (KIND_MESH, STRIDE, 4), (0, true)));
+        copy_in(&warp.list, 12);
+        assert!(record_gather_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            budget_gpu,
+            &src,
+            table_gpu + 8,
+            (KIND_MESH, STRIDE, 4),
+            (u64::from(STRIDE), true),
+        ));
+        // SAFETY: an open list; the scratch is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 24);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer.
+        let out = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 6).to_vec() };
+        assert_eq!(&out[..3], &[7, 1, 1], "the first segment's slot: the record before the write");
+        assert_eq!(&out[3..], &[65535, 1, 1], "the second's: the record as written");
     }
 
     #[test]
@@ -1927,6 +2344,44 @@ void main() {
                 assert_eq!(largest, u32::MAX);
             }
         }
+    }
+
+    #[test]
+    fn warp_a_clamp_with_a_stats_slot_counts_the_records_it_changed() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let records: [[u32; 3]; 3] = [[70_000, 1, 1], [4, 2, 1], [8, 8, 1]];
+        let bytes = STRIDE as usize * records.len();
+        let (src_buf, src_ptr, _) = warp.shared_buffer(bytes as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256 + 64);
+        let dst_buf = warp.default_uav(bytes as u64);
+        // SAFETY: mapped buffers have sufficient capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), src_ptr, bytes);
+            std::ptr::write_bytes(budget_ptr, 0, 256 + 64);
+        }
+        clamp_slot(3);
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DISPATCH, STRIDE, records.len() as u32),
+            false,
+        ));
+        warp.submit_and_wait();
+        // SAFETY: GPU work completed.
+        let words = unsafe { std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 64 + 16).to_vec() };
+        // one record cut to 65,535 groups in x; the others as they were
+        assert_eq!(words[3], 1, "dispatch records changed");
+        assert_eq!(words[4], 0, "draw records changed");
+        assert_eq!(words[64 + 2], 1, "the clamp's slot");
+        assert_eq!(words[64], 0, "other slots untouched");
     }
 
     #[test]
@@ -3132,5 +3587,30 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+}
+#[cfg(test)]
+mod cpu_clamp_tests {
+    use super::clamp_dispatch_record;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn a_dispatch_clamped_on_the_cpu_is_bounded_as_the_clamp_shader_bounds_it() {
+        let budget = AtomicU32::new(0);
+        assert_eq!(clamp_dispatch_record([4, 2, 1], &budget), [4, 2, 1]);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 8 * 64);
+        // a dimension past the host's limit is cut to it
+        assert_eq!(clamp_dispatch_record([70_000, 1, 1], &budget), [65_535, 1, 1]);
+        // more than 2^20 groups in all: empty, charging nothing
+        let before = budget.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(clamp_dispatch_record([u32::MAX, u32::MAX, u32::MAX], &budget), [0, 0, 0]);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), before);
+        // past the list's budget, records run empty
+        let full = AtomicU32::new((1 << 27) - 64);
+        assert_eq!(clamp_dispatch_record([2, 1, 1], &full), [0, 0, 0]);
+        assert_eq!(clamp_dispatch_record([1, 1, 1], &full), [0, 0, 0]);
+        let room = AtomicU32::new((1 << 27) - 128);
+        assert_eq!(clamp_dispatch_record([2, 1, 1], &room), [2, 1, 1]);
+        assert_eq!(clamp_dispatch_record([1, 1, 1], &room), [0, 0, 0]);
     }
 }

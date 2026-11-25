@@ -67,6 +67,8 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// Whether shaders were ever declared to write this copy ([`Shadow::gpu_wrote`]).
+    gpu_wrote: std::sync::atomic::AtomicBool,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -2458,6 +2460,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            gpu_wrote: std::sync::atomic::AtomicBool::new(false),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2547,6 +2550,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        self.gpu_wrote.store(true, Ordering::Relaxed);
         if self.place.is_some() {
             return;
         }
@@ -3599,6 +3603,12 @@ impl Shadow {
             }
             true
         })
+    }
+
+    /// Whether shaders were ever declared to write this copy: if not, title memory holds
+    /// what the card would read once the copy is refreshed.
+    pub(crate) fn gpu_wrote(&self) -> bool {
+        self.gpu_wrote.load(Ordering::Relaxed)
     }
 
     /// Whether shaders read and write this copy in the card's own memory
